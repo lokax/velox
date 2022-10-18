@@ -161,10 +161,12 @@ std::vector<ExprPtr> compileInputs(
       VELOX_CHECK(
           dynamic_cast<const core::FieldAccessTypedExpr*>(expr.get()),
           "An InputReference can only occur under a FieldReference");
+          // 这里不保存进compiedInput？
     } else {
       if (flattenIf.has_value()) {
         std::vector<TypedExprPtr> flat;
         flattenInput(input, flattenIf.value(), flat);
+        // 对flat后的的表达式进行编译？
         for (auto& input : flat) {
           compiledInputs.push_back(compileExpression(
               input,
@@ -175,6 +177,7 @@ std::vector<ExprPtr> compileInputs(
               enableConstantFolding));
         }
       } else {
+        // 递归编译输入表达式
         compiledInputs.push_back(compileExpression(
             input,
             scope,
@@ -295,7 +298,9 @@ std::shared_ptr<Expr> compileLambda(
     bool enableConstantFolding) {
   auto signature = lambda->signature();
   auto parameterNames = signature->names();
+  // 创建lambda作用域
   Scope lambdaScope(std::move(parameterNames), scope, scope->exprSet);
+  // 编译body
   auto body = compileExpression(
       lambda->body(),
       &lambdaScope,
@@ -337,6 +342,7 @@ ExprPtr tryFoldIfConstant(const ExprPtr& expr, Scope* scope) {
     try {
       // Check that all inputs are literals.
       for (auto& input : expr->inputs()) {
+        // 任何一个输入不是常量表达式，则直接返回原始的expr，不做常量折叠
         if (!dynamic_cast<ConstantExpr*>(input.get())) {
           return expr;
         }
@@ -346,6 +352,7 @@ ExprPtr tryFoldIfConstant(const ExprPtr& expr, Scope* scope) {
       auto row = BaseVector::create(rowType, 1, execCtx->pool());
       EvalCtx context(
           execCtx, scope->exprSet, dynamic_cast<RowVector*>(row.get()));
+          // 执行表达式得到结果向量，然后包装成常量表达式
       VectorPtr result;
       SelectivityVector rows(1);
       expr->eval(rows, context, result);
@@ -393,11 +400,13 @@ ExprPtr compileExpression(
     memory::MemoryPool* pool,
     const std::unordered_set<std::string>& flatteningCandidates,
     bool enableConstantFolding) {
+        // 检查表达式是否已经编译过，注意检查的时候会比较表达式是否相同，比较的不是指针！
   ExprPtr alreadyCompiled = getAlreadyCompiled(expr.get(), &scope->visited);
   if (alreadyCompiled) {
     if (!alreadyCompiled->isMultiplyReferenced()) {
       scope->exprSet->addToReset(alreadyCompiled);
     }
+    // 设置该表达式会被多人引用
     alreadyCompiled->setMultiplyReferenced();
     return alreadyCompiled;
   }
@@ -415,6 +424,7 @@ ExprPtr compileExpression(
         resultType, std::move(compiledInputs), trackCpuUsage);
   } else if (auto cast = dynamic_cast<const core::CastTypedExpr*>(expr.get())) {
     VELOX_CHECK(!compiledInputs.empty());
+    // 常见cast表达式
     result = std::make_shared<CastExpr>(
         resultType,
         std::move(compiledInputs[0]),
@@ -501,7 +511,7 @@ ExprPtr compileExpression(
   } else {
     VELOX_UNSUPPORTED("Unknown typed expression");
   }
-
+    // 计算元数据
   result->computeMetadata();
 
   auto folded =

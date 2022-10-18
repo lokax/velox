@@ -178,19 +178,25 @@ std::optional<column_index_t> getIdentityProjection(
 } // namespace
 
 void Driver::pushdownFilters(int operatorIndex) {
+    // 算子
   auto op = operators_[operatorIndex].get();
+  // 获取动态过滤器
   const auto& filters = op->getDynamicFilters();
+  // 没有动态过滤器，则直接返回
   if (filters.empty()) {
     return;
   }
-
+    // 统计数据？
   op->stats().addRuntimeStat(
       "dynamicFiltersProduced", RuntimeCounter(filters.size()));
 
   // Walk operator list upstream and find a place to install the filters.
   for (const auto& entry : filters) {
+    // column index?
     auto channel = entry.first;
+    // 遍历当前算子等待每一个之前的算子
     for (auto i = operatorIndex - 1; i >= 0; --i) {
+        // 之前的每一个算子
       auto prevOp = operators_[i].get();
 
       if (i == 0) {
@@ -223,7 +229,7 @@ void Driver::pushdownFilters(int operatorIndex) {
       channel = inputChannel.value();
     }
   }
-
+    // 清除
   op->clearDynamicFilters();
 }
 
@@ -246,6 +252,7 @@ RowVectorPtr Driver::next(std::shared_ptr<BlockingState>& blockingState) {
 
 void Driver::enqueueInternal() {
   VELOX_CHECK(!state_.isEnqueued);
+  // 设置为进入队列
   state_.isEnqueued = true;
   // When enqueuing, starting timing the queue time.
   queueTimeStartMicros_ = getCurrentTimeMicro();
@@ -257,6 +264,7 @@ StopReason Driver::runInternal(
     RowVectorPtr& result) {
   auto queuedTime = (getCurrentTimeMicro() - queueTimeStartMicros_) * 1'000;
   // Update the next operator's queueTime.
+  // 如果driver已经关闭了，这里就返回终结状态
   auto stop = closed_ ? StopReason::kTerminate : task()->enter(state_);
   if (stop != StopReason::kNone) {
     if (stop == StopReason::kTerminate) {
@@ -273,12 +281,14 @@ StopReason Driver::runInternal(
           error_code::kInvalidState,
           false)));
     }
+    // 返回停止状态
     return stop;
   }
 
   // Update the queued time after entering the Task to ensure the stats have not
   // been deleted.
   if (curOpIndex_ < operators_.size()) {
+    // 当前CurOpIndex算子是阻塞的？
     operators_[curOpIndex_]->stats().addRuntimeStat(
         "queuedWallNanos",
         RuntimeCounter(queuedTime, RuntimeCounter::Unit::kNanos));
@@ -306,17 +316,20 @@ StopReason Driver::runInternal(
       folly::makeGuard([]() { setRunTimeStatWriter(nullptr); });
 
   try {
+    // 算子的数量
     int32_t numOperators = operators_.size();
     ContinueFuture future;
 
     for (;;) {
+        // 逆序遍历,从sink算子开始
       for (int32_t i = numOperators - 1; i >= 0; --i) {
+        // 任务是否应该停止
         stop = task()->shouldStop();
         if (stop != StopReason::kNone) {
           guard.notThrown();
           return stop;
         }
-
+        // 当前算子
         auto op = operators_[i].get();
         // In case we are blocked, this index will point to the operator, whose
         // queuedTime we should update.
@@ -325,29 +338,38 @@ StopReason Driver::runInternal(
         // runtime stats would be updated (for instance time taken to load lazy
         // vectors).
         setRunTimeStatWriter(std::make_unique<OperatorRuntimeStatWriter>(op));
-
+        // 检查当前算子阻塞原因
         blockingReason_ = op->isBlocked(&future);
+        // 如果算子发生了阻塞
         if (blockingReason_ != BlockingReason::kNotBlocked) {
+            // 创建blockingState
           blockingState = std::make_shared<BlockingState>(
               self, std::move(future), op, blockingReason_);
           guard.notThrown();
           return StopReason::kBlock;
         }
+        // 下一个算子
         Operator* nextOp = nullptr;
+        // i不是最后一个算子
         if (i < operators_.size() - 1) {
+            // 获取下一个算子
           nextOp = operators_[i + 1].get();
+          // 检查下一个算子的阻塞原因
           blockingReason_ = nextOp->isBlocked(&future);
           if (blockingReason_ != BlockingReason::kNotBlocked) {
             blockingState = std::make_shared<BlockingState>(
                 self, std::move(future), nextOp, blockingReason_);
             guard.notThrown();
+            // 下一个算子阻塞的话，这里就也不处理了？
             return StopReason::kBlock;
           }
+          // 如果下一个算子需要输入的话
           if (nextOp->needsInput()) {
             uint64_t resultBytes = 0;
             RowVectorPtr result;
             {
               CpuWallTimer timer(op->stats().getOutputTiming);
+              // 尝试获取当前算子的输出
               result = op->getOutput();
               if (result) {
                 VELOX_CHECK(
@@ -361,17 +383,21 @@ StopReason Driver::runInternal(
               }
             }
             pushdownFilters(i);
+            // 如果当前算子有输出
             if (result) {
               CpuWallTimer timer(nextOp->stats().addInputTiming);
               nextOp->stats().inputVectors += 1;
               nextOp->stats().inputPositions += result->size();
               nextOp->stats().inputBytes += resultBytes;
+              // 把输出结果添加到下一个算子上的输入上
               nextOp->addInput(result);
               // The next iteration will see if operators_[i + 1] has
               // output now that it got input.
+              // 继续处理下一个算子
               i += 2;
               continue;
             } else {
+                // 如果当前算子没有输出数据
               stop = task()->shouldStop();
               if (stop != StopReason::kNone) {
                 guard.notThrown();
@@ -383,6 +409,7 @@ StopReason Driver::runInternal(
               // is not blocked and empty, this is finished. If this is
               // not the source, just try to get output from the one
               // before.
+              // 之前不是不阻塞吗，为什么这里又检查是否发生了阻塞
               blockingReason_ = op->isBlocked(&future);
               if (blockingReason_ != BlockingReason::kNotBlocked) {
                 blockingState = std::make_shared<BlockingState>(
@@ -404,6 +431,7 @@ StopReason Driver::runInternal(
           // will come back here after this is again on thread.
           {
             CpuWallTimer timer(op->stats().getOutputTiming);
+            // 获取算子的输出？
             result = op->getOutput();
             if (result) {
               VELOX_CHECK(
@@ -414,14 +442,17 @@ StopReason Driver::runInternal(
               // This code path is used only in single-threaded execution.
               blockingReason_ = BlockingReason::kWaitForConsumer;
               guard.notThrown();
+              // 返回阻塞态，等待消费者进行消费
               return StopReason::kBlock;
             }
           }
+          // 如果算子完成了，返回结束状态
           if (op->isFinished()) {
             guard.notThrown();
             close();
             return StopReason::kAtEnd;
           }
+          // 这是干什么
           pushdownFilters(i);
           continue;
         }
@@ -507,8 +538,10 @@ void Driver::close() {
   }
   addStatsToTask();
   for (auto& op : operators_) {
+    // 关闭每一个算子
     op->close();
   }
+  // 设置closed为true
   closed_ = true;
   Task::removeDriver(ctx_->task, this);
 }
@@ -516,6 +549,7 @@ void Driver::close() {
 void Driver::closeByTask() {
   VELOX_CHECK(isTerminated());
   addStatsToTask();
+  // 关闭每一个算子，然后设置closed为true
   for (auto& op : operators_) {
     op->close();
   }
@@ -541,6 +575,7 @@ std::unordered_set<column_index_t> Driver::canPushdownFilters(
     const Operator* FOLLY_NONNULL filterSource,
     const std::vector<column_index_t>& channels) const {
   int filterSourceIndex = -1;
+  // 找到filterSource所在的index
   for (auto i = 0; i < operators_.size(); ++i) {
     auto op = operators_[i].get();
     if (filterSource == op) {
@@ -558,19 +593,23 @@ std::unordered_set<column_index_t> Driver::canPushdownFilters(
   for (auto i = 0; i < channels.size(); ++i) {
     auto channel = channels[i];
     for (auto j = filterSourceIndex - 1; j >= 0; --j) {
+        // 遍历之前的每一个算子
       auto prevOp = operators_[j].get();
 
       if (j == 0) {
         // Source operator.
         if (prevOp->canAddDynamicFilter()) {
+            // 如果source能支持，则添加channel进去，这个channel是op的input chanal，
+            // 应该也是prevop的output chanal
           supportedChannels.emplace(channels[i]);
         }
         break;
       }
-
+        // 拿出相同的projecion?
       const auto& identityProjections = prevOp->identityProjections();
       auto inputChannel = getIdentityProjection(identityProjections, channel);
       if (!inputChannel.has_value()) {
+        // 不能再下推的意思吗？
         // Filter channel is not an identity projection.
         if (prevOp->canAddDynamicFilter()) {
           supportedChannels.emplace(channels[i]);

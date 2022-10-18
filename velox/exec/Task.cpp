@@ -206,8 +206,9 @@ memory::MappedMemory* FOLLY_NONNULL Task::addOperatorMemory(
 }
 
 bool Task::supportsSingleThreadedExecution() const {
+    // driver工厂？
   std::vector<std::unique_ptr<DriverFactory>> driverFactories;
-
+    // 如果有消费者提供商，则返回false
   if (consumerSupplier_) {
     return false;
   }
@@ -223,6 +224,7 @@ bool Task::supportsSingleThreadedExecution() const {
   return true;
 }
 
+// 单线程api？
 RowVectorPtr Task::next() {
   VELOX_CHECK_EQ(
       core::ExecutionStrategy::kUngrouped,
@@ -488,7 +490,7 @@ void Task::resume(std::shared_ptr<Task> self) {
     }
   }
 }
-
+// 创建split分组状态
 void Task::createSplitGroupStateLocked(
     std::shared_ptr<Task>& self,
     uint32_t splitGroupId) {
@@ -500,6 +502,7 @@ void Task::createSplitGroupStateLocked(
 
     auto exchangeId = factory->needsLocalExchange();
     if (exchangeId.has_value()) {
+        // 创建队列
       self->createLocalExchangeQueuesLocked(
           splitGroupId, exchangeId.value(), factory->numDrivers);
     }
@@ -517,6 +520,7 @@ void Task::createDriversLocked(
     uint32_t splitGroupId,
     std::vector<std::shared_ptr<Driver>>& out) {
   auto& splitGroupState = self->splitGroupStates_[splitGroupId];
+  // 有几条pipeline
   const auto numPipelines = driverFactories_.size();
   for (auto pipeline = 0; pipeline < numPipelines; ++pipeline) {
     auto& factory = driverFactories_[pipeline];
@@ -540,6 +544,7 @@ void Task::createDriversLocked(
     }
   }
   noMoreLocalExchangeProducers(splitGroupId);
+  // 正在运行的split分组
   ++numRunningSplitGroups_;
 
   // Initialize operator stats using the 1st driver of each operator.
@@ -570,20 +575,23 @@ void Task::removeDriver(std::shared_ptr<Task> self, Driver* driver) {
   bool foundDriver = false;
   bool allFinished = true;
   {
+    // 加锁
     std::lock_guard<std::mutex> taskLock(self->mutex_);
+    // 遍历该任务的每一个driver
     for (auto& driverPtr : self->drivers_) {
       if (driverPtr.get() != driver) {
         continue;
       }
-
+        // 找到相等的driver
       // Mark the closure of another driver for its split group (even in
       // ungrouped execution mode).
       const auto splitGroupId = driver->driverCtx()->splitGroupId;
       auto& splitGroupState = self->splitGroupStates_[splitGroupId];
+      // 减少运行的driver
       --splitGroupState.numRunningDrivers;
-
+        // pipeline的id号
       auto pipelineId = driver->driverCtx()->pipelineId;
-
+        // output pipeline是什么
       if (self->isOutputPipeline(pipelineId)) {
         ++splitGroupState.numFinishedOutputDrivers;
       }
@@ -708,7 +716,9 @@ void Task::addSplit(const core::PlanNodeId& planNodeId, exec::Split&& split) {
   bool isTaskRunning;
   std::unique_ptr<ContinuePromise> promise;
   {
+    // 加锁
     std::lock_guard<std::mutex> l(mutex_);
+    // 任务是否在运行
     isTaskRunning = isRunningLocked();
     if (isTaskRunning) {
       promise = addSplitLocked(splitsStates_[planNodeId], std::move(split));
@@ -792,10 +802,12 @@ void Task::noMoreSplitsForGroup(
   checkPlanNodeIdForSplit(planNodeId);
   std::vector<ContinuePromise> promises;
   {
+    // 加锁
     std::lock_guard<std::mutex> l(mutex_);
-
+    // split状态？
     auto& splitsState = splitsStates_[planNodeId];
     auto& splitsStore = splitsState.groupSplitsStores[splitGroupId];
+    // 设置没有更多的split
     splitsStore.noMoreSplits = true;
     promises = std::move(splitsStore.splitPromises);
 
@@ -827,6 +839,7 @@ void Task::noMoreSplits(const core::PlanNodeId& planNodeId) {
       // Mark all split stores as 'no more splits'.
       for (auto& it : splitsState.groupSplitsStores) {
         it.second.noMoreSplits = true;
+        // 这里感觉不对
         splitPromises = std::move(it.second.splitPromises);
       }
     } else if (isUngroupedExecution()) {
@@ -915,18 +928,22 @@ BlockingReason Task::getSplitOrFuture(
         splitsState.groupSplitsStores[splitGroupId], split, future);
   }
 }
-
+// 看过
 BlockingReason Task::getSplitOrFutureLocked(
     SplitsStore& splitsStore,
     exec::Split& split,
     ContinueFuture& future) {
+        // 如果没有split
   if (splitsStore.splits.empty()) {
     if (splitsStore.noMoreSplits) {
+        // 不再需要split，返回不阻塞
       return BlockingReason::kNotBlocked;
     }
+    // 创建future和promise
     auto [splitPromise, splitFuture] = makeVeloxContinuePromiseContract(
         fmt::format("Task::getSplitOrFuture {}", taskId_));
     future = std::move(splitFuture);
+    // 保存promise以便将来有split的时候进行通知
     splitsStore.splitPromises.push_back(std::move(splitPromise));
     return BlockingReason::kWaitForSplit;
   }
@@ -934,8 +951,9 @@ BlockingReason Task::getSplitOrFutureLocked(
   split = getSplitLocked(splitsStore);
   return BlockingReason::kNotBlocked;
 }
-
+// 看过
 exec::Split Task::getSplitLocked(SplitsStore& splitsStore) {
+    // 从队列中弹出第一个split
   auto split = std::move(splitsStore.splits.front());
   splitsStore.splits.pop_front();
 
@@ -974,21 +992,21 @@ bool Task::isGroupedExecution() const {
 bool Task::isUngroupedExecution() const {
   return not isGroupedExecution();
 }
-
+// 任务正在运行
 bool Task::isRunning() const {
   std::lock_guard<std::mutex> l(mutex_);
   return (state_ == TaskState::kRunning);
 }
-
+// 任务完成，但是这里为什么要加锁
 bool Task::isFinished() const {
   std::lock_guard<std::mutex> l(mutex_);
   return (state_ == TaskState::kFinished);
 }
-
+// 任务正在运行
 bool Task::isRunningLocked() const {
   return (state_ == TaskState::kRunning);
 }
-
+// 任务已经完成
 bool Task::isFinishedLocked() const {
   return (state_ == TaskState::kFinished);
 }
@@ -1043,10 +1061,12 @@ void Task::driverClosedLocked() {
   if (isRunningLocked()) {
     --numRunningDrivers_;
   }
+  // 增加完成的driver
   ++numFinishedDrivers_;
 }
 
 bool Task::checkIfFinishedLocked() {
+    // 如果没有处于Running状态，则返回false
   if (!isRunningLocked()) {
     return false;
   }
@@ -1069,6 +1089,7 @@ bool Task::checkIfFinishedLocked() {
   }
 
   if (allFinished) {
+    // 如果没有分区输出或者分区输出已经被消费了？
     if ((not hasPartitionedOutput_) || partitionedOutputConsumed_) {
       taskStats_.endTimeMs = getCurrentTimeMs();
       return true;
@@ -1231,13 +1252,16 @@ ContinueFuture Task::terminate(TaskState terminalState) {
   std::vector<std::shared_ptr<Driver>> offThreadDrivers;
   TaskCompletionNotifier completionNotifier;
   {
+    // 加锁
     std::lock_guard<std::mutex> l(mutex_);
     if (taskStats_.executionEndTimeMs == 0) {
       taskStats_.executionEndTimeMs = getCurrentTimeMs();
     }
+    // 如果任务不处于以运行状态
     if (not isRunningLocked()) {
       return makeFinishFutureLocked("Task::terminate");
     }
+    // 修改任务状态，这里是任务的状态
     state_ = terminalState;
     if (state_ == TaskState::kCanceled || state_ == TaskState::kAborted) {
       try {
@@ -1245,6 +1269,7 @@ ContinueFuture Task::terminate(TaskState terminalState) {
             state_ == TaskState::kCanceled ? "Cancelled"
                                            : "Aborted for external error");
       } catch (const std::exception& e) {
+        // 创建一个异常，然后保存下来
         exception_ = std::current_exception();
       }
     }
@@ -1257,11 +1282,14 @@ ContinueFuture Task::terminate(TaskState terminalState) {
     // The drivers that are on thread will go off thread in time and
     // 'numRunningDrivers_' is cleared here so that this is 0 right
     // after terminate as tests expect.
+    // 这里直接清0
     numRunningDrivers_ = 0;
     for (auto& driver : drivers_) {
       if (driver) {
+        // 这种情况说明driver不在线程上,调用者负责清理资源？ 
         if (enterForTerminateLocked(driver->state()) ==
             StopReason::kTerminate) {
+                // 保存离线线程driver
           offThreadDrivers.push_back(std::move(driver));
           driverClosedLocked();
         }
@@ -1365,13 +1393,14 @@ ContinueFuture Task::terminate(TaskState terminalState) {
     bridge->cancel();
   }
 
+    // 创建finished future
   std::lock_guard<std::mutex> l(mutex_);
   return makeFinishFutureLocked("Task::terminate");
 }
 
 ContinueFuture Task::makeFinishFutureLocked(const char* FOLLY_NONNULL comment) {
   auto [promise, future] = makeVeloxContinuePromiseContract(comment);
-
+    // 0个线程的时候通知promise
   if (numThreads_ == 0) {
     promise.setValue();
     return std::move(future);
@@ -1520,6 +1549,7 @@ void Task::createLocalExchangeQueuesLocked(
     uint32_t splitGroupId,
     const core::PlanNodeId& planNodeId,
     int numPartitions) {
+        // 拿出split分组状态
   auto& splitGroupState = splitGroupStates_[splitGroupId];
   VELOX_CHECK(
       splitGroupState.localExchanges.find(planNodeId) ==
@@ -1532,7 +1562,7 @@ void Task::createLocalExchangeQueuesLocked(
   LocalExchangeState exchange;
   exchange.memoryManager = std::make_shared<LocalExchangeMemoryManager>(
       queryCtx_->config().maxLocalExchangeBufferSize());
-
+    // 几个分区几个队列
   exchange.queues.reserve(numPartitions);
   for (auto i = 0; i < numPartitions; ++i) {
     exchange.queues.emplace_back(
@@ -1543,10 +1573,12 @@ void Task::createLocalExchangeQueuesLocked(
 }
 
 void Task::noMoreLocalExchangeProducers(uint32_t splitGroupId) {
+    // 获取split分组状态
   auto& splitGroupState = splitGroupStates_[splitGroupId];
 
   for (auto& exchange : splitGroupState.localExchanges) {
     for (auto& queue : exchange.second.queues) {
+        // 调用这些队列，不再有生产者
       queue->noMoreProducers();
     }
   }
@@ -1582,6 +1614,7 @@ Task::getLocalExchangeQueues(
 void Task::setError(const std::exception_ptr& exception) {
   bool isFirstError = false;
   {
+    // 加锁
     std::lock_guard<std::mutex> l(mutex_);
     if (not isRunningLocked()) {
       return;
@@ -1626,19 +1659,25 @@ std::string Task::errorMessage() const {
 StopReason Task::enter(ThreadState& state) {
   std::lock_guard<std::mutex> l(mutex_);
   VELOX_CHECK(state.isEnqueued);
+  // 表明弹出队列？
   state.isEnqueued = false;
+  // 其他调用了terminate，自然会影响到当前的driver
   if (state.isTerminated) {
     return StopReason::kAlreadyTerminated;
   }
+  // 已经在线程上了，直接返回
   if (state.isOnThread()) {
     return StopReason::kAlreadyOnThread;
   }
   auto reason = shouldStopLocked();
   if (reason == StopReason::kTerminate) {
+    // 设置状态为终结
     state.isTerminated = true;
   }
   if (reason == StopReason::kNone) {
+    // 增加线程数
     ++numThreads_;
+    // 设置线程状态里的线程为当前线程
     state.setThread();
     state.hasBlockingFuture = false;
   }
@@ -1646,10 +1685,12 @@ StopReason Task::enter(ThreadState& state) {
 }
 
 StopReason Task::enterForTerminateLocked(ThreadState& state) {
+    // 如果driver在线程上的话，只是设置它的isTerminate
   if (state.isOnThread() || state.isTerminated) {
     state.isTerminated = true;
     return StopReason::kAlreadyOnThread;
   }
+  // 由当前线程负责清理资源
   state.isTerminated = true;
   state.setThread();
   return StopReason::kTerminate;
@@ -1657,11 +1698,15 @@ StopReason Task::enterForTerminateLocked(ThreadState& state) {
 
 StopReason Task::leave(ThreadState& state) {
   std::lock_guard<std::mutex> l(mutex_);
+  // 减少线程数
   if (--numThreads_ == 0) {
     finishedLocked();
   }
+  // 重置线程状态
   state.clearThread();
+  // 如果被终结了，就返回终结停止原因
   if (state.isTerminated) {
+    // 这里为什么不返回AlreadyTerminate
     return StopReason::kTerminate;
   }
   auto reason = shouldStopLocked();
@@ -1676,9 +1721,11 @@ StopReason Task::enterSuspended(ThreadState& state) {
   VELOX_CHECK(state.isOnThread());
   std::lock_guard<std::mutex> l(mutex_);
   if (state.isTerminated) {
+    // 返回已经终结
     return StopReason::kAlreadyTerminated;
   }
   if (!state.isOnThread()) {
+    // 不在线程上也返回已经终结？什么几把玩意
     return StopReason::kAlreadyTerminated;
   }
   auto reason = shouldStopLocked();
@@ -1742,6 +1789,7 @@ StopReason Task::shouldStop() {
 }
 
 void Task::finishedLocked() {
+    // 通知线程完成的promise
   for (auto& promise : threadFinishPromises_) {
     promise.setValue();
   }
@@ -1749,9 +1797,11 @@ void Task::finishedLocked() {
 }
 
 StopReason Task::shouldStopLocked() {
+    // 如果有终结请求的话
   if (terminateRequested_) {
     return StopReason::kTerminate;
   }
+  // 如果有暂停请求的话
   if (pauseRequested_) {
     return StopReason::kPause;
   }
@@ -1759,6 +1809,7 @@ StopReason Task::shouldStopLocked() {
     --toYield_;
     return StopReason::kYield;
   }
+  // 否则返回None
   return StopReason::kNone;
 }
 

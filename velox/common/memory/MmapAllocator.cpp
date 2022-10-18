@@ -29,6 +29,7 @@ MmapAllocator::MmapAllocator(const MmapAllocatorOptions& options)
           options.capacity / kPageSize,
           64 * sizeClassSizes_.back())),
       useMmapArena_(options.useMmapArena) {
+        // capacity_是page的数量
   for (int size : sizeClassSizes_) {
     sizeClasses_.push_back(std::make_unique<SizeClass>(capacity_ / size, size));
   }
@@ -49,22 +50,28 @@ bool MmapAllocator::allocate(
     Allocation& out,
     std::function<void(int64_t)> beforeAllocCB,
     MachinePageCount minSizeClass) {
+        // 先释放内存
   auto numFreed = freeInternal(out);
   if (numFreed != 0) {
     numAllocated_.fetch_sub(numFreed);
   }
   auto mix = allocationSize(numPages, minSizeClass);
+  // 如果已经分配的空间加上需要的总pages数量大于容量时，则无法分配了
   if (numAllocated_ + mix.totalPages > capacity_) {
     return false;
   }
+  // 如果还有page可以分配
+ // 这里为什么再检查一遍
   if (numAllocated_.fetch_add(mix.totalPages) + mix.totalPages > capacity_) {
     numAllocated_.fetch_sub(mix.totalPages);
     return false;
   }
   ++numAllocations_;
+  // 这个是统计数据
   numAllocatedPages_ += mix.totalPages;
   if (beforeAllocCB) {
     try {
+        // 尝试回调
       beforeAllocCB(mix.totalPages * kPageSize);
     } catch (const std::exception& e) {
       numAllocated_.fetch_sub(mix.totalPages);
@@ -112,6 +119,7 @@ bool MmapAllocator::ensureEnoughMappedPages(int32_t newMappedNeeded) {
   }
   int totalMaps = numMapped_.fetch_add(newMappedNeeded) + newMappedNeeded;
   if (totalMaps <= capacity_) {
+    // 总的映射小于容量
     // We are not at capacity. No need to advise away.
     return true;
   }
@@ -133,11 +141,12 @@ int64_t MmapAllocator::free(Allocation& allocation) {
   return numFreed * kPageSize;
 }
 MachinePageCount MmapAllocator::freeInternal(Allocation& allocation) {
+    // 如果没有run直接返回
   if (allocation.numRuns() == 0) {
     return 0;
   }
   MachinePageCount numFreed = 0;
-
+    // 遍历每一个sizeClass
   for (auto i = 0; i < sizeClasses_.size(); ++i) {
     auto& sizeClass = sizeClasses_[i];
     int32_t pages = 0;
@@ -153,8 +162,10 @@ MachinePageCount MmapAllocator::freeInternal(Allocation& allocation) {
       auto sizeIndex = Stats::sizeIndex(sizeClassSizes_[i] * kPageSize);
       stats_.sizes[sizeIndex].freeClocks += clocks;
     }
+    // 增加释放的page
     numFreed += pages;
   }
+  // 清除
   allocation.clear();
   return numFreed;
 }
@@ -182,6 +193,7 @@ bool MmapAllocator::allocateContiguousImpl(
   // cover the new size, as other threads might grab the transiently
   // free pages.
   if (collateral) {
+    // 这堆内存没有实际unmap掉
     numCollateralPages = freeInternal(*collateral);
   }
   int64_t numLargeCollateralPages = allocation.numPages();
@@ -190,6 +202,7 @@ bool MmapAllocator::allocateContiguousImpl(
       std::lock_guard<std::mutex> l(arenaMutex_);
       managedArenas_->free(allocation.data(), allocation.size());
     } else {
+        // 这堆内存是实际unmap掉的
       if (munmap(allocation.data(), allocation.size()) < 0) {
         LOG(ERROR) << "munmap got " << errno << "for " << allocation.data()
                    << ", " << allocation.size();
@@ -333,6 +346,7 @@ MmapAllocator::SizeClass::SizeClass(size_t capacity, MachinePageCount unitSize)
       pageMapped_(pageBitmapSize_ + kSimdTail) {
   VELOX_CHECK(
       capacity_ % 64 == 0, "Sizeclass must have a multiple of 64 capacity.");
+      // 利用mmap分配空间
   void* ptr = mmap(
       nullptr,
       capacity_ * unitSize_ * kPageSize,
@@ -427,6 +441,7 @@ bool MmapAllocator::SizeClass::allocate(
     int32_t owner,
     MachinePageCount& numUnmapped,
     MmapAllocator::Allocation& out) {
+    // 加锁
   std::lock_guard<std::mutex> l(mutex_);
   return allocateLocked(numPages, owner, &numUnmapped, out);
 }
@@ -440,6 +455,7 @@ bool MmapAllocator::SizeClass::allocateLocked(
   ClassPageCount considerMappedOnly = std::min(numMappedFreePages_, numPages);
   auto numPagesToGo = numPages;
   if (considerMappedOnly) {
+    // 拿到out之前的页面数量
     int previousPages = out.numPages();
     allocateFromMappdFree(considerMappedOnly, out);
     auto numAllocated = (out.numPages() - previousPages) / unitSize_;
@@ -452,9 +468,11 @@ bool MmapAllocator::SizeClass::allocateLocked(
   if (!numPagesToGo) {
     return true;
   }
+  // 如果是nullptr的话直接返回
   if (!numUnmapped) {
     return false;
   }
+  // 时钟把手
   uint32_t cursor = clockHand_;
   int numWordsTried = 0;
   for (;;) {
@@ -462,13 +480,17 @@ bool MmapAllocator::SizeClass::allocateLocked(
     if (++cursor >= numWords) {
       cursor = 0;
     }
+    // 如果循环了一定次数，则退出
     if (++numWordsTried > numWords) {
       return false;
     }
+    // 检查下这个位置的page有没有空闲的
     uint64_t bits = pageAllocated_[cursor];
+    //如果存在空闲的pages
     if (bits != kAllSet) {
       int previousToGo = numPagesToGo;
       allocateAny(cursor, numPagesToGo, *numUnmapped, out);
+      // 这个和好像没什么用，统计数据吧
       numAllocatedUnmapped_ += previousToGo - numPagesToGo;
       if (numPagesToGo == 0) {
         clockHand_ = previousCursor;
@@ -484,18 +506,24 @@ bool isAllZero(xsimd::batch<uint64_t> bits) {
       simd::toBitMask(bits == xsimd::broadcast<uint64_t>(0));
 }
 } // namespace
-
+// 返回哪个bit是free的
 int32_t MmapAllocator::SizeClass::findMappedFreeGroup() {
+    // 假设是2
   constexpr int32_t kWidth = xsimd::batch<int64_t>::size;
+  // 从上次寻找的位置开始
   int32_t index = lastLookupIndex_;
+  // 不支持last look up的的情况
   if (index == kNoLastLookup) {
     index = 0;
   }
+  // size本身已经包括SimdTail了阿，这里还加干什么？
   auto lookupSize = mappedFreeLookup_.size() + kSimdTail;
   for (auto counter = 0; counter <= lookupSize; ++counter) {
+    // 未对其的加载
     auto candidates = xsimd::load_unaligned(mappedFreeLookup_.data() + index);
     auto bits = simd::allSetBitMask<int64_t>() ^
         simd::toBitMask(candidates == xsimd::broadcast<uint64_t>(0LL));
+        // 得到的结果是0
     if (!bits) {
       index = index + kWidth <= mappedFreeLookup_.size() - kWidth
           ? index + kWidth
@@ -506,13 +534,15 @@ int32_t MmapAllocator::SizeClass::findMappedFreeGroup() {
     auto wordIndex = count_trailing_zeros(bits);
     auto word = mappedFreeLookup_[index + wordIndex];
     auto bit = count_trailing_zeros(word);
+    // 计算是第几个bit
     return (index + wordIndex) * 64 + bit;
   }
+  // 下面不用看
   ClassPageCount ignore = 0;
   checkConsistency(ignore, ignore);
   LOG(FATAL) << "MMAPL: Inconsistent mapped free lookup class " << unitSize_;
 }
-
+// 8 8 8 8
 xsimd::batch<uint64_t> MmapAllocator::SizeClass::mappedFreeBits(int32_t index) {
   return (xsimd::load_unaligned(pageAllocated_.data() + index) ^
           xsimd::broadcast<uint64_t>(~0UL)) &
@@ -522,19 +552,28 @@ xsimd::batch<uint64_t> MmapAllocator::SizeClass::mappedFreeBits(int32_t index) {
 void MmapAllocator::SizeClass::allocateFromMappdFree(
     int32_t numPages,
     Allocation& allocation) {
+    // 代表SIMD向量里面有几条数据
+    // 比如128能存2个64，则kwidth是2?
   constexpr int32_t kWidth = xsimd::batch<int64_t>::size;
+  // 256 / 64 --> 4
   constexpr int32_t kWordsPerGroup = kPagesPerLookupBit / 64;
+  // 需要的page数量
   int needed = numPages;
+  // 循环
   for (;;) {
+    // 注意这里有一个*的操作
     auto group = findMappedFreeGroup() * kWordsPerGroup;
+    // 这应该是一个free都没有？
     if (group < 0) {
       return;
     }
     bool anyFound = false;
     for (auto index = group; index <= group + kWidth; index += kWidth) {
+        // 每次检查一个宽度的比特值
       auto bits = mappedFreeBits(index);
       uint16_t mask = simd::allSetBitMask<int64_t>() ^
           simd::toBitMask(bits == xsimd::broadcast<uint64_t>(0));
+          // 因为我们在做更细粒度的检查，所以是有可能mask为0的
       if (!mask) {
         if (!(index < group + kWidth || anyFound)) {
           LOG(ERROR) << "MMAPL: Lookup bit set but no free mapped pages class "
@@ -544,6 +583,8 @@ void MmapAllocator::SizeClass::allocateFromMappdFree(
         }
         continue;
       }
+      // 如果是256的话，会有4个word
+      // 获取最后一个bit的同时清除掉最后一个bit
       auto firstWord = bits::getAndClearLastSetBit(mask);
       anyFound = true;
       auto allUsed = bits::testBits(
@@ -556,6 +597,7 @@ void MmapAllocator::SizeClass::allocateFromMappdFree(
               return false;
             }
             auto page = index * 64 + bit;
+            // 设置页面已经分配
             bits::setBit(pageAllocated_.data(), page);
             allocation.append(
                 address_ + page * unitSize_ * kPageSize, unitSize_);
@@ -580,9 +622,11 @@ MachinePageCount MmapAllocator::SizeClass::adviseAway(
     MachinePageCount numPages,
     MmapAllocator* allocator) {
   // Allocate as many mapped free pages as needed and advise them away.
+  // target表明需要几个unit
   ClassPageCount target = bits::roundUp(numPages, unitSize_) / unitSize_;
   Allocation allocation(allocator);
   {
+    // 加锁
     std::lock_guard<std::mutex> l(mutex_);
     if (!numMappedFreePages_) {
       return 0;
@@ -597,6 +641,7 @@ MachinePageCount MmapAllocator::SizeClass::adviseAway(
   adviseAway(allocation);
   free(allocation);
   allocation.clear();
+  // 返回大小
   return unitSize_ * target;
 }
 
@@ -625,6 +670,7 @@ void MmapAllocator::SizeClass::setAllMapped(
 }
 
 void MmapAllocator::SizeClass::adviseAway(const Allocation& allocation) {
+    // 遍历每一个runs
   for (int i = 0; i < allocation.numRuns(); ++i) {
     PageRun run = allocation.runAt(i);
     if (!isInRange(run.data())) {
@@ -634,6 +680,7 @@ void MmapAllocator::SizeClass::adviseAway(const Allocation& allocation) {
       LOG(WARNING) << "madvise got errno " << errno;
     } else {
       std::lock_guard<std::mutex> l(mutex_);
+      // 加锁并设置成unmap
       setMappedBits(run, false);
     }
   }
@@ -642,6 +689,7 @@ void MmapAllocator::SizeClass::adviseAway(const Allocation& allocation) {
 void MmapAllocator::SizeClass::setMappedBits(
     const MappedMemory::PageRun run,
     bool value) {
+    // 拿出这个run的地址
   const uint8_t* runAddress = run.data();
   const int firstBit = (runAddress - address_) / (unitSize_ * kPageSize);
   VELOX_CHECK(
@@ -653,11 +701,13 @@ void MmapAllocator::SizeClass::setMappedBits(
   }
 }
 
+// 释放一个allocation里面的部分内存
 MachinePageCount MmapAllocator::SizeClass::free(
     MappedMemory::Allocation& allocation) {
   MachinePageCount numFreed = 0;
   int firstRunInClass = -1;
   // Check if there are any runs in 'this' outside of 'mutex_'.
+  // 遍历每一个runs
   for (int i = 0; i < allocation.numRuns(); ++i) {
     PageRun run = allocation.runAt(i);
     uint8_t* runAddress = run.data();
@@ -669,10 +719,12 @@ MachinePageCount MmapAllocator::SizeClass::free(
   if (firstRunInClass == -1) {
     return 0;
   }
+  // 加锁
   std::lock_guard<std::mutex> l(mutex_);
   for (int i = firstRunInClass; i < allocation.numRuns(); ++i) {
     PageRun run = allocation.runAt(i);
     uint8_t* runAddress = run.data();
+    // 如果不重叠，则continue
     if (!isInRange(runAddress)) {
       continue;
     }
@@ -685,6 +737,7 @@ MachinePageCount MmapAllocator::SizeClass::free(
         continue;
       }
       if (bits::isBitSet(pageMapped_.data(), page)) {
+        // 被映射着的pages
         ++numMappedFreePages_;
         markMappedFree(page);
       }
@@ -704,8 +757,10 @@ void MmapAllocator::SizeClass::allocateAny(
   int toAlloc = std::min(numPages, __builtin_popcountll(freeBits));
   for (int i = 0; i < toAlloc; ++i) {
     int bit = __builtin_ctzll(freeBits);
+    // 设置被分配了
     bits::setBit(&pageAllocated_[wordIndex], bit);
     if (!(pageMapped_[wordIndex] & (1UL << bit))) {
+        // 每个bit代表uintSize的空间
       numUnmapped += unitSize_;
     } else {
       --numMappedFreePages_;

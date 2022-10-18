@@ -205,6 +205,7 @@ BlockingReason HashProbe::isBlocked(ContinueFuture* future) {
           ->tableOrFuture(future);
   if (!hashBuildResult.has_value()) {
     VELOX_CHECK_NOT_NULL(future);
+    // 等待build table完成
     return BlockingReason::kWaitForJoinBuild;
   }
 
@@ -229,10 +230,13 @@ BlockingReason HashProbe::isBlocked(ContinueFuture* future) {
       // dynamic filters on all or a subset of the join keys. Create dynamic
       // filters to push down.
       const auto& buildHashers = table_->hashers();
+      // 返回哪些channal可以下推
       auto channels = operatorCtx_->driverCtx()->driver->canPushdownFilters(
           this, keyChannels_);
       for (auto i = 0; i < keyChannels_.size(); i++) {
+        // 如果可以下推
         if (channels.find(keyChannels_[i]) != channels.end()) {
+            // 生成动态filter
           if (auto filter = buildHashers[i]->getFilter(false)) {
             dynamicFilters_.emplace(keyChannels_[i], std::move(filter));
           }
@@ -243,7 +247,7 @@ BlockingReason HashProbe::isBlocked(ContinueFuture* future) {
       prepareForNullAwareAntiJoinWithFilter();
     }
   }
-
+    // 没有阻塞
   return BlockingReason::kNotBlocked;
 }
 

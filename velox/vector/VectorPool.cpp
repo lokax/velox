@@ -76,6 +76,7 @@ VectorPtr VectorPool::TypePool::pop(
     memory::MemoryPool& pool) {
   if (size) {
     auto result = std::move(vectors[--size]);
+    // 重新设置位掩码
     if (UNLIKELY(result->rawNulls() != nullptr)) {
       // This is a recyclable vector, no need to check uniqueness.
       simd::memset(
@@ -96,6 +97,7 @@ VectorPtr VectorPool::TypePool::pop(
     }
     return result;
   }
+  // 没有的话，则直接自己创建
   return BaseVector::create(type, vectorSize, &pool);
 }
 } // namespace facebook::velox

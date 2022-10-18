@@ -166,7 +166,7 @@ class LocalPartition : public Operator {
   }
 
   void addInput(RowVectorPtr input) override;
-
+    // 输出返回nullptr
   RowVectorPtr getOutput() override {
     return nullptr;
   }

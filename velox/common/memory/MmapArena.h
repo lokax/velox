@@ -32,6 +32,7 @@ class MmapArena {
   // capacity from the ratio is too small to serve large allocations.
   static constexpr int64_t kMinCapacityBytes = 128 * 1024 * 1024; // 128M
 
+    // 最小是1MB
   // MmapArena capacity should be multiple of kMinGrainSizeBytes.
   static constexpr uint64_t kMinGrainSizeBytes = 1024 * 1024; // 1M
 

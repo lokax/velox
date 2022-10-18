@@ -22,6 +22,7 @@ void ConstantExpr::evalSpecialForm(
     EvalCtx& context,
     VectorPtr& result) {
   if (!sharedSubexprValues_) {
+    // 如果没有，则创建一个
     sharedSubexprValues_ =
         BaseVector::createConstant(value_, 1, context.execCtx()->pool());
   }
@@ -59,7 +60,7 @@ void ConstantExpr::evalSpecialFormSimplified(
   // Simplified path should never ask us to write to a vector that was already
   // pre-allocated.
   VELOX_CHECK(result == nullptr);
-
+    // 这里忽略rows的选择阿
   if (sharedSubexprValues_ == nullptr) {
     result = BaseVector::createConstant(value_, rows.end(), context.pool());
   } else {

@@ -218,6 +218,7 @@ VectorPtr EvalCtx::ensureFieldLoaded(
     int32_t index,
     const SelectivityVector& rows) {
   auto field = getField(index);
+  // 如果是lazy向量并且没有加载
   if (isLazyNotLoaded(*field)) {
     const auto& rowsToLoad = isFinalSelection_ ? rows : *finalSelection_;
 
@@ -226,6 +227,7 @@ VectorPtr EvalCtx::ensureFieldLoaded(
     LocalSelectivityVector baseRowsHolder(*this, 0);
     auto baseRows = baseRowsHolder.get();
     auto rawField = field.get();
+    // 确保已经加载数据
     LazyVector::ensureLoadedRows(field, rowsToLoad, *decoded, *baseRows);
     if (rawField != field.get()) {
       if (peeledFields_.empty()) {

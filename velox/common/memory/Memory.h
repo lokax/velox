@@ -680,6 +680,7 @@ MemoryPoolImpl<Allocator, ALIGNMENT>::MemoryPoolImpl(
 template <typename Allocator, uint16_t ALIGNMENT>
 void* FOLLY_NULLABLE
 MemoryPoolImpl<Allocator, ALIGNMENT>::allocate(int64_t size) {
+    // 这是到达容量的意思吗
   if (this->isMemoryCapped()) {
     VELOX_MEM_MANUAL_CAP();
   }
@@ -746,6 +747,7 @@ int64_t MemoryPoolImpl<Allocator, ALIGNMENT>::getCurrentBytes() const {
 
 template <typename Allocator, uint16_t ALIGNMENT>
 int64_t MemoryPoolImpl<Allocator, ALIGNMENT>::getMaxBytes() const {
+    // 子树的最大还是自己的最大
   return std::max(getSubtreeMaxBytes(), localMemoryUsage_.getMaxBytes());
 }
 
@@ -793,7 +795,7 @@ template <typename Allocator, uint16_t ALIGNMENT>
 uint16_t MemoryPoolImpl<Allocator, ALIGNMENT>::getAlignment() const {
   return ALIGNMENT;
 }
-
+// 冻结内存？
 template <typename Allocator, uint16_t ALIGNMENT>
 void MemoryPoolImpl<Allocator, ALIGNMENT>::capMemoryAllocation() {
   capped_.store(true);
@@ -808,10 +810,12 @@ void MemoryPoolImpl<Allocator, ALIGNMENT>::uncapMemoryAllocation() {
   // in MemoryManager, only parent has the right to lift the cap.
   // This suffices because parent will then recursively lift the cap on the
   // entire tree.
+  // 如果暂用的内存依然大于Cap，则不解冻
   if (getAggregateBytes() > getCap()) {
     return;
   }
   if (auto parentPtr = parent_.lock()) {
+    // 父节点还没有解冻，那么这里也直接返回
     if (parentPtr->isMemoryCapped()) {
       return;
     }
@@ -853,6 +857,7 @@ template <typename Allocator, uint16_t ALIGNMENT>
 int64_t MemoryPoolImpl<Allocator, ALIGNMENT>::getSubtreeMaxBytes() const {
   int64_t maxBytes;
   accessSubtreeMemoryUsage([&maxBytes](const MemoryUsage& subtreeUsage) {
+    // TODO(lokax): 这个实现看起来不对?
     maxBytes = subtreeUsage.getMaxBytes();
   });
   return maxBytes;
@@ -874,11 +879,12 @@ void MemoryPoolImpl<Allocator, ALIGNMENT>::updateSubtreeMemoryUsage(
 
 template <typename Allocator, uint16_t ALIGNMENT>
 void MemoryPoolImpl<Allocator, ALIGNMENT>::reserve(int64_t size) {
+  // 更新内存的使用情况统计数据
   if (memoryUsageTracker_) {
     memoryUsageTracker_->update(size);
   }
   localMemoryUsage_.incrementCurrentBytes(size);
-
+    // 如果没有超过内存配额
   bool success = memoryManager_.reserve(size);
   bool manualCap = isMemoryCapped();
   int64_t aggregateBytes = getAggregateBytes();
@@ -889,9 +895,11 @@ void MemoryPoolImpl<Allocator, ALIGNMENT>::reserve(int64_t size) {
     // more conservative side.
     release(size);
     if (!success) {
+        // 超过配额
       VELOX_MEM_MANAGER_CAP_EXCEEDED(memoryManager_.getMemoryQuota());
     }
     if (manualCap) {
+        // 手动冻结的情况
       VELOX_MEM_MANUAL_CAP();
     }
     auto errorMessage = fmt::format(

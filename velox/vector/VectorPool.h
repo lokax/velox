@@ -56,7 +56,7 @@ class VectorPool {
         vector_size_t vectorSize,
         memory::MemoryPool& pool);
   };
-
+    // 内存池
   memory::MemoryPool* const pool_;
 
   /// Caches of pre-allocated vectors indexed by typeKind.

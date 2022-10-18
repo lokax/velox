@@ -36,7 +36,7 @@ class FilterProject : public Operator {
   bool preservesOrder() const override {
     return true;
   }
-
+    // 如果没有输入，就需要输入
   bool needsInput() const override {
     return !input_;
   }
@@ -44,7 +44,7 @@ class FilterProject : public Operator {
   void addInput(RowVectorPtr input) override;
 
   RowVectorPtr getOutput() override;
-
+    // 这个算子从来不会阻塞
   BlockingReason isBlocked(ContinueFuture* /* unused */) override {
     return BlockingReason::kNotBlocked;
   }

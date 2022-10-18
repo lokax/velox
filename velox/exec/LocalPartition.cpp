@@ -58,6 +58,7 @@ std::vector<ContinuePromise> LocalExchangeMemoryManager::decreaseMemoryUsage(
 void LocalExchangeQueue::addProducer() {
   queue_.withWLock([&](auto& /*queue*/) {
     VELOX_CHECK(!noMoreProducers_, "addProducer called after noMoreProducers");
+    // 增加pending的producer？
     ++pendingProducers_;
   });
 }
@@ -67,11 +68,14 @@ void LocalExchangeQueue::noMoreProducers() {
   std::vector<ContinuePromise> producerPromises;
   queue_.withWLock([&](auto& queue) {
     VELOX_CHECK(!noMoreProducers_, "noMoreProducers can be called only once");
+    // 没有更多的生产者
     noMoreProducers_ = true;
+    // 如果pending的也没有
     if (pendingProducers_ == 0) {
+        // 可能还有一堆消费者在等待输出,所以我们需要通知它们
       // No more data will be produced.
       consumerPromises = std::move(consumerPromises_);
-
+        // 这个有必要吗？不是没有生产者了吗?
       if (queue.empty()) {
         // All data has been consumed.
         producerPromises = std::move(producerPromises_);
@@ -85,6 +89,7 @@ void LocalExchangeQueue::noMoreProducers() {
 BlockingReason LocalExchangeQueue::enqueue(
     RowVectorPtr input,
     ContinueFuture* future) {
+        // 输入向量的字节数
   auto inputBytes = input->retainedSize();
 
   std::vector<ContinuePromise> consumerPromises;
@@ -92,7 +97,9 @@ BlockingReason LocalExchangeQueue::enqueue(
     if (closed_) {
       return true;
     }
+    // push到队列中
     queue.push(std::move(input));
+    // 把消费者的promise拿出来，以便通知它们
     consumerPromises = std::move(consumerPromises_);
     return false;
   });
@@ -100,13 +107,14 @@ BlockingReason LocalExchangeQueue::enqueue(
   if (isClosed) {
     return BlockingReason::kNotBlocked;
   }
-
+    // 通知每一个消费者
   notify(consumerPromises);
-
+    // 增加内存使用，如果超出内存，则阻塞
   if (memoryManager_->increaseMemoryUsage(future, inputBytes)) {
+    // 阻塞生产者线程
     return BlockingReason::kWaitForConsumer;
   }
-
+    // 没超出内存，不需要进行阻塞
   return BlockingReason::kNotBlocked;
 }
 
@@ -115,6 +123,8 @@ void LocalExchangeQueue::noMoreData() {
   std::vector<ContinuePromise> producerPromises;
   queue_.withWLock([&](auto queue) {
     VELOX_CHECK_GT(pendingProducers_, 0);
+    // 因为是一个producer调用的这个队列的noMoreData
+    // 所以这里减少pendingProducer
     --pendingProducers_;
     if (noMoreProducers_ && pendingProducers_ == 0) {
       consumerPromises = std::move(consumerPromises_);
@@ -136,19 +146,20 @@ BlockingReason LocalExchangeQueue::next(
   auto blockingReason = queue_.withWLock([&](auto& queue) {
     *data = nullptr;
     if (queue.empty()) {
+        // 队列是空，并且已经完成了，则线程不需要进入阻塞态
       if (isFinishedLocked(queue)) {
         return BlockingReason::kNotBlocked;
       }
-
+        // 添加消费者promise，以便将来生产者可以进行通知
       consumerPromises_.emplace_back("LocalExchangeQueue::next");
       *future = consumerPromises_.back().getSemiFuture();
-
+        // 等待生产者通知
       return BlockingReason::kWaitForExchange;
     }
-
+    // 有数据的话，则弹出数据
     *data = queue.front();
     queue.pop();
-
+    // 减少内存使用,函数内会触发对生产者的通知
     memoryPromises =
         memoryManager_->decreaseMemoryUsage((*data)->retainedSize());
 
@@ -165,6 +176,7 @@ BlockingReason LocalExchangeQueue::next(
 
 bool LocalExchangeQueue::isFinishedLocked(
     const std::queue<RowVectorPtr>& queue) const {
+        // 如果已经关闭了，则返回true
   if (closed_) {
     return true;
   }
@@ -181,14 +193,14 @@ BlockingReason LocalExchangeQueue::isFinished(ContinueFuture* future) {
     if (isFinishedLocked(queue)) {
       return BlockingReason::kNotBlocked;
     }
-
+    // 生产者promise，等待消费者进行通知
     producerPromises_.emplace_back("LocalExchangeQueue::isFinished");
     *future = producerPromises_.back().getSemiFuture();
-
+    // 阻塞等待消费者进行通知
     return BlockingReason::kWaitForConsumer;
   });
 }
-
+// 返回是否完成，不需要future
 bool LocalExchangeQueue::isFinished() {
   return queue_.withWLock([&](auto& queue) { return isFinishedLocked(queue); });
 }
@@ -210,13 +222,14 @@ void LocalExchangeQueue::close() {
 
     producerPromises = std::move(producerPromises_);
     consumerPromises = std::move(consumerPromises_);
+    // 设置closed是true
     closed_ = true;
   });
   notify(producerPromises);
   notify(consumerPromises);
   notify(memoryPromises);
 }
-
+// exchange算子
 LocalExchange::LocalExchange(
     int32_t operatorId,
     DriverCtx* ctx,
@@ -329,8 +342,9 @@ wrapChildren(const RowVectorPtr& input, vector_size_t size, BufferPtr indices) {
       input->pool(), input->type(), BufferPtr(nullptr), size, wrappedChildren);
 }
 } // namespace
-
+// 添加输入数据
 void LocalPartition::addInput(RowVectorPtr input) {
+    // 更新统计数据
   stats_.outputBytes += input->estimateFlatSize();
   stats_.outputPositions += input->size();
 
@@ -340,10 +354,11 @@ void LocalPartition::addInput(RowVectorPtr input) {
   }
 
   input_ = std::move(input);
-
+    // 如果只有一个分区
   if (numPartitions_ == 1) {
     blockingReasons_[0] = queues_[0]->enqueue(input_, &futures_[0]);
     if (blockingReasons_[0] != BlockingReason::kNotBlocked) {
+        // 一个阻塞的分区
       numBlockedPartitions_ = 1;
     }
   } else {
@@ -359,7 +374,7 @@ void LocalPartition::addInput(RowVectorPtr input) {
       rawIndices[partition][maxIndex[partition]] = i;
       ++maxIndex[partition];
     }
-
+    // 分区后放到对应的队列中去
     for (auto i = 0; i < numPartitions_; i++) {
       auto partitionSize = maxIndex[i];
       if (partitionSize == 0) {
@@ -382,12 +397,16 @@ void LocalPartition::addInput(RowVectorPtr input) {
 }
 
 BlockingReason LocalPartition::isBlocked(ContinueFuture* future) {
+    // 如果有阻塞的分区
   if (numBlockedPartitions_) {
     --numBlockedPartitions_;
+    // 移动future出去
     *future = std::move(futures_[numBlockedPartitions_]);
+    // 返回阻塞的原因
     return blockingReasons_[numBlockedPartitions_];
   }
-
+    // 如果没有分区被阻塞
+    // 如果没有更多的输入
   if (noMoreInput_) {
     for (const auto& queue : queues_) {
       auto reason = queue->isFinished(future);

@@ -201,14 +201,17 @@ class EvalCtx {
       const VectorPtr& localResult,
       const SelectivityVector& rows,
       VectorPtr& result) const {
+        // 如果result本身已经有了
     if (result && !isFinalSelection() && *finalSelection() != rows) {
+        // 执行拷贝
       BaseVector::ensureWritable(rows, result->type(), result->pool(), result);
       result->copy(localResult.get(), rows, nullptr);
     } else {
+        // 直接拷贝指针
       result = localResult;
     }
   }
-
+    // 向量池
   VectorPool& vectorPool() const {
     return execCtx_->vectorPool();
   }

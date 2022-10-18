@@ -39,6 +39,7 @@ struct SizeClassStats {
   //// Size of the tracked size class  in pages.
   int32_t size{0};
 
+    // 花费在内存分配上的cpu时间
   /// Cumulative CPU clocks spent inside allocation.
   std::atomic<uint64_t> allocateClocks{0};
 
@@ -135,7 +136,7 @@ struct Stats {
 
   /// Counters for each size class.
   std::array<SizeClassStats, kNumSizes> sizes;
-
+    // 页面预取？
   /// Cumulative count of pages advised away, if the allocator exposes this.
   int64_t numAdvise{0};
 };
@@ -187,6 +188,7 @@ class MappedMemory : public std::enable_shared_from_this<MappedMemory> {
       VELOX_CHECK(
           (word & ~kPointerMask) == 0,
           "A pointer must have its 16 high bits 0");
+    // 最高16位用来存page的数量
       data_ =
           word | (static_cast<uint64_t>(numPages) << kPointerSignificantBits);
     }
@@ -282,6 +284,7 @@ class MappedMemory : public std::enable_shared_from_this<MappedMemory> {
     ContiguousAllocation() = default;
     ~ContiguousAllocation() {
       if (data_ && mappedMemory_) {
+        // 释放内存
         mappedMemory_->freeContiguous(*this);
       }
       data_ = nullptr;
@@ -595,6 +598,7 @@ class ScopedMappedMemory final : public MappedMemory {
   std::shared_ptr<MemoryUsageTracker> tracker_;
 };
 
+// 使用MappedMemmory作为标准库容器的分配器
 // An Allocator backed by MappedMemory for for STL containers.
 template <class T>
 struct StlMappedMemoryAllocator {

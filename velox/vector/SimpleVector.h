@@ -109,7 +109,7 @@ class SimpleVector : public BaseVector {
             storageByteCount) {}
 
   virtual ~SimpleVector() override {}
-
+    // 返回统计数据
   SimpleVectorStats<T> getStats() const {
     return stats_;
   }

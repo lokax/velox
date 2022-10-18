@@ -42,6 +42,7 @@ void EnforceSingleRow::addInput(RowVectorPtr input) {
         numInput);
     input_ = std::move(input);
   } else {
+    // 不是一行数据就报错
     VELOX_USER_FAIL(
         "Expected single row of input. Received {} extra rows.", numInput);
   }

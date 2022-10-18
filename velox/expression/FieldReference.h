@@ -36,8 +36,9 @@ class FieldReference : public SpecialForm {
   const std::string& field() const {
     return field_;
   }
-
+    // 返回这个字段在行中的索引
   int32_t index(const EvalCtx& context) {
+    // 记忆化
     if (index_ != -1) {
       return index_;
     }
@@ -60,6 +61,7 @@ class FieldReference : public SpecialForm {
  protected:
   void computeMetadata() override {
     propagatesNulls_ = true;
+    // 如果没有输入表达式
     if (inputs_.empty()) {
       distinctFields_.resize(1);
       distinctFields_[0] = this;

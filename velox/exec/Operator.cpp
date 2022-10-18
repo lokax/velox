@@ -208,7 +208,9 @@ RowVectorPtr Operator::fillOutput(vector_size_t size, BufferPtr mapping) {
   bool wrapResults = true;
   if (size == input_->size() &&
       (!mapping || isSequence(mapping->as<vector_size_t>(), 0, size))) {
+        // 输入和输出的字段完全相同?
     if (isIdentityProjection_) {
+        // 直接移动输入出去?
       return std::move(input_);
     }
     wrapResults = false;
@@ -216,8 +218,10 @@ RowVectorPtr Operator::fillOutput(vector_size_t size, BufferPtr mapping) {
 
   std::vector<VectorPtr> columns(outputType_->size());
   if (!identityProjections_.empty()) {
+    // input_是rowVector，children则是每一个列的Vector
     auto input = input_->children();
     for (auto& projection : identityProjections_) {
+        // 智能指针的拷贝
       columns[projection.outputChannel] = wrapResults
           ? wrapChild(size, mapping, input[projection.inputChannel])
           : input[projection.inputChannel];

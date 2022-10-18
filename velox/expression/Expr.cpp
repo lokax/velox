@@ -109,7 +109,7 @@ bool hasConditionals(Expr* expr) {
   return false;
 }
 } // namespace
-
+// 表达式构建器
 Expr::Expr(
     TypePtr type,
     std::vector<std::shared_ptr<Expr>>&& inputs,
@@ -130,6 +130,7 @@ Expr::Expr(
   inputIsConstant_.reserve(inputs_.size());
   for (auto& expr : inputs_) {
     if (auto constantExpr = std::dynamic_pointer_cast<ConstantExpr>(expr)) {
+        // 如果是常量表达式，则直接保存常量值
       constantInputs_.emplace_back(constantExpr->value());
       inputIsConstant_.push_back(true);
     } else {
@@ -175,7 +176,7 @@ bool Expr::allSupportFlatNoNullsFastPath(
 
   return true;
 }
-
+// 计算元数据
 void Expr::computeMetadata() {
   // Sets propagatesNulls if all subtrees propagate nulls.
   // Sets isDeterministic to false if some subtree is non-deterministic.
@@ -187,23 +188,27 @@ void Expr::computeMetadata() {
     propagatesNulls_ = true;
     deterministic_ = true;
   } else if (vectorFunction_) {
+    // 函数里面包括这些属性
     propagatesNulls_ = vectorFunction_->isDefaultNullBehavior();
     deterministic_ = vectorFunction_->isDeterministic();
   }
-
+    // 遍历每一个输入表达式
   for (auto& input : inputs_) {
+    // 递归计算输入的meta data
     input->computeMetadata();
     deterministic_ &= input->deterministic_;
     propagatesNulls_ &= input->propagatesNulls_;
     mergeFields(
         distinctFields_, multiplyReferencedFields_, input->distinctFields_);
   }
+  // 这里感觉多此一举
   if (isSpecialForm()) {
     propagatesNulls_ = propagatesNulls();
   }
   for (auto& input : inputs_) {
     if (!input->isMultiplyReferenced_ &&
         isSameFields(distinctFields_, input->distinctFields_)) {
+            // 如果distinct filed一样，则清空掉输入的distinct filed
       input->distinctFields_.clear();
     }
   }
@@ -235,6 +240,7 @@ void Expr::evalSimplified(
     const SelectivityVector& rows,
     EvalCtx& context,
     VectorPtr& result) {
+        // 如果没有数据，直接创建空
   if (!rows.hasSelections()) {
     // empty input, return an empty vector of the right type
     result = BaseVector::createNullConstant(type(), 0, context.pool());
@@ -256,9 +262,10 @@ void Expr::evalSimplified(
   if (remainingRows->hasSelections()) {
     evalSimplifiedImpl(*remainingRows, context, result);
   }
+  // 添加NULL值
   addNulls(rows, remainingRows->asRange().bits(), context, result);
 }
-
+// 从向量池中释放掉向量
 void Expr::releaseInputValues(EvalCtx& evalCtx) {
   evalCtx.releaseVectors(inputValues_);
   inputValues_.clear();
@@ -276,13 +283,15 @@ void Expr::evalSimplifiedImpl(
 
   SelectivityVector remainingRows = rows;
   inputValues_.resize(inputs_.size());
+  // 对null值有默认行为
   const bool defaultNulls = vectorFunction_->isDefaultNullBehavior();
 
   LocalDecodedVector decodedVector(context);
   for (int32_t i = 0; i < inputs_.size(); ++i) {
     auto& inputValue = inputValues_[i];
+    // 递归处理输入, 把值保存在inputValue中
     inputs_[i]->evalSimplified(remainingRows, context, inputValue);
-
+    // 碾平输入向量
     BaseVector::flattenVector(inputValue, rows.end());
     VELOX_CHECK_EQ(VectorEncoding::Simple::FLAT, inputValue->encoding());
 
@@ -291,6 +300,7 @@ void Expr::evalSimplifiedImpl(
     if (defaultNulls && inputValue->mayHaveNulls()) {
       decodedVector.get()->decode(*inputValue, rows);
       if (auto* rawNulls = decodedVector->nulls()) {
+        // 把null值过滤掉
         remainingRows.deselectNulls(
             rawNulls, remainingRows.begin(), remainingRows.end());
       }
@@ -298,18 +308,21 @@ void Expr::evalSimplifiedImpl(
 
     // All rows are null, return a null constant.
     if (!remainingRows.hasSelections()) {
+        // 没有数据，把输入向量释放回向量池中
       releaseInputValues(context);
+      // 直接创建结果向量
       result =
           BaseVector::createNullConstant(type(), rows.size(), context.pool());
       return;
     }
   }
-
+    // 应用函数
   // Apply the actual function.
   vectorFunction_->apply(remainingRows, inputValues_, type(), context, result);
-
+    // 添加NULL值
   // Make sure the returned vector has its null bitmap properly set.
   addNulls(rows, remainingRows.asRange().bits(), context, result);
+  // 释放回去也有进行重用阿？目前实现
   releaseInputValues(context);
 }
 
@@ -437,18 +450,21 @@ void Expr::evalFlatNoNulls(
     if (constantInputs_[i]) {
       // No need to re-evaluate constant expression. Simply move constant values
       // from constantInputs_.
+      // 常量输入简单的移动出来
       inputValues_[i] = std::move(constantInputs_[i]);
       inputValues_[i]->resize(rows.size());
     } else {
+        // 递归评估输入表达式，并把结果保存到inputValues中
       inputs_[i]->evalFlatNoNulls(rows, context, inputValues_[i]);
     }
   }
-
+    // 应用向量函数
   applyFunction(rows, context, result);
 
   // Move constant values back to constantInputs_.
   for (int32_t i = 0; i < inputs_.size(); ++i) {
     if (inputIsConstant_[i]) {
+        // 移动回去
       constantInputs_[i] = std::move(inputValues_[i]);
       VELOX_CHECK_NULL(inputValues_[i]);
     }
@@ -473,7 +489,7 @@ void Expr::eval(
   ExceptionContextSetter exceptionContext(
       {topLevel ? onTopLevelException : onException,
        topLevel ? (void*)&exprExceptionContext : this});
-
+    // 没有数据，直接创建空向量
   if (!rows.hasSelections()) {
     // empty input, return an empty vector of the right type
     result = BaseVector::createNullConstant(type(), 0, context.pool());
@@ -512,6 +528,7 @@ void Expr::eval(
     return;
   }
 
+    // 这里就是公共子表达式的逻辑？
   // Check if this expression has been evaluated already. If so, fetch and
   // return the previously computed result.
   if (checkGetSharedSubexprValues(rows, context, result)) {
@@ -539,20 +556,24 @@ bool Expr::checkGetSharedSubexprValues(
       context.wrapEncoding() != VectorEncoding::Simple::FLAT) {
     return false;
   }
-
+    // 说明有部分行不太一样
   if (!rows.isSubset(*sharedSubexprRows_)) {
     LocalSelectivityVector missingRowsHolder(context, rows);
+    // 相当于拷贝了一份rows到missingRows中
     auto missingRows = missingRowsHolder.get();
     VELOX_DCHECK_NOT_NULL(missingRows);
+    // 相当于过滤出一堆还没计算过的rows
     missingRows->deselect(*sharedSubexprRows_);
 
     // Add the missingRows to sharedSubexprRows_ that will eventually be
     // evaluated and added to sharedSubexprValues_.
+    // 相当于把缺失的行添加进去
     sharedSubexprRows_->select(*missingRows);
 
     // Fix finalSelection to avoid losing values outside missingRows.
     LocalSelectivityVector newFinalSelectionHolder(
         context, *sharedSubexprRows_);
+        // 这个相当于拷贝了sharedSubexprRows
     auto newFinalSelection = newFinalSelectionHolder.get();
     VELOX_DCHECK_NOT_NULL(newFinalSelection);
     if (!context.isFinalSelection()) {
@@ -570,6 +591,7 @@ bool Expr::checkGetSharedSubexprValues(
 
     evalEncodings(*missingRows, context, sharedSubexprValues_);
   }
+  // 把值拷贝到resul上
   context.moveOrCopyResult(sharedSubexprValues_, rows, result);
   return true;
 }
@@ -586,6 +608,7 @@ void Expr::checkUpdateSharedSubexprValues(
   if (!sharedSubexprRows_) {
     sharedSubexprRows_ = context.execCtx()->getSelectivityVector(rows.size());
   }
+  // 保存选择向量以及之前计算过的结果
   *sharedSubexprRows_ = rows;
   sharedSubexprValues_ = result;
 }
@@ -799,6 +822,7 @@ void Expr::evalEncodings(
     VectorPtr& result) {
   if (deterministic_ && !distinctFields_.empty()) {
     bool hasNonFlat = false;
+    // 检查是否有非flat的向量
     for (const auto& field : distinctFields_) {
       if (!isFlat(*context.getField(field->index(context)))) {
         hasNonFlat = true;
@@ -855,7 +879,7 @@ bool Expr::removeSureNulls(
   for (auto* field : distinctFields_) {
     VectorPtr values;
     field->evalSpecialForm(rows, context, values);
-
+    // 还没加载的的，暂时不处理？
     if (isLazyNotLoaded(*values)) {
       continue;
     }
@@ -867,6 +891,7 @@ bool Expr::removeSureNulls(
           result = nullHolder.get(rows);
         }
         auto bits = result->asMutableRange().bits();
+        // AND一下空值掩码
         bits::andBits(bits, rawNulls, rows.begin(), rows.end());
       }
     }
@@ -916,7 +941,7 @@ void Expr::evalWithNulls(
     result = BaseVector::createNullConstant(type(), 0, context.pool());
     return;
   }
-
+    // 如果会传播空值
   if (propagatesNulls_) {
     bool mayHaveNulls = false;
     for (const auto& field : distinctFields_) {
@@ -930,15 +955,18 @@ void Expr::evalWithNulls(
         break;
       }
     }
-
+    // 如果有可能有null值，并且distinct field不是空
     if (mayHaveNulls && !distinctFields_.empty()) {
       LocalSelectivityVector nonNullHolder(context);
+      // 提前过滤掉移除掉null值
       if (removeSureNulls(rows, context, nonNullHolder)) {
         ScopedVarSetter noMoreNulls(context.mutableNullsPruned(), true);
         if (nonNullHolder.get()->hasSelections()) {
+            // 只对非null值进行计算
           evalAll(*nonNullHolder.get(), context, result);
         }
         auto rawNonNulls = nonNullHolder.get()->asRange().bits();
+        // 添加null值
         addNulls(rows, rawNonNulls, context, result);
         return;
       }
@@ -1155,12 +1183,15 @@ void Expr::evalAll(
   // mutableRemainingRowsHolder only if needed.
   SelectivityVector* mutableRemainingRows = nullptr;
   LocalSelectivityVector mutableRemainingRowsHolder(context);
-
+    // 预留
   inputValues_.resize(inputs_.size());
+  // 遍历每一个输入表达式
   for (int32_t i = 0; i < inputs_.size(); ++i) {
+    // 对输入进行评估
     inputs_[i]->eval(*remainingRows, context, inputValues_[i]);
+    // 常量，字典，RLE可以剥离
     tryPeelArgs = tryPeelArgs && isPeelable(inputValues_[i]->encoding());
-
+    // 如果对NULL值是默认行为
     // Avoid subsequent computation on rows with known null output.
     if (defaultNulls && inputValues_[i]->mayHaveNulls()) {
       LocalDecodedVector decoded(context, *inputValues_[i], *remainingRows);
@@ -1171,7 +1202,7 @@ void Expr::evalAll(
           mutableRemainingRows = mutableRemainingRowsHolder.get(rows);
           remainingRows = mutableRemainingRows;
         }
-
+        // 把NULL值的选择向量给清掉
         mutableRemainingRows->deselectNulls(
             rawNulls, remainingRows->begin(), remainingRows->end());
 
@@ -1207,14 +1238,17 @@ void Expr::evalAll(
 
   if (!tryPeelArgs ||
       !applyFunctionWithPeeling(rows, *remainingRows, context, result)) {
+        // 直接应用函数
     applyFunction(*remainingRows, context, result);
   }
 
   // Write non-selected rows in remainingRows as nulls in the result if some
   // rows have been skipped.
   if (mutableRemainingRows != nullptr) {
+    // 添加null值
     addNulls(rows, mutableRemainingRows->asRange().bits(), context, result);
   }
+  // 释放NULL值
   releaseInputValues(context);
 }
 
@@ -1231,11 +1265,13 @@ void setPeeledArg(
 }
 } // namespace
 
+// 只对剥离出来后的不同值进行计算？
 bool Expr::applyFunctionWithPeeling(
     const SelectivityVector& rows,
     const SelectivityVector& applyRows,
     EvalCtx& context,
     VectorPtr& result) {
+        // 注意：这是context的编码
   if (context.wrapEncoding() == VectorEncoding::Simple::CONSTANT) {
     return false;
   }
@@ -1252,12 +1288,15 @@ bool Expr::applyFunctionWithPeeling(
     BufferPtr firstIndices;
     BufferPtr firstLengths;
     std::vector<VectorPtr> maybePeeled;
+    // 遍历每一个输入
     for (auto i = 0; i < inputValues_.size(); ++i) {
       auto leaf = inputValues_[i];
+    
       if (!constantArgs.empty() && constantArgs[i]) {
         setPeeledArg(leaf, i, numArgs, maybePeeled);
         continue;
       }
+      // numLevel不为0，代表有inputValue做了peeled
       if ((numLevels == 0 && leaf->isConstant(rows)) ||
           leaf->isConstantEncoding()) {
         if (leaf->isConstantEncoding()) {
@@ -1269,6 +1308,7 @@ bool Expr::applyFunctionWithPeeling(
               numArgs,
               maybePeeled);
         }
+        // 每次resize都会清空数据阿？搞毛线
         constantArgs.resize(numArgs);
         constantArgs.at(i) = true;
         ++numConstant;
@@ -1313,6 +1353,7 @@ bool Expr::applyFunctionWithPeeling(
           peeled = false;
           break;
         }
+        // 保存第一个wrapper
         if (!firstWrapper) {
           firstWrapper = leaf;
         }
@@ -1347,6 +1388,7 @@ bool Expr::applyFunctionWithPeeling(
     decoded->makeIndices(*firstWrapper, rows, numLevels);
     newRows = translateToInnerRows(applyRows, *decoded, newRowsHolder);
     context.saveAndReset(saver, rows);
+    // 这个是为什么
     setDictionaryWrapping(*decoded, rows, *firstWrapper, context);
 
     // 'newRows' comes from the set of row numbers in the base vector. These
@@ -1374,6 +1416,7 @@ void Expr::applyFunction(
     const SelectivityVector& rows,
     EvalCtx& context,
     VectorPtr& result) {
+        //这些是统计数据
   stats_.numProcessedVectors += 1;
   stats_.numProcessedRows += rows.countSelected();
   auto timer = cpuWallTimer();
@@ -1564,6 +1607,7 @@ void ExprSet::eval(
     const SelectivityVector& rows,
     EvalCtx& context,
     std::vector<VectorPtr>& result) {
+        // 预留足够的数组空间
   result.resize(exprs_.size());
   if (initialize) {
     clearSharedSubexprs();
@@ -1584,7 +1628,7 @@ void ExprSet::eval(
     exprs_[i]->eval(rows, context, result[i], true /*topLevel*/);
   }
 }
-
+// 清除之前的公共子表达式的计算结果
 void ExprSet::clearSharedSubexprs() {
   for (auto& expr : toReset_) {
     expr->reset();

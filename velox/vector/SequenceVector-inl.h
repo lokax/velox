@@ -79,6 +79,7 @@ template <typename T>
 const T SequenceVector<T>::valueAtFast(vector_size_t idx) const {
   size_t offset = offsetOfIndex(idx);
   VELOX_DCHECK_GE(offset, 0, "Invalid index");
+  // 如果不是scalar的话，这里是nullptr
   return scalarSequenceValues_->valueAt(offset);
 }
 
@@ -94,6 +95,7 @@ std::unique_ptr<SimpleVector<uint64_t>> SequenceVector<T>::hashAll() const {
   BufferPtr hashes =
       AlignedBuffer::allocate<uint64_t>(sequenceCount, BaseVector::pool_);
   uint64_t* rawHashes = hashes->asMutable<uint64_t>();
+  // 对每一个值进行哈希
   for (size_t i = 0; i < sequenceCount; ++i) {
     rawHashes[i] = sequenceValues_->hashValueAt(i);
   }
@@ -108,7 +110,7 @@ std::unique_ptr<SimpleVector<uint64_t>> SequenceVector<T>::hashAll() const {
       0 /* nullCount */,
       false /* sorted */,
       sizeof(uint64_t) * sequenceCount /* representedBytes */);
-
+    // 继续进行RLE
   return std::make_unique<SequenceVector<uint64_t>>(
       BaseVector::pool_,
       BaseVector::length_,
@@ -121,7 +123,7 @@ std::unique_ptr<SimpleVector<uint64_t>> SequenceVector<T>::hashAll() const {
       sizeof(uint64_t) * BaseVector::length_ /* representedBytes */,
       0 /* nullSequenceCount */);
 }
-
+// 加载SIMD的值
 template <typename T>
 xsimd::batch<T> SequenceVector<T>::loadSIMDValueBufferAt(
     size_t byteOffset) const {
@@ -134,6 +136,8 @@ xsimd::batch<T> SequenceVector<T>::loadSIMDValueBufferAt(
     if (checkLoadRange(startIndex, kBatchSize)) {
       return simd::setAll(valueAtFast(startIndex));
     }
+
+    // TODO(lokax): 学习一下
     alignas(xsimd::default_arch::alignment()) T tmp[kBatchSize];
     for (int i = 0; i < kBatchSize; ++i) {
       tmp[i] = valueAtFast(startIndex + i);

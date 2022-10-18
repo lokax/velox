@@ -34,6 +34,7 @@ void MappedMemory::Allocation::append(uint8_t* address, int32_t numPages) {
   if (address == last.data()) {
     VELOX_CHECK(false, "Appending a duplicate address into a PageRun");
   }
+  // 合并page run
   // Increment page count if new data starts at end of the last run
   // and the combined page count is within limits.
   if (address == last.data() + last.numPages() * kPageSize &&
@@ -86,6 +87,8 @@ MappedMemory::SizeMix MappedMemory::allocationSize(
       "Requesting minimum size {} larger than largest size class {}",
       minSizeClass,
       sizeClassSizes_.back());
+
+      // 从大往小进行遍历
   for (int32_t sizeIndex = sizeClassSizes_.size() - 1; sizeIndex >= 0;
        sizeIndex--) {
     int32_t size = sizeClassSizes_[sizeIndex];
@@ -190,6 +193,7 @@ bool MappedMemoryImpl::allocate(
     Allocation& out,
     std::function<void(int64_t)> beforeAllocCB,
     MachinePageCount minSizeClass) {
+        // 释放掉out的内存
   free(out);
 
   auto mix = allocationSize(numPages, minSizeClass);
@@ -202,12 +206,14 @@ bool MappedMemoryImpl::allocate(
             mix.sizeCounts[i] * sizeClassSizes_[mix.sizeIndices[i]];
         bytesAllocated += numPages * kPageSize;
       }
+      // 一个回调函数
       beforeAllocCB(bytesAllocated);
     }
 
     std::vector<void*> pages;
     pages.reserve(mix.numSizes);
     for (int32_t i = 0; i < mix.numSizes; ++i) {
+        // 要分配几个page
       MachinePageCount numPages =
           mix.sizeCounts[i] * sizeClassSizes_[mix.sizeIndices[i]];
       void* ptr;
@@ -224,6 +230,7 @@ bool MappedMemoryImpl::allocate(
       pages.emplace_back(ptr);
       out.append(reinterpret_cast<uint8_t*>(ptr), numPages); // NOLINT
     }
+    // 分配失败的话进行相应的回滚
     if (pages.size() != mix.numSizes) {
       // Failed to allocate memory using malloc. Free any malloced pages and
       // return false.
@@ -236,6 +243,7 @@ bool MappedMemoryImpl::allocate(
 
     {
       std::lock_guard<std::mutex> l(mallocsMutex_);
+      // mallocs_管理这些指针？
       mallocs_.insert(pages.begin(), pages.end());
     }
 
@@ -245,18 +253,21 @@ bool MappedMemoryImpl::allocate(
   }
   throw std::runtime_error("Not implemented");
 }
-
+// 分配连续内存, 其实就是释放掉之前的内存，然后重新分配内存
+// 连续内存的分配是用mmap来分配的
 bool MappedMemoryImpl::allocateContiguousImpl(
     MachinePageCount numPages,
     Allocation* FOLLY_NULLABLE collateral,
     ContiguousAllocation& allocation,
     std::function<void(int64_t)> beforeAllocCB) {
   MachinePageCount numCollateralPages = 0;
+  // 释放collateral来提供新内存的分配
   if (collateral) {
     numCollateralPages = free(*collateral) / kPageSize;
   }
   auto numContiguousCollateralPages = allocation.numPages();
   if (numContiguousCollateralPages) {
+    // 取消之前内存的映射
     if (munmap(allocation.data(), allocation.size()) < 0) {
       LOG(ERROR) << "munmap got " << errno << "for " << allocation.data()
                  << ", " << allocation.size();
@@ -277,6 +288,7 @@ bool MappedMemoryImpl::allocateContiguousImpl(
   }
   numAllocated_.fetch_add(numNeededPages);
   numMapped_.fetch_add(numNeededPages);
+  // 直接映射
   void* data = mmap(
       nullptr,
       numPages * kPageSize,
@@ -289,16 +301,20 @@ bool MappedMemoryImpl::allocateContiguousImpl(
 }
 
 int64_t MappedMemoryImpl::free(Allocation& allocation) {
+    // 如果一个runs都没有，则不用释放
   if (allocation.numRuns() == 0) {
     return 0;
   }
   MachinePageCount numFreed = 0;
   if (FLAGS_velox_use_malloc) {
+    // 遍历每一个run
     for (int32_t i = 0; i < allocation.numRuns(); ++i) {
+        // 拿出对应的run
       PageRun run = allocation.runAt(i);
       numFreed += run.numPages();
       void* ptr = run.data();
       {
+        // 所以这东西也就用来做检查的而已？
         std::lock_guard<std::mutex> l(mallocsMutex_);
         if (mallocs_.find(ptr) == mallocs_.end()) {
           VELOX_CHECK(false, "Bad free");
@@ -348,6 +364,7 @@ std::atomic<uint64_t> MappedMemory::totalLargeAllocateBytes_;
 
 // static
 MappedMemory* MappedMemory::getInstance() {
+    // 如果有用户提供的实例，则使用用户提供的
   if (customInstance_) {
     return customInstance_;
   }
@@ -367,6 +384,7 @@ std::shared_ptr<MappedMemory> MappedMemory::createDefaultInstance() {
   return std::make_shared<MappedMemoryImpl>();
 }
 
+// 设置实例
 // static
 void MappedMemory::setDefaultInstance(MappedMemory* instance) {
   customInstance_ = instance;
@@ -389,9 +407,11 @@ MachinePageCount roundUpToSizeClassSize(
 }
 } // namespace
 
+// 一个代理派发类
 void* FOLLY_NULLABLE
 MappedMemory::allocateBytes(uint64_t bytes, uint64_t maxMallocSize) {
   if (bytes <= maxMallocSize) {
+    // 小于3KB，直接采用malloc进行分配
     auto result = ::malloc(bytes);
     if (result) {
       totalSmallAllocateBytes_ += bytes;
@@ -414,6 +434,7 @@ MappedMemory::allocateBytes(uint64_t bytes, uint64_t maxMallocSize) {
     return nullptr;
   }
   ContiguousAllocation allocation;
+  // 向上取整一个PAGE
   auto numPages = bits::roundUp(bytes, kPageSize) / kPageSize;
   if (allocateContiguous(numPages, nullptr, allocation)) {
     char* data = allocation.data<char>();

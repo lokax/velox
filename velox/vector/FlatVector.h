@@ -29,6 +29,7 @@
 namespace facebook {
 namespace velox {
 
+// TODO: 这段注释重点？
 // FlatVector is marked final to allow for inlining on virtual methods called
 // on a pointer that has the static type FlatVector<T>; this can be a
 // significant performance win when these methods are called in loops.
@@ -36,7 +37,7 @@ template <typename T>
 class FlatVector final : public SimpleVector<T> {
  public:
   using value_type = T;
-
+    // 可以simd的类型
   static constexpr bool can_simd =
       (std::is_same_v<T, int64_t> || std::is_same_v<T, int32_t> ||
        std::is_same_v<T, int16_t> || std::is_same_v<T, int8_t> ||

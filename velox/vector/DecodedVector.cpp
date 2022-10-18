@@ -140,6 +140,7 @@ void DecodedVector::combineWrappers(
       mayHaveNulls_ = true;
     }
   } else if (topEncoding == VectorEncoding::Simple::SEQUENCE) {
+    // RLE
     copiedIndices_.resize(rows.end());
     indices_ = &copiedIndices_[0];
     auto sizes = vector->wrapInfo()->as<vector_size_t>();

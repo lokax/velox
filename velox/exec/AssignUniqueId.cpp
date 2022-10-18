@@ -35,7 +35,7 @@ AssignUniqueId::AssignUniqueId(
       rowIdPool_(std::move(rowIdPool)) {
   VELOX_CHECK_LT(uniqueTaskId, kTaskUniqueIdLimit)
   uniqueValueMask_ = ((int64_t)uniqueTaskId) << 40;
-
+    // 列的数量
   const auto numColumns = planNode->outputType()->size();
   identityProjections_.reserve(numColumns - 1);
   for (column_index_t i = 0; i < numColumns - 1; ++i) {
@@ -67,6 +67,7 @@ RowVectorPtr AssignUniqueId::getOutput() {
 }
 
 bool AssignUniqueId::isFinished() {
+    // 不再有输入了，并且没有未处理的输入
   return noMoreInput_ && input_ == nullptr;
 }
 
@@ -74,6 +75,7 @@ void AssignUniqueId::generateIdColumn(vector_size_t size) {
   // Re-use memory for the ID vector if possible.
   VectorPtr& result = results_[0];
   if (result && result.unique()) {
+    // 尽可能重用内存
     BaseVector::prepareForReuse(result, size);
   } else {
     result = BaseVector::create(BIGINT(), size, pool());
@@ -84,6 +86,7 @@ void AssignUniqueId::generateIdColumn(vector_size_t size) {
 
   vector_size_t start = 0;
   while (start < size) {
+    // 重新请求行id
     if (rowIdCounter_ >= maxRowIdCounterValue_) {
       requestRowIds();
     }
@@ -100,7 +103,9 @@ void AssignUniqueId::generateIdColumn(vector_size_t size) {
 }
 
 void AssignUniqueId::requestRowIds() {
+    // pool是原子变量, 是因为这个东西能多线程的意思？
   rowIdCounter_ = rowIdPool_->fetch_add(kRowIdsPerRequest);
+  // 最大也就1 << 40
   maxRowIdCounterValue_ =
       std::min(rowIdCounter_ + kRowIdsPerRequest, kMaxRowId);
 }

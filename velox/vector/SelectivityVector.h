@@ -69,6 +69,7 @@ class SelectivityVector {
     if (size > size_ && !bits_.empty()) {
       const auto start = size_ % 64;
       if (start) {
+        // 填充最末尾的部分
         bits::fillBits(&bits_.back(), start, 64, value);
       }
     }
@@ -291,9 +292,11 @@ class SelectivityVector {
   }
 
   bool isAllSelected() const {
+    // 这是fast path
     if (allSelected_.has_value()) {
       return allSelected_.value();
     }
+    // slow path检查
     allSelected_ = begin_ == 0 && end_ == size_ &&
         bits::isAllSet(bits_.data(), 0, size_, true);
     return allSelected_.value();
@@ -302,14 +305,16 @@ class SelectivityVector {
    * Iterate and count the number of selected values in this SelectivityVector
    */
   vector_size_t countSelected() const {
+    // 如果全部都selected，那么就直接返回size，这是fast path
     if (allSelected_.has_value() && *allSelected_) {
       return size();
     }
     auto count = bits::countBits(bits_.data(), begin_, end_);
+    // 顺便更新一下allSelected
     allSelected_ = count == size();
     return count;
   }
-
+    // 返回比特的数量
   vector_size_t size() const {
     return size_;
   }
@@ -424,11 +429,13 @@ class SelectivityIterator {
 
 template <typename Callable>
 inline void SelectivityVector::applyToSelected(Callable func) const {
+    // 所有都是seleced，那么就直接应用函数就行了
   if (isAllSelected()) {
     for (vector_size_t row = begin_; row < end_; ++row) {
       func(row);
     }
   } else {
+    // 遍历每一个seted的比特
     bits::forEachSetBit(bits_.data(), begin_, end_, func);
   }
 }
@@ -438,6 +445,7 @@ inline bool SelectivityVector::testSelected(Callable func) const {
   if (isAllSelected()) {
     for (vector_size_t row = begin_; row < end_; ++row) {
       if (!func(row)) {
+        // 函数返回false，就直接返回false
         return false;
       }
     }

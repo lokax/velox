@@ -142,7 +142,7 @@ class MmapAllocator : public MappedMemory {
     SizeClass(size_t capacity, MachinePageCount unitSize);
 
     ~SizeClass();
-
+    // 表明几个page
     MachinePageCount unitSize() const {
       return unitSize_;
     }
@@ -190,7 +190,7 @@ class MmapAllocator : public MappedMemory {
     // Number of bits in 'mappedPages_' for one bit in
     // 'mappedFreeLookup_'.
     static constexpr int32_t kPagesPerLookupBit =
-        xsimd::batch<int64_t>::size * 128;
+        xsimd::batch<int64_t>::size * 128; // 1个bit代表256个page?
     // Number of extra 0 uint64's at te end of allocation bitmaps for SIMD
     // checks.
     static constexpr int32_t kSimdTail = 8;

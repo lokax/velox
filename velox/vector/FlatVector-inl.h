@@ -140,13 +140,16 @@ void FlatVector<T>::copyValuesAndNulls(
     const BaseVector* source,
     const SelectivityVector& rows,
     const vector_size_t* toSourceRow) {
+        // 加载source向量
   source = source->loadedVector();
   VELOX_CHECK(
       BaseVector::compatibleKind(BaseVector::typeKind(), source->typeKind()));
   VELOX_CHECK_GE(BaseVector::length_, rows.end());
+  // null 掩码吗?
   const uint64_t* sourceNulls = source->rawNulls();
   uint64_t* rawNulls = const_cast<uint64_t*>(BaseVector::rawNulls_);
   if (source->mayHaveNulls()) {
+    // 确保有空间？
     rawNulls = BaseVector::mutableRawNulls();
   }
 

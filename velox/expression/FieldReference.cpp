@@ -23,6 +23,7 @@ void FieldReference::evalSpecialForm(
     EvalCtx& context,
     VectorPtr& result) {
   if (result) {
+    // 确保result能写
     context.ensureWritable(rows, type_, result);
   }
   const RowVector* row;
@@ -34,7 +35,7 @@ void FieldReference::evalSpecialForm(
     row = context.row();
   } else {
     inputs_[0]->eval(rows, context, input);
-
+    // 输入竟然是RowVector
     if (auto rowTry = input->as<RowVector>()) {
       // Make sure output is not copied
       if (rowTry->isCodegenOutput()) {
@@ -55,6 +56,7 @@ void FieldReference::evalSpecialForm(
   if (index_ == -1) {
     auto rowType = dynamic_cast<const RowType*>(row->type().get());
     VELOX_CHECK(rowType);
+    // 获取child index
     index_ = rowType->getChildIdx(field_);
   }
   // If we refer to a column of the context row, this may have been
@@ -62,8 +64,10 @@ void FieldReference::evalSpecialForm(
   // 'context'.  Check if the child is unique before taking the second
   // reference. Unique constant vectors can be resized in place, non-unique
   // must be copied to set the size.
+  // 唯一的常量向量可以就地调整大小，非唯一的必须复制来设置大小。
   bool isUniqueChild = inputs_.empty() ? context.getField(index_).unique()
                                        : row->childAt(index_).unique();
+                                       // 拿到孩子向量
   VectorPtr child =
       inputs_.empty() ? context.getField(index_) : row->childAt(index_);
   if (result.get()) {

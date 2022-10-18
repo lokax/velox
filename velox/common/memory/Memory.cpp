@@ -42,6 +42,7 @@ MmapMemoryAllocator::allocZeroFilled(int64_t numMembers, int64_t sizeEach) {
   auto totalBytes = numMembers * sizeEach;
   auto* allocResult = alloc(totalBytes);
   if (allocResult != nullptr) {
+    // 手动清0
     std::memset(allocResult, 0, totalBytes);
   }
   return allocResult;

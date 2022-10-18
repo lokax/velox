@@ -95,14 +95,18 @@ FilterProject::FilterProject(
 }
 
 void FilterProject::addInput(RowVectorPtr input) {
+    // 保存输入
   input_ = std::move(input);
+  // 处理的输入行数
   numProcessedInputRows_ = 0;
   if (!resultProjections_.empty()) {
     results_.resize(resultProjections_.back().inputChannel + 1);
     for (auto& result : results_) {
       if (result && result.unique() && result->isFlatEncoding()) {
+        // 重用
         BaseVector::prepareForReuse(result, 0);
       } else {
+        // 重置智能指针
         result.reset();
       }
     }
@@ -113,6 +117,7 @@ bool FilterProject::allInputProcessed() {
   if (!input_) {
     return true;
   }
+  // 所有行都处理了
   if (numProcessedInputRows_ == input_->size()) {
     input_ = nullptr;
     return true;
@@ -126,9 +131,10 @@ bool FilterProject::isFinished() {
 
 RowVectorPtr FilterProject::getOutput() {
   if (allInputProcessed()) {
+    // 如果对当前的输入数据都处理了，这里就返回nullptr
     return nullptr;
   }
-
+    // 输入的数据行数
   vector_size_t size = input_->size();
   LocalSelectivityVector localRows(*operatorCtx_->execCtx(), size);
   auto* rows = localRows.get();

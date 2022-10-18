@@ -58,6 +58,7 @@ void* FOLLY_NULLABLE MmapArena::allocate(uint64_t bytes) {
   }
   bytes = roundBytes(bytes);
 
+    // 找到第一个匹配的
   // First match in the list that can give this many bytes
   auto lookupItr = freeLookup_.lower_bound(bytes);
   if (lookupItr == freeLookup_.end()) {
@@ -266,6 +267,7 @@ bool MmapArena::checkConsistency() const {
 
 ManagedMmapArenas::ManagedMmapArenas(uint64_t singleArenaCapacity)
     : singleArenaCapacity_(singleArenaCapacity) {
+        // 创建一个Arena
   auto arena = std::make_shared<MmapArena>(singleArenaCapacity);
   arenas_.emplace(reinterpret_cast<uint64_t>(arena->address()), arena);
   currentArena_ = arena;

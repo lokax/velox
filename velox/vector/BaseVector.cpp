@@ -364,6 +364,7 @@ void BaseVector::addNulls(const uint64_t* bits, const SelectivityVector& rows) {
   VELOX_CHECK(isNullsWritable());
   VELOX_CHECK(length_ >= rows.end());
   ensureNulls();
+  // 拿到nulls的裸指针
   auto target = nulls_->asMutable<uint64_t>();
   const uint64_t* selected = rows.asRange().bits();
   if (!bits) {
@@ -571,6 +572,7 @@ void BaseVector::ensureWritable(
       case VectorEncoding::Simple::ARRAY:
       case VectorEncoding::Simple::MAP:
       case VectorEncoding::Simple::FUNCTION: {
+        // 其实差不多就是分配足够多的空间可以写
         result->ensureWritable(rows);
         return;
       }

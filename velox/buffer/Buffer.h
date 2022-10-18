@@ -59,21 +59,24 @@ class Buffer {
       std::is_trivially_destructible_v<T>&& std::is_trivially_copyable_v<T>;
 
   virtual ~Buffer(){};
-
+    // 增加引用计数
   void addRef() {
     referenceCount_.fetch_add(1);
   }
-
+    // 返回引用计数
   int refCount() const {
     return referenceCount_;
   }
 
   void release() {
+    // 减少引用计数，如果引用计数是0，则释放资源
     if (referenceCount_.fetch_sub(1) == 1) {
       releaseResources();
       if (pool_) {
+        // 有内存池，则释放回内存池
         freeToPool();
       } else {
+        // 否则，直接delete
         delete this;
       }
     }
@@ -124,15 +127,15 @@ class Buffer {
   uint64_t capacity() const {
     return capacity_;
   }
-
+    // 是否唯一引用
   bool unique() const {
     return referenceCount_ == 1;
   }
-
+    // 返回内存池
   velox::memory::MemoryPool* pool() const {
     return pool_;
   }
-
+    // 是否可变?
   bool isMutable() const {
     return mutable_;
   }
@@ -244,6 +247,7 @@ class Buffer {
   uint8_t* const data_;
   uint64_t size_ = 0;
   uint64_t capacity_ = 0;
+  // 为什么引用计数是原子的，避免同时增加或减少引用计数时出现问题
   std::atomic<int32_t> referenceCount_;
   bool mutable_ = true;
   bool podType_ = true;
@@ -280,7 +284,7 @@ static inline void intrusive_ptr_release(Buffer* buffer) {
 
 template <typename T>
 class NonPODAlignedBuffer;
-
+// 对齐的buffer
 class AlignedBuffer : public Buffer {
  public:
   static constexpr int16_t kAlignment = 64;
@@ -319,6 +323,7 @@ class AlignedBuffer : public Buffer {
       size_t numElements,
       velox::memory::MemoryPool* pool,
       const std::optional<T>& initValue = std::nullopt) {
+        // 获取内存大小
     size_t size = checkedMultiply(numElements, sizeof(T));
     size_t preferredSize =
         pool->getPreferredSize(checkedPlus<size_t>(size, kPaddedSize));
@@ -375,6 +380,7 @@ class AlignedBuffer : public Buffer {
       *buffer = std::move(newBuffer);
       return;
     }
+    // 不是唯一，则重新分配内存
     if (!old->unique()) {
       auto newBuffer = allocate<T>(numElements, pool);
       newBuffer->copyFrom(old, std::min(size, old->size()));
@@ -436,6 +442,7 @@ class AlignedBuffer : public Buffer {
       reallocate<char>(
           buffer, std::max(checkedMultiply<size_t>(2, capacity), newSize));
     }
+    // 这里就不检查是不是unique了？
     (*buffer)->setSize(newSize);
     auto startOfCopy = (*buffer)->asMutable<uint8_t>() + size;
     memcpy(startOfCopy, items, bytes);

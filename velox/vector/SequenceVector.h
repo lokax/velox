@@ -126,7 +126,7 @@ class SequenceVector : public SimpleVector<T> {
   vector_size_t numSequences() const {
     return sequenceValues_->size();
   }
-
+    // 返沪包装器信息？
   BufferPtr wrapInfo() const override {
     return sequenceLengths_;
   }
@@ -134,7 +134,7 @@ class SequenceVector : public SimpleVector<T> {
   uint64_t retainedSize() const override {
     return sequenceValues_->retainedSize() + sequenceLengths_->capacity();
   }
-
+    // 有点意思
   bool isConstant(const SelectivityVector& rows) const override {
     return offsetOfIndex(rows.begin()) == offsetOfIndex(rows.end() - 1);
   }
@@ -149,15 +149,15 @@ class SequenceVector : public SimpleVector<T> {
    * or an index that is >= the logical length of this vector.
    */
   vector_size_t offsetOfIndex(vector_size_t idx) const;
-
+    // sequenceValues就是实际存值的地方
   const BaseVector* wrappedVector() const override {
     return sequenceValues_->wrappedVector();
   }
-
+    // 可以直接访问WrappedVector的Index
   vector_size_t wrappedIndex(vector_size_t index) const override {
     return sequenceValues_->wrappedIndex(offsetOfIndex(index));
   }
-
+    // RLE不能添加NULL值
   void addNulls(const uint64_t* bits, const SelectivityVector& rows) override {
     throw std::runtime_error("addNulls not supported");
   }

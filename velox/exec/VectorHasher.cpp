@@ -562,6 +562,7 @@ std::unique_ptr<common::Filter> VectorHasher::getFilter(
       if (!distinctOverflow_) {
         std::vector<int64_t> values;
         values.reserve(uniqueValues_.size());
+        // 不同值
         for (const auto& value : uniqueValues_) {
           values.emplace_back(value.data());
         }

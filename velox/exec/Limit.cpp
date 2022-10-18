@@ -50,7 +50,7 @@ RowVectorPtr Limit::getOutput() {
   if (input_ == nullptr || (remainingOffset_ == 0 && remainingLimit_ == 0)) {
     return nullptr;
   }
-
+    // 输入数据行数
   const auto inputSize = input_->size();
 
   if (remainingOffset_ >= inputSize) {
@@ -78,6 +78,7 @@ RowVectorPtr Limit::getOutput() {
   }
 
   if (remainingLimit_ <= inputSize) {
+    // 完成了
     finished_ = true;
   }
 
