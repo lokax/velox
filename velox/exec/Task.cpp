@@ -1634,6 +1634,7 @@ void Task::setError(const std::exception_ptr& exception) {
   {
     // 加锁
     std::lock_guard<std::mutex> l(mutex_);
+    // 说明任务状态已经被设置过了
     if (not isRunningLocked()) {
       return;
     }
@@ -1642,9 +1643,11 @@ void Task::setError(const std::exception_ptr& exception) {
       isFirstError = true;
     }
   }
+  // 如果是第一个异常的话，调用terminate
   if (isFirstError) {
     terminate(TaskState::kFailed);
   }
+  // 调用回调函数
   if (isFirstError && onError_) {
     onError_(exception_);
   }
@@ -1718,6 +1721,7 @@ StopReason Task::leave(ThreadState& state) {
   std::lock_guard<std::mutex> l(mutex_);
   // 减少线程数
   if (--numThreads_ == 0) {
+    // 在没有driver在线程上运行的时候，通知promise
     finishedLocked();
   }
   // 重置线程状态
