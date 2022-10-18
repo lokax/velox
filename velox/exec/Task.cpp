@@ -446,6 +446,7 @@ void Task::start(
     for (auto& driver : self->drivers_) {
       if (driver) {
         ++self->numRunningDrivers_;
+        // 把driver放进任务队列中，等待线程池中的工作线程进行处理
         Driver::enqueue(driver);
       }
     }
@@ -464,17 +465,22 @@ void Task::start(
 // static
 void Task::resume(std::shared_ptr<Task> self) {
   VELOX_CHECK(!self->exception_, "Cannot resume failed task");
+  // 获取任务的互斥锁
   std::lock_guard<std::mutex> l(self->mutex_);
   // Setting pause requested must be atomic with the resuming so that
   // suspended sections do not go back on thread during resume.
+  // 设置暂停请求为false
   self->requestPauseLocked(false);
+  // 遍历每一个driver
   for (auto& driver : self->drivers_) {
     if (driver) {
+        // 这个暂时没懂
       if (driver->state().isSuspended) {
         // The Driver will come on thread in its own time as long as
         // the cancel flag is reset. This check needs to be inside 'mutex_'.
         continue;
       }
+      // 在被暂停的时候，该driver在队列中，这时候不会添加两次进去
       if (driver->state().isEnqueued) {
         // A Driver can wait for a thread and there can be a
         // pause/resume during the wait. The Driver should not be
@@ -482,6 +488,10 @@ void Task::resume(std::shared_ptr<Task> self) {
         continue;
       }
       VELOX_CHECK(!driver->isOnThread() && !driver->isTerminated());
+      // 如果这里有阻塞发future的话，说明该driver在等待一些事件发生
+      // 等到这些事件发生后，又futture设置的回调去放到队列中
+      // 而不是由这个函数来放进队列
+      // 注意hasBlockingFuture是在任务的互斥锁下进行保护的
       if (!driver->state().hasBlockingFuture) {
         // Do not continue a Driver that is blocked on external
         // event. The Driver gets enqueued by the promise realization.
@@ -1257,8 +1267,10 @@ ContinueFuture Task::terminate(TaskState terminalState) {
     if (taskStats_.executionEndTimeMs == 0) {
       taskStats_.executionEndTimeMs = getCurrentTimeMs();
     }
-    // 如果任务不处于以运行状态
+    // 如果任务不处于以运行状态, 比如同时调用了terminate
+    // 但是这里会获取任务的互斥锁的，所以有一个修改了任务的状态
     if (not isRunningLocked()) {
+        // 所以这里也需要future
       return makeFinishFutureLocked("Task::terminate");
     }
     // 修改任务状态，这里是任务的状态
@@ -1268,6 +1280,7 @@ ContinueFuture Task::terminate(TaskState terminalState) {
         VELOX_FAIL(
             state_ == TaskState::kCanceled ? "Cancelled"
                                            : "Aborted for external error");
+                                           // 这里是主动抛异常
       } catch (const std::exception& e) {
         // 创建一个异常，然后保存下来
         exception_ = std::current_exception();
@@ -1278,6 +1291,8 @@ ContinueFuture Task::terminate(TaskState terminalState) {
 
     // Drivers that are on thread will see this at latest when they go off
     // thread.
+    // 设置这个flag后，其他在线程上的driver会退出线程
+    // 如果有driver被阻塞的话，在放回队列并且被调度执行后，同样会退出，不过我觉得不用放回队列了
     terminateRequested_ = true;
     // The drivers that are on thread will go off thread in time and
     // 'numRunningDrivers_' is cleared here so that this is 0 right
@@ -1397,14 +1412,17 @@ ContinueFuture Task::terminate(TaskState terminalState) {
   std::lock_guard<std::mutex> l(mutex_);
   return makeFinishFutureLocked("Task::terminate");
 }
-
+// 等待driver全部退出线程的future
 ContinueFuture Task::makeFinishFutureLocked(const char* FOLLY_NONNULL comment) {
   auto [promise, future] = makeVeloxContinuePromiseContract(comment);
     // 0个线程的时候通知promise
+    // 线程数是代表当前的任务中有几个driver在线程上运行
+    // 0则代表没有，比如可能进入阻塞态了
   if (numThreads_ == 0) {
-    promise.setValue();
+    promise.setValue();\
     return std::move(future);
   }
+  // 完成时通知
   threadFinishPromises_.push_back(std::move(promise));
   return std::move(future);
 }
@@ -1718,18 +1736,24 @@ StopReason Task::leave(ThreadState& state) {
 
 StopReason Task::enterSuspended(ThreadState& state) {
   VELOX_CHECK(!state.hasBlockingFuture);
+  // 这里已经断言state在线程上了，下面加锁后又做了判断?
   VELOX_CHECK(state.isOnThread());
   std::lock_guard<std::mutex> l(mutex_);
   if (state.isTerminated) {
     // 返回已经终结
     return StopReason::kAlreadyTerminated;
   }
+  // 感觉这个逻辑不会进入
   if (!state.isOnThread()) {
     // 不在线程上也返回已经终结？什么几把玩意
     return StopReason::kAlreadyTerminated;
   }
+
+  // 检查是否已经stop
   auto reason = shouldStopLocked();
+  // 如果是因为有终结请求
   if (reason == StopReason::kTerminate) {
+    // 为什么这种情况下不返回终结
     state.isTerminated = true;
   }
   // A pause will not stop entering the suspended section. It will
@@ -1737,31 +1761,41 @@ StopReason Task::enterSuspended(ThreadState& state) {
   // CancelPool. The pause can wait at the exit of the suspended
   // section.
   if (reason == StopReason::kNone || reason == StopReason::kPause) {
+    // 挂起
     state.isSuspended = true;
+    // 减少线程数
     if (--numThreads_ == 0) {
+        // 通知promise
       finishedLocked();
     }
   }
+  // 这里总是返回None
   return StopReason::kNone;
 }
 
 StopReason Task::leaveSuspended(ThreadState& state) {
+    // 无限循环
   for (;;) {
     {
       std::lock_guard<std::mutex> l(mutex_);
       ++numThreads_;
+      // 设置线程状态为不挂起
       state.isSuspended = false;
       if (state.isTerminated) {
+        // 如果终结了，就返回已经终结
         return StopReason::kAlreadyTerminated;
       }
+      // 如果有终结请求
       if (terminateRequested_) {
         state.isTerminated = true;
         return StopReason::kTerminate;
       }
+      // 如果没有暂停请求，就直接返回None
       if (!pauseRequested_) {
         // For yield or anything but pause  we return here.
         return StopReason::kNone;
       }
+      // 如果有暂停请求，就重新挂起
       --numThreads_;
       state.isSuspended = true;
     }
@@ -1775,21 +1809,24 @@ StopReason Task::leaveSuspended(ThreadState& state) {
 }
 
 StopReason Task::shouldStop() {
+    // 终结请求
   if (terminateRequested_) {
     return StopReason::kTerminate;
   }
+  // 停止请求
   if (pauseRequested_) {
     return StopReason::kPause;
   }
   if (toYield_) {
+    // 这里要加锁
     std::lock_guard<std::mutex> l(mutex_);
     return shouldStopLocked();
   }
   return StopReason::kNone;
 }
-
+// 所有driver都离开线程了，比如进入阻塞了，或者暂停之类的
 void Task::finishedLocked() {
-    // 通知线程完成的promise
+    // 遍历每一个promise，通知完成
   for (auto& promise : threadFinishPromises_) {
     promise.setValue();
   }
@@ -1806,15 +1843,18 @@ StopReason Task::shouldStopLocked() {
     return StopReason::kPause;
   }
   if (toYield_) {
+    // 减少1
     --toYield_;
     return StopReason::kYield;
   }
   // 否则返回None
   return StopReason::kNone;
 }
-
+// 在任务互斥锁的保护下
 ContinueFuture Task::requestPauseLocked(bool pause) {
+    // 设置暂停请求
   pauseRequested_ = pause;
+  // 返回future
   return makeFinishFutureLocked("Task::requestPause");
 }
 

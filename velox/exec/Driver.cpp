@@ -70,24 +70,32 @@ BlockingState::BlockingState(
 // static
 void BlockingState::setResume(std::shared_ptr<BlockingState> state) {
   VELOX_CHECK(!state->driver_->isOnThread());
+  // 拿出执行器
   auto& exec = folly::QueuedImmediateExecutor::instance();
+  // 把future交给执行器去处理
   std::move(state->future_)
       .via(&exec)
       .thenValue([state](auto&& /* unused */) {
         auto driver = state->driver_;
         auto task = driver->task();
-
+        // 获取任务的互斥锁
         std::lock_guard<std::mutex> l(task->mutex());
         if (!driver->state().isTerminated) {
           state->operator_->recordBlockingTime(state->sinceMicros_);
         }
+        // 不能是挂起的状态
         VELOX_CHECK(!driver->state().isSuspended);
+        // 这个时候有阻塞的future
+        // 创建BlockState的时候，在构造函数里面就会设置这个flag
         VELOX_CHECK(driver->state().hasBlockingFuture);
         driver->state().hasBlockingFuture = false;
+        // 哪怕有终结请求，或者任务已经被终止了，在有暂停请求时这里也会等待唤醒？
+        // 如果该任务被暂停的话，不由我们来放进队列，而是由resume函数来执行
         if (task->pauseRequested()) {
           // The thread will be enqueued at resume.
           return;
         }
+        // 重新放回队列中，等待被执行
         Driver::enqueue(state->driver_);
       })
       .thenError(
@@ -160,6 +168,7 @@ Driver::Driver(
   curOpIndex_ = operators_.size() - 1;
   // Operators need access to their Driver for adaptation.
   ctx_->driver = this;
+  trackOperatorCpuUsage_ = ctx_->queryConfig().operatorTrackCpuUsage();
 }
 
 namespace {
@@ -368,8 +377,7 @@ StopReason Driver::runInternal(
             uint64_t resultBytes = 0;
             RowVectorPtr result;
             {
-              CpuWallTimer timer(op->stats().getOutputTiming);
-              // 尝试获取当前算子的输出
+              auto timer = cpuWallTimer(op->stats().getOutputTiming);
               result = op->getOutput();
               if (result) {
                 VELOX_CHECK(
@@ -385,7 +393,7 @@ StopReason Driver::runInternal(
             pushdownFilters(i);
             // 如果当前算子有输出
             if (result) {
-              CpuWallTimer timer(nextOp->stats().addInputTiming);
+              auto timer = cpuWallTimer(op->stats().addInputTiming);
               nextOp->stats().inputVectors += 1;
               nextOp->stats().inputPositions += result->size();
               nextOp->stats().inputBytes += resultBytes;
@@ -418,7 +426,7 @@ StopReason Driver::runInternal(
                 return StopReason::kBlock;
               }
               if (op->isFinished()) {
-                CpuWallTimer timer(nextOp->stats().finishTiming);
+                auto timer = cpuWallTimer(op->stats().finishTiming);
                 nextOp->noMoreInput();
                 break;
               }
@@ -430,8 +438,7 @@ StopReason Driver::runInternal(
           // this will be detected when trying to add input, and we
           // will come back here after this is again on thread.
           {
-            CpuWallTimer timer(op->stats().getOutputTiming);
-            // 获取算子的输出？
+            auto timer = cpuWallTimer(op->stats().getOutputTiming);
             result = op->getOutput();
             if (result) {
               VELOX_CHECK(
@@ -475,6 +482,7 @@ void Driver::run(std::shared_ptr<Driver> self) {
   RowVectorPtr nullResult;
   auto reason = self->runInternal(self, blockingState, nullResult);
 
+    // 产生的数据必须被回调或者其他算子消费掉，最后一个算子不能产生输出数据
   // When Driver runs on an executor, the last operator (sink) must not produce
   // any results.
   VELOX_CHECK_NULL(
@@ -491,10 +499,13 @@ void Driver::run(std::shared_ptr<Driver> self) {
       return;
 
     case StopReason::kYield:
+    // 主动让出CPU，那么
+        // 将任务放到队列的末尾
       // Go to the end of the queue.
       enqueue(self);
       return;
-
+    // 暂停的话，什么不处理?
+    // 暂停的话，就由别人调用resume后从而重新放进队列中进行计算
     case StopReason::kPause:
     case StopReason::kTerminate:
     case StopReason::kAlreadyTerminated:

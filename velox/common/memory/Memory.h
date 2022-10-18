@@ -429,8 +429,7 @@ class MemoryPoolImpl : public MemoryPoolBase {
       VELOX_CHECK_EQ(
           0,
           remainingBytes,
-          "Memory pool should be destroyed only after all allocated memory "
-          "has been freed. Remaining bytes allocated: {}, cumulative bytes allocated: {}, number of allocations: {}",
+          "Memory pool should be destroyed only after all allocated memory has been freed. Remaining bytes allocated: {}, cumulative bytes allocated: {}, number of allocations: {}",
           remainingBytes,
           tracker->getCumulativeBytes(),
           tracker->getNumAllocs());

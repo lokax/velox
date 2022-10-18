@@ -61,6 +61,7 @@ class QueryCtx : public Context {
         connectorConfigs_(connectorConfigs),
         executor_{std::move(executor)},
         config_{this},
+        queryId_(queryId),
         spillExecutor_(std::move(spillExecutor)) {
     setConfigOverrides(config);
     if (!pool_) {
@@ -86,7 +87,8 @@ class QueryCtx : public Context {
         mappedMemory_(mappedMemory),
         connectorConfigs_(connectorConfigs),
         executorKeepalive_(std::move(executorKeepalive)),
-        config_{this} {
+        config_{this},
+        queryId_(queryId) {
     setConfigOverrides(config);
     if (!pool_) {
       initPool(queryId);
@@ -139,6 +141,10 @@ class QueryCtx : public Context {
     return spillExecutor_.get();
   }
 
+  const std::string& queryId() const {
+    return queryId_;
+  }
+
  private:
   static Config* FOLLY_NONNULL getEmptyConfig() {
     static const std::unique_ptr<Config> kEmptyConfig =
@@ -160,6 +166,7 @@ class QueryCtx : public Context {
   std::shared_ptr<folly::Executor> executor_;
   folly::Executor::KeepAlive<> executorKeepalive_;
   QueryConfig config_;
+  const std::string queryId_;
   std::shared_ptr<folly::Executor> spillExecutor_;
 };
 

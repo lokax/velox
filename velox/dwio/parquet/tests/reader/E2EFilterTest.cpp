@@ -18,6 +18,8 @@
 #include "velox/dwio/parquet/reader/ParquetReader.h"
 #include "velox/dwio/parquet/writer/Writer.h"
 
+#include <folly/init/Init.h>
+
 using namespace facebook::velox;
 using namespace facebook::velox::common;
 using namespace facebook::velox::dwio::common;
@@ -41,7 +43,7 @@ class E2EFilterTest : public E2EFilterTestBase {
     sinkPtr_ = sink.get();
 
     writer_ = std::make_unique<facebook::velox::parquet::Writer>(
-        std::move(sink), *pool_, 10000, writerProperties_);
+        std::move(sink), *pool_, rowGroupSize_, writerProperties_);
     for (auto& batch : batches) {
       writer_->write(batch);
     }
@@ -56,6 +58,7 @@ class E2EFilterTest : public E2EFilterTestBase {
 
   std::unique_ptr<facebook::velox::parquet::Writer> writer_;
   std::shared_ptr<::parquet::WriterProperties> writerProperties_;
+  int32_t rowGroupSize_{10000};
 };
 
 TEST_F(E2EFilterTest, writerMagic) {
@@ -200,6 +203,126 @@ TEST_F(E2EFilterTest, floatAndDouble) {
       false);
 }
 
+TEST_F(E2EFilterTest, shortDecimalDictionary) {
+  // decimal(10, 5) maps to 5 bytes FLBA in Parquet.
+  // decimal(17, 5) maps to 8 bytes FLBA in Parquet.
+  for (const auto& type : {
+           "shortdecimal_val:short_decimal(10, 5)",
+           "shortdecimal_val:short_decimal(17, 5)",
+       }) {
+    testWithTypes(
+        type,
+        [&]() {
+          makeIntDistribution<UnscaledShortDecimal>(
+              Subfield("shortdecimal_val"),
+              UnscaledShortDecimal(10), // min
+              UnscaledShortDecimal(100), // max
+              22, // repeats
+              19, // rareFrequency
+              UnscaledShortDecimal(-999), // rareMin
+              UnscaledShortDecimal(30000), // rareMax
+              true);
+        },
+        false,
+        {"shortdecimal_val"},
+        20,
+        true,
+        false);
+  }
+}
+
+TEST_F(E2EFilterTest, shortDecimalDirect) {
+  writerProperties_ = ::parquet::WriterProperties::Builder()
+                          .disable_dictionary()
+                          ->data_pagesize(4 * 1024)
+                          ->build();
+  // decimal(10, 5) maps to 5 bytes FLBA in Parquet.
+  // decimal(17, 5) maps to 8 bytes FLBA in Parquet.
+  for (const auto& type : {
+           "shortdecimal_val:short_decimal(10, 5)",
+           "shortdecimal_val:short_decimal(17, 5)",
+       }) {
+    testWithTypes(
+        type,
+        [&]() {
+          makeIntDistribution<UnscaledShortDecimal>(
+              Subfield("shortdecimal_val"),
+              UnscaledShortDecimal(10), // min
+              UnscaledShortDecimal(100), // max
+              22, // repeats
+              19, // rareFrequency
+              UnscaledShortDecimal(-999), // rareMin
+              UnscaledShortDecimal(30000), // rareMax
+              true);
+        },
+        false,
+        {"shortdecimal_val"},
+        20,
+        true,
+        false);
+  }
+}
+
+TEST_F(E2EFilterTest, longDecimalDictionary) {
+  // decimal(30, 10) maps to 13 bytes FLBA in Parquet.
+  // decimal(37, 15) maps to 16 bytes FLBA in Parquet.
+  for (const auto& type : {
+           "longdecimal_val:long_decimal(30, 10)",
+           "longdecimal_val:long_decimal(37, 15)",
+       }) {
+    testWithTypes(
+        type,
+        [&]() {
+          makeIntDistribution<UnscaledLongDecimal>(
+              Subfield("longdecimal_val"),
+              UnscaledLongDecimal(10), // min
+              UnscaledLongDecimal(100), // max
+              22, // repeats
+              19, // rareFrequency
+              UnscaledLongDecimal(-999), // rareMin
+              UnscaledLongDecimal(30000), // rareMax
+              true);
+        },
+        false,
+        {},
+        20,
+        true,
+        false);
+  }
+}
+
+TEST_F(E2EFilterTest, longDecimalDirect) {
+  writerProperties_ = ::parquet::WriterProperties::Builder()
+                          .disable_dictionary()
+                          ->data_pagesize(4 * 1024)
+                          ->build();
+  // decimal(30, 10) maps to 13 bytes FLBA in Parquet.
+  // decimal(37, 15) maps to 16 bytes FLBA in Parquet.
+  for (const auto& type : {
+           "longdecimal_val:long_decimal(30, 10)",
+           "longdecimal_val:long_decimal(37, 15)",
+       }) {
+    testWithTypes(
+        type,
+        [&]() {
+          makeIntDistribution<UnscaledLongDecimal>(
+              Subfield("longdecimal_val"),
+              UnscaledLongDecimal(10), // min
+              UnscaledLongDecimal(100), // max
+              22, // repeats
+              19, // rareFrequency
+              UnscaledLongDecimal(-999), // rareMin
+              UnscaledLongDecimal(30000), // rareMax
+              true);
+        },
+        false,
+        {},
+        20,
+        true,
+        false);
+  }
+}
+
 TEST_F(E2EFilterTest, stringDirect) {
   writerProperties_ = ::parquet::WriterProperties::Builder()
                           .disable_dictionary()
@@ -231,4 +354,31 @@ TEST_F(E2EFilterTest, stringDictionary) {
       {"string_val", "string_val_2"},
       20,
       true);
+}
+
+TEST_F(E2EFilterTest, dedictionarize) {
+  writerProperties_ = ::parquet::WriterProperties::Builder()
+                          .max_row_group_length(10000000)
+                          ->dictionary_pagesize_limit(20000)
+                          ->build();
+
+  testWithTypes(
+      "long_val: bigint,"
+      "string_val:string,"
+      "string_val_2:string",
+      [&]() {
+        makeStringDistribution(Subfield("string_val"), 10000000, true, false);
+        makeStringDistribution(Subfield("string_val_2"), 1700000, false, true);
+      },
+      false,
+      {"long_val", "string_val", "string_val_2"},
+      20,
+      true);
+}
+
+// Define main so that gflags get processed.
+int main(int argc, char** argv) {
+  testing::InitGoogleTest(&argc, argv);
+  folly::init(&argc, &argv, false);
+  return RUN_ALL_TESTS();
 }

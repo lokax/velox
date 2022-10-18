@@ -203,6 +203,7 @@ class DriverTest : public OperatorTestBase {
         } else if (operation == ResultOperation::kPause) {
           auto& executor = folly::QueuedImmediateExecutor::instance();
           auto future = cursor->task()->requestPause(true).via(&executor);
+          // TODO(lokax): 等待future
           future.wait();
           paused = true;
         }
@@ -448,6 +449,11 @@ TEST_F(DriverTest, pause) {
       [](int64_t num) { return num % 10 > 0; },
       &hits);
   params.maxDrivers = 10;
+  params.queryCtx =
+      core::QueryCtx::createForTest(std::make_shared<core::MemConfig>(
+          std::unordered_map<std::string, std::string>{
+              // Make sure CPU usage tracking is enabled.
+              {core::QueryConfig::kOperatorTrackCpuUsage, "true"}}));
   int32_t numRead = 0;
   readResults(params, ResultOperation::kPause, 370'000'000, &numRead);
   // Each thread will fully read the 1M rows in values.
@@ -550,11 +556,13 @@ class TestingPauser : public Operator {
     auto label = operatorCtx_->driver()->label();
     // Block for a time quantum evern 10th time.
     if (counter_ % 10 == 0) {
+        // 每10次进行一次阻塞?
       test_->registerForWakeup(&future_);
       return nullptr;
     }
     {
       SuspendedSection noCancel(operatorCtx_->driver());
+      // 睡眠一秒钟?
       sleep(1);
       if (counter_ % 7 == 0) {
         // Every 7th time, stop and resume other Tasks. This operation is
@@ -562,14 +570,18 @@ class TestingPauser : public Operator {
         std::lock_guard<std::mutex> l(pauseMutex_);
 
         for (auto i = 0; i <= counter_ % 3; ++i) {
+            // 获取一个随机任务
           auto task = test_->randomTask();
           if (!task) {
             continue;
           }
           auto& executor = folly::QueuedImmediateExecutor::instance();
+          // 暂停任务
           auto future = task->requestPause(true).via(&executor);
           future.wait();
+          // 睡眠2s
           sleep(2);
+          // 唤醒任务
           Task::resume(task);
         }
       }
@@ -797,7 +809,7 @@ TEST_F(DriverTest, driverCreationThrow) {
 
   auto rows = makeRowVector({"c0"}, {makeFlatVector<int32_t>({1, 2, 3})});
 
-  auto planNodeIdGenerator = std::make_shared<PlanNodeIdGenerator>();
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
 
   auto plan = PlanBuilder(planNodeIdGenerator)
                   .values({rows}, true)

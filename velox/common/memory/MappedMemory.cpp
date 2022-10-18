@@ -16,11 +16,14 @@
 
 #include "velox/common/memory/MappedMemory.h"
 #include "velox/common/base/BitUtil.h"
+#include "velox/common/testutil/TestValue.h"
 
 #include <sys/mman.h>
 
 #include <iostream>
 #include <numeric>
+
+using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::memory {
 
@@ -128,7 +131,7 @@ class MappedMemoryImpl : public MappedMemory {
       MachinePageCount numPages,
       int32_t owner,
       Allocation& out,
-      std::function<void(int64_t)> beforeAllocCB = nullptr,
+      std::function<void(int64_t, bool)> userAllocCB = nullptr,
       MachinePageCount minSizeClass = 0) override;
   int64_t free(Allocation& allocation) override;
 
@@ -136,11 +139,11 @@ class MappedMemoryImpl : public MappedMemory {
       MachinePageCount numPages,
       Allocation* FOLLY_NULLABLE collateral,
       ContiguousAllocation& allocation,
-      std::function<void(int64_t)> beforeAllocCB = nullptr) override {
+      std::function<void(int64_t, bool)> userAllocCB = nullptr) override {
     bool result;
     stats_.recordAllocate(numPages * kPageSize, 1, [&]() {
-      result = allocateContiguousImpl(
-          numPages, collateral, allocation, beforeAllocCB);
+      result =
+          allocateContiguousImpl(numPages, collateral, allocation, userAllocCB);
     });
     return result;
   }
@@ -169,7 +172,7 @@ class MappedMemoryImpl : public MappedMemory {
       MachinePageCount numPages,
       Allocation* FOLLY_NULLABLE collateral,
       ContiguousAllocation& allocation,
-      std::function<void(int64_t)> beforeAllocCB);
+      std::function<void(int64_t, bool)> userAllocCB);
 
   void freeContiguousImpl(ContiguousAllocation& allocation);
 
@@ -191,7 +194,7 @@ bool MappedMemoryImpl::allocate(
     MachinePageCount numPages,
     int32_t owner,
     Allocation& out,
-    std::function<void(int64_t)> beforeAllocCB,
+    std::function<void(int64_t, bool)> userAllocCB,
     MachinePageCount minSizeClass) {
         // 释放掉out的内存
   free(out);
@@ -199,21 +202,40 @@ bool MappedMemoryImpl::allocate(
   auto mix = allocationSize(numPages, minSizeClass);
 
   if (FLAGS_velox_use_malloc) {
-    if (beforeAllocCB) {
-      uint64_t bytesAllocated = 0;
+    uint64_t bytesToAllocate = 0;
+    if (userAllocCB != nullptr) {
       for (int32_t i = 0; i < mix.numSizes; ++i) {
         MachinePageCount numPages =
             mix.sizeCounts[i] * sizeClassSizes_[mix.sizeIndices[i]];
-        bytesAllocated += numPages * kPageSize;
+        bytesToAllocate += numPages * kPageSize;
       }
+<<<<<<< HEAD
       // 一个回调函数
       beforeAllocCB(bytesAllocated);
+=======
+      userAllocCB(bytesToAllocate, true);
+>>>>>>> f59af650049951ec26465b4c12096e0a80428fea
     }
 
     std::vector<void*> pages;
     pages.reserve(mix.numSizes);
     for (int32_t i = 0; i < mix.numSizes; ++i) {
+<<<<<<< HEAD
         // 要分配几个page
+=======
+      if (TestValue::enabled()) {
+        // NOTE: if 'injectAllocFailure' is set to true by test callback, then
+        // we break out the loop to trigger a memory allocation failure scenario
+        // which doesn't have all the request memory allocated.
+        bool injectAllocFailure = false;
+        TestValue::adjust(
+            "facebook::velox::memory::MappedMemoryImpl::allocate",
+            &injectAllocFailure);
+        if (injectAllocFailure) {
+          break;
+        }
+      }
+>>>>>>> f59af650049951ec26465b4c12096e0a80428fea
       MachinePageCount numPages =
           mix.sizeCounts[i] * sizeClassSizes_[mix.sizeIndices[i]];
       void* ptr;
@@ -238,6 +260,9 @@ bool MappedMemoryImpl::allocate(
         ::free(ptr);
       }
       out.clear();
+      if (userAllocCB != nullptr) {
+        userAllocCB(bytesToAllocate, false);
+      }
       return false;
     }
 
@@ -259,8 +284,9 @@ bool MappedMemoryImpl::allocateContiguousImpl(
     MachinePageCount numPages,
     Allocation* FOLLY_NULLABLE collateral,
     ContiguousAllocation& allocation,
-    std::function<void(int64_t)> beforeAllocCB) {
+    std::function<void(int64_t, bool)> userAllocCB) {
   MachinePageCount numCollateralPages = 0;
+<<<<<<< HEAD
   // 释放collateral来提供新内存的分配
   if (collateral) {
     numCollateralPages = free(*collateral) / kPageSize;
@@ -268,27 +294,41 @@ bool MappedMemoryImpl::allocateContiguousImpl(
   auto numContiguousCollateralPages = allocation.numPages();
   if (numContiguousCollateralPages) {
     // 取消之前内存的映射
+=======
+  if (collateral != nullptr) {
+    numCollateralPages = free(*collateral) / kPageSize;
+  }
+  auto numContiguousCollateralPages = allocation.numPages();
+  if (numContiguousCollateralPages > 0) {
+>>>>>>> f59af650049951ec26465b4c12096e0a80428fea
     if (munmap(allocation.data(), allocation.size()) < 0) {
       LOG(ERROR) << "munmap got " << errno << "for " << allocation.data()
                  << ", " << allocation.size();
     }
+    numMapped_.fetch_sub(numContiguousCollateralPages);
+    numAllocated_.fetch_sub(numContiguousCollateralPages);
     allocation.reset(nullptr, nullptr, 0);
   }
-  int64_t numNeededPages =
+  const int64_t numNeededPages =
       numPages - numCollateralPages - numContiguousCollateralPages;
-  if (beforeAllocCB) {
+  if (userAllocCB != nullptr) {
     try {
-      beforeAllocCB(numNeededPages * kPageSize);
+      userAllocCB(numNeededPages * kPageSize, true);
     } catch (std::exception& e) {
-      beforeAllocCB(
-          -(numCollateralPages + numContiguousCollateralPages) * kPageSize);
-      numAllocated_ -= numContiguousCollateralPages;
+      userAllocCB(
+          (numCollateralPages + numContiguousCollateralPages) * kPageSize,
+          false);
       std::rethrow_exception(std::current_exception());
     }
   }
+<<<<<<< HEAD
   numAllocated_.fetch_add(numNeededPages);
   numMapped_.fetch_add(numNeededPages);
   // 直接映射
+=======
+  numAllocated_.fetch_add(numPages);
+  numMapped_.fetch_add(numNeededPages + numContiguousCollateralPages);
+>>>>>>> f59af650049951ec26465b4c12096e0a80428fea
   void* data = mmap(
       nullptr,
       numPages * kPageSize,
@@ -470,19 +510,19 @@ bool ScopedMappedMemory::allocate(
     MachinePageCount numPages,
     int32_t owner,
     Allocation& out,
-    std::function<void(int64_t)> beforeAllocCB,
+    std::function<void(int64_t, bool)> userAllocCB,
     MachinePageCount minSizeClass) {
   free(out);
   return parent_->allocate(
       numPages,
       owner,
       out,
-      [this, beforeAllocCB](int64_t allocated) {
+      [this, userAllocCB](int64_t allocBytes, bool preAllocate) {
         if (tracker_) {
-          tracker_->update(allocated);
+          tracker_->update(preAllocate ? allocBytes : -allocBytes);
         }
-        if (beforeAllocCB) {
-          beforeAllocCB(allocated);
+        if (userAllocCB) {
+          userAllocCB(allocBytes, preAllocate);
         }
       },
       minSizeClass);
@@ -492,17 +532,17 @@ bool ScopedMappedMemory::allocateContiguous(
     MachinePageCount numPages,
     Allocation* FOLLY_NULLABLE collateral,
     ContiguousAllocation& allocation,
-    std::function<void(int64_t)> beforeAllocCB) {
+    std::function<void(int64_t, bool)> userAllocCB) {
   bool success = parent_->allocateContiguous(
       numPages,
       collateral,
       allocation,
-      [this, beforeAllocCB](int64_t allocated) {
+      [this, userAllocCB](int64_t allocBytes, bool preAlloc) {
         if (tracker_) {
-          tracker_->update(allocated);
+          tracker_->update(preAlloc ? allocBytes : -allocBytes);
         }
-        if (beforeAllocCB) {
-          beforeAllocCB(allocated);
+        if (userAllocCB) {
+          userAllocCB(allocBytes, preAlloc);
         }
       });
   if (success) {

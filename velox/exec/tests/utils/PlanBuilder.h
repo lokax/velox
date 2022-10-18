@@ -20,6 +20,7 @@
 #include <velox/core/PlanNode.h>
 #include "velox/common/memory/Memory.h"
 #include "velox/parse/ExpressionsParser.h"
+#include "velox/parse/PlanNodeIdGenerator.h"
 
 namespace facebook::velox::core {
 class IExpr;
@@ -30,24 +31,6 @@ enum class Table : uint8_t;
 }
 
 namespace facebook::velox::exec::test {
-
-/// Generates unique sequential plan node IDs starting with zero or specified
-/// value.
-class PlanNodeIdGenerator {
- public:
-  explicit PlanNodeIdGenerator(int startId = 0) : nextId_{startId} {}
-
-  int next() {
-    return nextId_++;
-  }
-
-  void reset(int startId = 0) {
-    nextId_ = startId;
-  }
-
- private:
-  int nextId_;
-};
 
 /// A builder class with fluent API for building query plans. Plans are built
 /// bottom up starting with the source node (table scan or similar). Expressions
@@ -102,14 +85,14 @@ class PlanBuilder {
   /// of PlanNodeIdGenerator for all builders to ensure unique plan node IDs
   /// across the plan.
   explicit PlanBuilder(
-      std::shared_ptr<PlanNodeIdGenerator> planNodeIdGenerator,
+      std::shared_ptr<core::PlanNodeIdGenerator> planNodeIdGenerator,
       memory::MemoryPool* pool = nullptr)
       : planNodeIdGenerator_{std::move(planNodeIdGenerator)}, pool_{pool} {}
 
   /// Constructor with no required parameters suitable for creating
   /// straight-line (e.g. no joins) query plans.
   explicit PlanBuilder(memory::MemoryPool* pool = nullptr)
-      : PlanBuilder(std::make_shared<PlanNodeIdGenerator>(), pool) {}
+      : PlanBuilder(std::make_shared<core::PlanNodeIdGenerator>(), pool) {}
 
   /// Add a TableScanNode to scan a Hive table.
   ///
@@ -224,10 +207,19 @@ class PlanBuilder {
   /// will produce projected columns named sum_ab, c and p2.
   PlanBuilder& project(const std::vector<std::string>& projections);
 
+  /// Similar to project() except 'optionalProjections' could be empty and the
+  /// function will skip creating a ProjectNode in that case.
+  PlanBuilder& optionalProject(
+      const std::vector<std::string>& optionalProjections);
+
   /// Add a FilterNode using specified SQL expression.
   ///
   /// @param filter SQL expression of type boolean.
   PlanBuilder& filter(const std::string& filter);
+
+  /// Similar to filter() except 'optionalFilter' could be empty and the
+  /// function will skip creating a FilterNode in that case.
+  PlanBuilder& optionalFilter(const std::string& optionalFilter);
 
   /// Adds a TableWriteNode.
   ///
@@ -697,10 +689,10 @@ class PlanBuilder {
   }
 
  protected:
-  // Users who create customer operators might want to extend the PlanBuilder to
-  // customized extended plan builders, those functions are needed in such
+  // Users who create custom operators might want to extend the PlanBuilder to
+  // customize extended plan builders. Those functions are needed in such
   // extensions.
-  std::string nextPlanNodeId();
+  core::PlanNodeId nextPlanNodeId();
 
   std::shared_ptr<const core::ITypedExpr> inferTypes(
       const std::shared_ptr<const core::IExpr>& untypedExpr);
@@ -759,7 +751,7 @@ class PlanBuilder {
   parse::ParseOptions options_;
 
  private:
-  std::shared_ptr<PlanNodeIdGenerator> planNodeIdGenerator_;
+  std::shared_ptr<core::PlanNodeIdGenerator> planNodeIdGenerator_;
   memory::MemoryPool* pool_;
 };
 } // namespace facebook::velox::exec::test
