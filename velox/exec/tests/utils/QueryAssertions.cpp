@@ -804,6 +804,7 @@ std::pair<std::unique_ptr<TaskCursor>, std::vector<RowVectorPtr>> readCursor(
 
 bool waitForTaskCompletion(exec::Task* task, uint64_t maxWaitMicros) {
   // Wait for task to transition to finished state.
+  // TODO(lokax): 等待任务的状态发生改变
   if (not task->isFinished()) {
     auto& executor = folly::QueuedImmediateExecutor::instance();
     auto future = task->stateChangeFuture(maxWaitMicros).via(&executor);

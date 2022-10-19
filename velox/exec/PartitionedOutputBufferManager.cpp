@@ -50,6 +50,7 @@ std::vector<std::unique_ptr<folly::IOBuf>> DestinationBuffer::getData(
       result.push_back(nullptr);
       break;
     }
+    // getIOBuf是浅拷贝的
     result.push_back(data_[i]->getIOBuf());
     resultBytes += data_[i]->size();
     if (resultBytes >= maxBytes) {
@@ -207,9 +208,11 @@ void PartitionedOutputBuffer::updateNumDrivers(uint32_t newNumDrivers) {
 }
 
 void PartitionedOutputBuffer::addBroadcastOutputBuffersLocked(int numBuffers) {
+    // 断言
   VELOX_CHECK(!noMoreBroadcastBuffers_)
   buffers_.reserve(numBuffers);
   for (auto i = buffers_.size(); i < numBuffers; i++) {
+    // 创建buffer
     auto buffer = std::make_unique<DestinationBuffer>();
     for (const auto& data : dataToBroadcast_) {
       buffer->enqueue(data);
@@ -239,6 +242,7 @@ BlockingReason PartitionedOutputBuffer::enqueue(
       std::shared_ptr<SerializedPage> sharedData(data.release());
       for (auto& buffer : buffers_) {
         if (buffer) {
+            // TODO(lokax): 送数据的时候，caller主动调用清除notify
           buffer->enqueue(sharedData);
           dataAvailableCallbacks.emplace_back(buffer->getAndClearNotify());
         }
@@ -350,6 +354,7 @@ void PartitionedOutputBuffer::updateAfterAcknowledgeLocked(
     std::vector<ContinuePromise>& promises) {
   uint64_t totalFreed = 0;
   for (const auto& free : freed) {
+    // unique?
     if (free.unique()) {
       totalFreed += free->size();
     }
@@ -414,6 +419,7 @@ void PartitionedOutputBuffer::getData(
   std::vector<std::shared_ptr<SerializedPage>> freed;
   std::vector<ContinuePromise> promises;
   {
+    // 加锁
     std::lock_guard<std::mutex> l(mutex_);
 
     if (broadcast_ && destination >= buffers_.size()) {

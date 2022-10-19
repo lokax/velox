@@ -1076,7 +1076,8 @@ void Task::driverClosedLocked() {
 }
 
 bool Task::checkIfFinishedLocked() {
-    // 如果没有处于Running状态，则返回false
+    // 如果没有处于Running状态，则返回false，这种情况可能被取消，出错之类的
+    // 自然不能表示Finished状态
   if (!isRunningLocked()) {
     return false;
   }
@@ -1105,7 +1106,7 @@ bool Task::checkIfFinishedLocked() {
       return true;
     }
   }
-
+    // 如果有分区没有被消费，是不能进入Finished状态的
   return false;
 }
 
@@ -1302,6 +1303,7 @@ ContinueFuture Task::terminate(TaskState terminalState) {
     for (auto& driver : drivers_) {
       if (driver) {
         // 这种情况说明driver不在线程上,调用者负责清理资源？ 
+        // 这里面会设置线程的状态为terminate
         if (enterForTerminateLocked(driver->state()) ==
             StopReason::kTerminate) {
                 // 保存离线线程driver
@@ -1311,7 +1313,7 @@ ContinueFuture Task::terminate(TaskState terminalState) {
       }
     }
   }
-
+    // 通知
   completionNotifier.notify();
 
   // Get the stats and free the resources of Drivers that were not on
@@ -1460,6 +1462,7 @@ uint64_t Task::timeSinceEndMs() const {
 
 void Task::onTaskCompletion() {
   listeners().withRLock([&](auto& listeners) {
+    // 没有监听者
     if (listeners.empty()) {
       return;
     }
@@ -1473,19 +1476,21 @@ void Task::onTaskCompletion() {
       state = state_;
       exception = exception_;
     }
-
+    // 调用函数
     for (auto& listener : listeners) {
       listener->onTaskCompletion(
           uuid_, taskId_, state, exception, std::move(stats));
     }
   });
 }
-
+// 用来等待状态发生改变的
 ContinueFuture Task::stateChangeFuture(uint64_t maxWaitMicros) {
+  // 获取任务互斥锁
   std::lock_guard<std::mutex> l(mutex_);
   // If 'this' is running, the future is realized on timeout or when
   // this no longer is running.
   if (not isRunningLocked()) {
+    // 直接返回一个默认构造的？
     return ContinueFuture();
   }
   auto [promise, future] = makeVeloxContinuePromiseContract(
@@ -1822,7 +1827,7 @@ StopReason Task::shouldStop() {
     return StopReason::kPause;
   }
   if (toYield_) {
-    // 这里要加锁
+    // 这里要加锁,是因为里面要修改toYield_的值的原因吧
     std::lock_guard<std::mutex> l(mutex_);
     return shouldStopLocked();
   }

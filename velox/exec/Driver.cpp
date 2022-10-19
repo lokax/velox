@@ -333,6 +333,8 @@ StopReason Driver::runInternal(
         // 逆序遍历,从sink算子开始
       for (int32_t i = numOperators - 1; i >= 0; --i) {
         // 任务是否应该停止
+        // 这个shouldStop一开始是没有加锁的
+        // 可能是因为每次循环都会调用，所以这里干脆不加锁了?但是是通过原子变量去访问的
         stop = task()->shouldStop();
         if (stop != StopReason::kNone) {
           guard.notThrown();
