@@ -84,6 +84,7 @@ HashStringAllocator::Position HashStringAllocator::newWrite(
       !currentHeader_,
       "Do not call newWrite before finishing the previous write to "
       "HashStringAllocator");
+      // 不需要精确大小？
   currentHeader_ = allocate(preferredSize, false);
 
   stream.setRange(ByteRange{
@@ -105,6 +106,7 @@ void HashStringAllocator::extendWrite(Position position, ByteStream& stream) {
       header->end(),
       "Starting extendWrite outside of the current range");
 
+    // 存在continue的话就释放掉，因为不一定需要这么多的空间
   if (header->isContinued()) {
     free(getNextContinued(header));
     header->clearContinued();
@@ -147,6 +149,8 @@ HashStringAllocator::Position HashStringAllocator::finishWrite(
 }
 
 void HashStringAllocator::newSlab(int32_t size) {
+    // 为什么多出两个header的空间？其中一个正常header，另一个是marker吗？
+    // 最少分配4个Page，16KB
   int32_t needed = std::max<int32_t>(
       bits::roundUp(size + 2 * sizeof(Header), memory::MappedMemory::kPageSize),
       kUnitSize);
@@ -154,8 +158,10 @@ void HashStringAllocator::newSlab(int32_t size) {
   auto run = pool_.firstFreeInRun();
   auto available = pool_.availableInRun() - sizeof(Header);
 
+    // 给当前run的末尾写一个marker
   // Write end  marker.
   *reinterpret_cast<uint32_t*>(run + available) = Header::kArenaEnd;
+  // 增加累计分配
   cumulativeBytes_ += available;
 
   // Add the new memory to the free list: Placement construct a header
@@ -171,6 +177,7 @@ void HashStringAllocator::newRange(int32_t bytes, ByteRange* range) {
   VELOX_CHECK(
       currentHeader_,
       "Must have called newWrite or extendWrite before newRange");
+      // 分配空间
   auto newHeader = allocate(bytes, false);
 
   auto lastWordPtr =
@@ -210,7 +217,7 @@ void HashStringAllocator::freeRestOfBlock(Header* header, int32_t keepBytes) {
   if (freeSize <= kMinAlloc) {
     return;
   }
-
+    // 把剩余部分放回链表中
   header->setSize(keepBytes);
   auto newHeader = new (header->end()) Header(freeSize);
   free(newHeader);
@@ -235,6 +242,7 @@ HashStringAllocator::allocateFromFreeList(
     bool mustHaveSize,
     bool isFinalSize) {
   constexpr int32_t kMaxCheckedForFit = 5;
+  // 如果没有free的块，则直接返回
   if (!numFree_) {
     return nullptr;
   }
@@ -243,6 +251,7 @@ HashStringAllocator::allocateFromFreeList(
   int32_t counter = 0;
   Header* largest = nullptr;
   Header* found = nullptr;
+  // 遍历链表
   for (auto* item = free_.next(); item != &free_; item = item->next()) {
     auto header = headerOf(item);
     VELOX_CHECK(header->isFree());
@@ -288,15 +297,20 @@ void HashStringAllocator::free(Header* _header) {
       continued = getNextContinued(header);
       header->clearContinued();
     }
+    // 断言header还没有被释放掉
     VELOX_CHECK(!header->isFree());
+    // 增加
     freeBytes_ += header->size() + sizeof(Header);
     cumulativeBytes_ -= header->size();
+    // 获取下一个header
     Header* next = header->next();
+    // 如果存在下一个header
     if (next) {
       VELOX_CHECK(!next->isPreviousFree());
       if (next->isFree()) {
         --numFree_;
         removeFromFreeList(next);
+        // 合并大小
         header->setSize(header->size() + next->size() + sizeof(Header));
         next = reinterpret_cast<Header*>(header->end());
         VELOX_CHECK(next->isArenaEnd() || !next->isFree());

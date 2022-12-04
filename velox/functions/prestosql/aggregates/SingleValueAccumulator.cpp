@@ -24,7 +24,9 @@ void SingleValueAccumulator::write(
     const BaseVector* vector,
     vector_size_t index,
     HashStringAllocator* allocator) {
+        // 如果是第一次写
   if (!begin_) {
+    // 则分配20个字节的空间
     begin_ = allocator->allocate(kInitialBytes);
   }
 

@@ -47,6 +47,7 @@ class StreamArena {
     return size_;
   }
 
+    // 获取映射内存的裸指针
   memory::MappedMemory* mappedMemory() {
     return mappedMemory_.get();
   }
@@ -62,6 +63,7 @@ class StreamArena {
   int32_t currentPage_ = 0;
   memory::MachinePageCount allocationQuantum_ = 2;
   size_t size_ = 0;
+  // 直接分配字符串的方式来分配空间
   std::vector<std::string> tinyRanges_;
 };
 

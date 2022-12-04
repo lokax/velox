@@ -176,6 +176,7 @@ class SimpleNumericAggregate : public exec::Aggregate {
   void
   pushdown(char** groups, const SelectivityVector& rows, const VectorPtr& arg) {
     DecodedVector decoded(*arg, rows, false);
+    // 索引
     const vector_size_t* indices = decoded.indices();
     THook hook(
         exec::Aggregate::offset_,

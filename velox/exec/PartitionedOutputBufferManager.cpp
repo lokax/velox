@@ -229,16 +229,19 @@ BlockingReason PartitionedOutputBuffer::enqueue(
     std::unique_ptr<SerializedPage> data,
     ContinueFuture* future) {
   VELOX_CHECK_NOT_NULL(data);
+  // 当前任务必须是运行态
   VELOX_CHECK(
       task_->isRunning(), "Task is terminated, cannot add data to output.");
   std::vector<DataAvailable> dataAvailableCallbacks;
   bool blocked = false;
   {
+    // 获取buffer的锁
     std::lock_guard<std::mutex> l(mutex_);
     VELOX_CHECK_LT(destination, buffers_.size());
 
     totalSize_ += data->size();
     if (broadcast_) {
+        // 创建一个共享指针
       std::shared_ptr<SerializedPage> sharedData(data.release());
       for (auto& buffer : buffers_) {
         if (buffer) {
@@ -247,7 +250,7 @@ BlockingReason PartitionedOutputBuffer::enqueue(
           dataAvailableCallbacks.emplace_back(buffer->getAndClearNotify());
         }
       }
-
+        // 保留下来，当将来创建broadacst buffer的时候，继续push进去
       if (!noMoreBroadcastBuffers_) {
         dataToBroadcast_.emplace_back(sharedData);
       }
@@ -256,6 +259,7 @@ BlockingReason PartitionedOutputBuffer::enqueue(
         buffer->enqueue(std::move(data));
         dataAvailableCallbacks.emplace_back(buffer->getAndClearNotify());
       } else {
+        // 什么时候会进行delete
         // Some downstream tasks may finish early and delete the
         // corresponding buffers. Further data for these buffers is dropped.
         totalSize_ -= data->size();
@@ -301,6 +305,7 @@ void PartitionedOutputBuffer::checkIfDone(bool oneDriverFinished) {
     if (atEnd_) {
       for (auto& buffer : buffers_) {
         if (buffer) {
+            // 末尾标志
           buffer->enqueue(nullptr);
           finished.push_back(buffer->getAndClearNotify());
         }
@@ -335,8 +340,10 @@ void PartitionedOutputBuffer::acknowledge(int destination, int64_t sequence) {
   std::vector<std::shared_ptr<SerializedPage>> freed;
   std::vector<ContinuePromise> promises;
   {
+    // 获取buffer的锁
     std::lock_guard<std::mutex> l(mutex_);
     VELOX_CHECK_LT(destination, buffers_.size());
+    // 获取对应目标的buffer
     auto* buffer = buffers_[destination].get();
     if (!buffer) {
       VLOG(1) << "Ack received after final ack for destination " << destination
@@ -421,20 +428,23 @@ void PartitionedOutputBuffer::getData(
   {
     // 加锁
     std::lock_guard<std::mutex> l(mutex_);
-
+    // 如果是broadcast的话，并且目标地点比当前的buffer多，那么尝试创建
     if (broadcast_ && destination >= buffers_.size()) {
       addBroadcastOutputBuffersLocked(destination + 1);
     }
-
+    // 断言
     VELOX_CHECK_LT(destination, buffers_.size());
+    // 拿出目标buffer
     auto destinationBuffer = buffers_[destination].get();
     VELOX_CHECK(
         destinationBuffer,
         "getData received after its buffer is deleted. Destination: {}, sequence: {}",
         destination,
         sequence);
+        // 移除sequence之前的数据?
     freed = destinationBuffer->acknowledge(sequence, true);
     updateAfterAcknowledgeLocked(freed, promises);
+    // 从sequence的位置读数据
     data = destinationBuffer->getData(maxBytes, sequence, notify);
   }
   releaseAfterAcknowledge(freed, promises);

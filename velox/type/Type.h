@@ -712,7 +712,7 @@ class UnknownType : public TypeBase<TypeKind::UNKNOWN> {
   }
 };
 
-class ArrayType : public TypeBase<TypeKind::ARRAY> {
+class TArrayType : public TypeBase<TypeKind::ARRAY> {
  public:
   explicit ArrayType(std::shared_ptr<const Type> child);
 

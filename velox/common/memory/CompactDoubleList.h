@@ -27,12 +27,14 @@ namespace facebook::velox {
 class CompactDoubleList {
  public:
   CompactDoubleList() {
+    // 设置循环指针
     setNext(this);
     setPrevious(this);
   }
 
   // Return true if 'this' is the only element.
   bool empty() const {
+    // 如果下一个元素指向自己，说明是空列表
     return next() == this;
   }
 
@@ -69,7 +71,7 @@ class CompactDoubleList {
   void setPrevious(CompactDoubleList* previous) {
     storePointer(previous, previousLow_, previousHigh_);
   }
-
+    // 加载指针
   CompactDoubleList* loadPointer(uint32_t low, uint16_t high) const {
     return reinterpret_cast<CompactDoubleList*>(
         low | (static_cast<uint64_t>(high) << 32));
@@ -80,11 +82,12 @@ class CompactDoubleList {
         reinterpret_cast<uint64_t>(pointer) &
             ~bits::lowMask(kPointerSignificantBits),
         0);
+    // 转换成uint64
     uint64_t data = reinterpret_cast<uint64_t>(pointer);
     low = static_cast<uint32_t>(data);
     high = static_cast<uint16_t>(data >> 32);
   }
-
+    // 只使用48位指针
   // 12 bytes. Stores 2 48 bit pointers.
   uint32_t nextLow_;
   uint32_t previousLow_;

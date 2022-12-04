@@ -107,6 +107,7 @@ class HashStringAllocator : public StreamArena {
       data_ = size | (data_ & ~kSizeMask);
     }
 
+    // 什么操作
     char* FOLLY_NONNULL begin() {
       return reinterpret_cast<char*>(this + 1);
     }

@@ -74,6 +74,7 @@ class ValueList {
   // and a next pointer. This could be adaptive, with smaller initial
   // sizes for lots of small arrays.
   static constexpr int kInitialSize = 44;
+    // 小数组
 
   void appendNull(HashStringAllocator* allocator);
 

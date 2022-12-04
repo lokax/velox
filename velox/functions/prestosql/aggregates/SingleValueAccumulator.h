@@ -39,6 +39,8 @@ struct SingleValueAccumulator {
   void destroy(HashStringAllocator* allocator);
 
  private:
+
+    // 初始20个字节
   static constexpr int kInitialBytes{20};
 
   HashStringAllocator::Header* begin_{nullptr};

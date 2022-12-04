@@ -166,6 +166,7 @@ class ByteStream {
   }
 
   int32_t lastRangeEnd() {
+    // 先更新，再返回
     updateEnd();
     return lastRangeEnd_;
   }
@@ -197,6 +198,7 @@ class ByteStream {
 
   template <typename T>
   T read() {
+    // 在当前缓冲区内，则直接返回即可
     if (current_->position + sizeof(T) <= current_->size) {
       current_->position += sizeof(T);
       return *reinterpret_cast<const T*>(
@@ -274,6 +276,7 @@ class ByteStream {
           values.size() * sizeof(T)));
       return;
     }
+    // 直接赋值
     auto target = reinterpret_cast<T*>(current_->buffer + current_->position);
     auto end = target + values.size();
     auto valuePtr = &values[0];
@@ -314,11 +317,14 @@ class ByteStream {
   }
 
   void appendStringPiece(folly::StringPiece value) {
+    // value需要几个字节
     int32_t bytes = value.size();
     int32_t offset = 0;
     for (;;) {
+        // 能够填充几个字节
       int32_t bytesFit =
           std::min(bytes - offset, current_->size - current_->position);
+          // 拷贝数据到buffer中
       memcpy(
           current_->buffer + current_->position,
           value.data() + offset,
@@ -328,10 +334,12 @@ class ByteStream {
       if (offset == bytes) {
         return;
       }
+      // 扩充内存
       extend(bits::roundUp(bytes - offset, memory::MappedMemory::kPageSize));
     }
   }
 
+    // 添加一个值
   template <typename T>
   void appendOne(const T& value) {
     append(folly::Range(&value, 1));
@@ -351,7 +359,7 @@ class ByteStream {
 
  private:
   void extend(int32_t bytes = memory::MappedMemory::kPageSize);
-
+    // 更新lastRangeEnd_
   void updateEnd() {
     if (!ranges_.empty() && current_ == &ranges_.back() &&
         current_->position > lastRangeEnd_) {

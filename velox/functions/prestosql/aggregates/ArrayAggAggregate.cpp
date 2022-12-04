@@ -22,22 +22,24 @@
 namespace facebook::velox::aggregate::prestosql {
 namespace {
 
+// 用ValueList来保存元素？
 struct ArrayAccumulator {
   ValueList elements;
 };
 
 class ArrayAggAggregate : public exec::Aggregate {
  public:
+    // 设置结果类型
   explicit ArrayAggAggregate(TypePtr resultType) : Aggregate(resultType) {}
-
+    // 固定大小
   int32_t accumulatorFixedWidthSize() const override {
     return sizeof(ArrayAccumulator);
   }
-
+    // 不是固定大小
   bool isFixedSize() const override {
     return false;
   }
-
+    // 遇到新组的时候，需要进行初始化
   void initializeNewGroups(
       char** groups,
       folly::Range<const vector_size_t*> indices) override {
@@ -54,8 +56,10 @@ class ArrayAggAggregate : public exec::Aggregate {
 
   void extractValues(char** groups, int32_t numGroups, VectorPtr* result)
       override {
+        // 类型转换为数组向量
     auto vector = (*result)->as<ArrayVector>();
     VELOX_CHECK(vector);
+    // 几个分组
     vector->resize(numGroups);
 
     auto elements = vector->elements();
@@ -100,6 +104,7 @@ class ArrayAggAggregate : public exec::Aggregate {
     });
   }
 
+    // 这个就是Combine
   void addIntermediateResults(
       char** groups,
       const SelectivityVector& rows,
@@ -120,7 +125,7 @@ class ArrayAggAggregate : public exec::Aggregate {
           allocator_);
     });
   }
-
+    // 只有一个分组的接口
   void addSingleGroupRawInput(
       char* group,
       const SelectivityVector& rows,
@@ -154,7 +159,7 @@ class ArrayAggAggregate : public exec::Aggregate {
           allocator_);
     });
   }
-
+    // 释放每个分组的内存
   void destroy(folly::Range<char**> groups) override {
     for (auto group : groups) {
       value<ArrayAccumulator>(group)->elements.free(allocator_);
@@ -162,6 +167,7 @@ class ArrayAggAggregate : public exec::Aggregate {
   }
 
  private:
+    // 计算总共有几个元素
   vector_size_t countElements(char** groups, int32_t numGroups) const {
     vector_size_t size = 0;
     for (int32_t i = 0; i < numGroups; ++i) {

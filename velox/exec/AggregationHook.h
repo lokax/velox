@@ -139,6 +139,7 @@ class SumHook final : public AggregationHook {
   }
 
   void addValue(vector_size_t row, const void* value) override {
+    // 拿出分组
     auto group = findGroup(row);
     clearNull(group);
     updateSingleValue(

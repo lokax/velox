@@ -97,6 +97,7 @@ class LocalExchangeSource : public ExchangeSource {
     auto buffers = PartitionedOutputBufferManager::getInstance().lock();
     VELOX_CHECK_NOT_NULL(buffers, "invalid PartitionedOutputBufferManager");
     VELOX_CHECK(requestPending_);
+    // 请求序列化为当前序列化
     auto requestedSequence = sequence_;
     auto self = shared_from_this();
     buffers->getData(
@@ -108,6 +109,7 @@ class LocalExchangeSource : public ExchangeSource {
         // shared_ptr to the current object (self).
         [self, requestedSequence, buffers, this](
             std::vector<std::unique_ptr<folly::IOBuf>> data, int64_t sequence) {
+                // 这种情况是什么时候发生呢？
           if (requestedSequence > sequence) {
             VLOG(2) << "Receives earlier sequence than requested: task "
                     << taskId_ << ", destination " << destination_
@@ -115,12 +117,14 @@ class LocalExchangeSource : public ExchangeSource {
                     << requestedSequence;
             int64_t nExtra = requestedSequence - sequence;
             VELOX_CHECK(nExtra < data.size());
+            // 这是把多余的数据移除掉吗
             data.erase(data.begin(), data.begin() + nExtra);
             sequence = requestedSequence;
           }
           std::vector<std::unique_ptr<SerializedPage>> pages;
           bool atEnd = false;
           for (auto& inputPage : data) {
+            // 代表inputPage是nullptr，这是结尾标志
             if (!inputPage) {
               atEnd = true;
               // Keep looping, there could be extra end markers.
@@ -133,13 +137,18 @@ class LocalExchangeSource : public ExchangeSource {
           }
           int64_t ackSequence;
           {
+            // 获取队列的互斥锁
             std::lock_guard<std::mutex> l(queue_->mutex());
+            // 不再pending
             requestPending_ = false;
+            // 把页面放进队列中
             for (auto& page : pages) {
               queue_->enqueue(std::move(page));
             }
             if (atEnd) {
+                // 如果在末尾，就退一个nullptr进队列中
               queue_->enqueue(nullptr);
+              // 设置为true
               atEnd_ = true;
             }
             ackSequence = sequence_ = sequence + pages.size();
@@ -247,7 +256,9 @@ std::unique_ptr<SerializedPage> ExchangeClient::next(
   {
     std::lock_guard<std::mutex> l(queue_->mutex());
     *atEnd = false;
+    // 尝试从队列中获取数据
     page = queue_->dequeue(atEnd, future);
+    // 如果结束了，则直接返回
     if (*atEnd) {
       return page;
     }

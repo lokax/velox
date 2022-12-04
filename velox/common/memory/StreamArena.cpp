@@ -24,15 +24,18 @@ StreamArena::StreamArena(memory::MappedMemory* mappedMemory)
 
 void StreamArena::newRange(int32_t bytes, ByteRange* range) {
   VELOX_CHECK(bytes > 0);
+  // 分配几个页面
   memory::MachinePageCount numPages =
       bits::roundUp(bytes, memory::MappedMemory::kPageSize) /
       memory::MappedMemory::kPageSize;
   int32_t numRuns = allocation_.numRuns();
   if (currentRun_ >= numRuns) {
     if (numRuns) {
+        // 把之前的allocation保存到数组中
       allocations_.push_back(std::make_unique<memory::MappedMemory::Allocation>(
           std::move(allocation_)));
     }
+    // allocationQuantum_至少分配两页的意思？
     if (!mappedMemory_->allocate(
             std::max(allocationQuantum_, numPages),
             kVectorStreamOwner,
@@ -41,8 +44,10 @@ void StreamArena::newRange(int32_t bytes, ByteRange* range) {
     }
     currentRun_ = 0;
     currentPage_ = 0;
+    // 分配了多少内存?
     size_ += allocation_.byteSize();
   }
+  // 拿出当前run
   auto run = allocation_.runAt(currentRun_);
   int32_t available = run.numPages() - currentPage_;
   range->buffer = run.data() + memory::MappedMemory::kPageSize * currentPage_;

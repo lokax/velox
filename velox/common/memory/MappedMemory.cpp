@@ -209,20 +209,12 @@ bool MappedMemoryImpl::allocate(
             mix.sizeCounts[i] * sizeClassSizes_[mix.sizeIndices[i]];
         bytesToAllocate += numPages * kPageSize;
       }
-<<<<<<< HEAD
-      // 一个回调函数
-      beforeAllocCB(bytesAllocated);
-=======
       userAllocCB(bytesToAllocate, true);
->>>>>>> f59af650049951ec26465b4c12096e0a80428fea
     }
 
     std::vector<void*> pages;
     pages.reserve(mix.numSizes);
     for (int32_t i = 0; i < mix.numSizes; ++i) {
-<<<<<<< HEAD
-        // 要分配几个page
-=======
       if (TestValue::enabled()) {
         // NOTE: if 'injectAllocFailure' is set to true by test callback, then
         // we break out the loop to trigger a memory allocation failure scenario
@@ -235,7 +227,6 @@ bool MappedMemoryImpl::allocate(
           break;
         }
       }
->>>>>>> f59af650049951ec26465b4c12096e0a80428fea
       MachinePageCount numPages =
           mix.sizeCounts[i] * sizeClassSizes_[mix.sizeIndices[i]];
       void* ptr;
@@ -286,21 +277,11 @@ bool MappedMemoryImpl::allocateContiguousImpl(
     ContiguousAllocation& allocation,
     std::function<void(int64_t, bool)> userAllocCB) {
   MachinePageCount numCollateralPages = 0;
-<<<<<<< HEAD
-  // 释放collateral来提供新内存的分配
-  if (collateral) {
-    numCollateralPages = free(*collateral) / kPageSize;
-  }
-  auto numContiguousCollateralPages = allocation.numPages();
-  if (numContiguousCollateralPages) {
-    // 取消之前内存的映射
-=======
   if (collateral != nullptr) {
     numCollateralPages = free(*collateral) / kPageSize;
   }
   auto numContiguousCollateralPages = allocation.numPages();
   if (numContiguousCollateralPages > 0) {
->>>>>>> f59af650049951ec26465b4c12096e0a80428fea
     if (munmap(allocation.data(), allocation.size()) < 0) {
       LOG(ERROR) << "munmap got " << errno << "for " << allocation.data()
                  << ", " << allocation.size();
@@ -321,14 +302,8 @@ bool MappedMemoryImpl::allocateContiguousImpl(
       std::rethrow_exception(std::current_exception());
     }
   }
-<<<<<<< HEAD
-  numAllocated_.fetch_add(numNeededPages);
-  numMapped_.fetch_add(numNeededPages);
-  // 直接映射
-=======
   numAllocated_.fetch_add(numPages);
   numMapped_.fetch_add(numNeededPages + numContiguousCollateralPages);
->>>>>>> f59af650049951ec26465b4c12096e0a80428fea
   void* data = mmap(
       nullptr,
       numPages * kPageSize,
@@ -463,6 +438,7 @@ MappedMemory::allocateBytes(uint64_t bytes, uint64_t maxMallocSize) {
     auto numPages = roundUpToSizeClassSize(bytes, sizeClassSizes_);
     if (allocate(numPages, kMallocOwner, allocation, nullptr, numPages)) {
       auto run = allocation.runAt(0);
+      // 只产生一个runs?
       VELOX_CHECK_EQ(
           1,
           allocation.numRuns(),

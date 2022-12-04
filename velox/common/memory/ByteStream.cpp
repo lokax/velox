@@ -18,6 +18,7 @@
 
 namespace facebook::velox {
 
+// 当前指针的位置？
 std::streampos ByteStream::tellp() const {
   if (ranges_.empty()) {
     return 0;
@@ -57,11 +58,13 @@ void ByteStream::flush(OutputStream* out) {
     int32_t count = i == ranges_.size() - 1 ? lastRangeEnd_ : ranges_[i].size;
     int32_t bytes = isBits_ ? bits::nbytes(count) : count;
     if (isBits_ && isReverseBitOrder_ && !isReversed_) {
+        // 没有将buffer内的比特翻转过的话，需要翻转一下
       bits::reverseBits(ranges_[i].buffer, bytes);
     }
     out->write(reinterpret_cast<char*>(ranges_[i].buffer), bytes);
   }
   if (isBits_ && isReverseBitOrder_) {
+    // 设置为已翻转，之后不再翻转
     isReversed_ = true;
   }
 }
@@ -79,10 +82,13 @@ void ByteStream::extend(int32_t bytes) {
     current_->position = 0;
     return;
   }
+  // 创建一个新的range
   ranges_.emplace_back();
   current_ = &ranges_.back();
   lastRangeEnd_ = 0;
+  // 创建新的range
   arena_->newRange(bytes, current_);
+  // bit的话range的大小乘8
   if (isBits_) {
     // size and position are in units of bits for a bits stream.
     current_->size *= 8;

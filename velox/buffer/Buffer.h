@@ -350,7 +350,7 @@ class AlignedBuffer : public Buffer {
     Buffer* old = buffer->get();
     VELOX_CHECK(old, "Buffer doesn't exist in reallocate");
     old->checkEndGuard();
-    VELOX_DCHECK(
+    VELOX_DCHECK(2
         dynamic_cast<ImplClass<T>*>(old) != nullptr,
         "Reallocate tries to change the type");
     auto oldSize = old->size();

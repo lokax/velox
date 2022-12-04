@@ -74,12 +74,7 @@ bool MmapAllocator::allocate(
   numAllocatedPages_ += mix.totalPages;
   if (userAllocCB != nullptr) {
     try {
-<<<<<<< HEAD
-        // 尝试回调
-      beforeAllocCB(mix.totalPages * kPageSize);
-=======
       userAllocCB(mix.totalPages * kPageSize, true);
->>>>>>> f59af650049951ec26465b4c12096e0a80428fea
     } catch (const std::exception& e) {
       numAllocated_.fetch_sub(mix.totalPages);
       std::rethrow_exception(std::current_exception());
