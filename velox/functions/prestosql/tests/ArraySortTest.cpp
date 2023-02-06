@@ -298,12 +298,13 @@ ArrayVectorPtr ArraySortTest::arrayVector<TestMapType>(
 template <>
 ArrayVectorPtr ArraySortTest::arrayVector<TestArrayType>(
     const std::vector<std::optional<TestArrayType>>& inputValues) {
-  std::vector<std::vector<std::optional<TestArrayType>>> inputVectors;
+  std::vector<std::optional<std::vector<std::optional<TestArrayType>>>>
+      inputVectors;
   inputVectors.reserve(numVectors_);
   for (int i = 0; i < numVectors_; ++i) {
     inputVectors.push_back(inputValues);
   }
-  return makeNestedArrayVector<StringView>(inputVectors);
+  return makeNullableNestedArrayVector<StringView>(inputVectors);
 }
 
 template <>
@@ -376,11 +377,7 @@ TEST_P(ArraySortTest, basic) {
   runTest(GetParam());
 }
 
-TEST_P(ArraySortTest, constant) {
-  if (GetParam() != TypeKind::BIGINT) {
-    GTEST_SKIP() << "Skipping constant test for non-bigint type";
-  }
-
+TEST_F(ArraySortTest, constant) {
   vector_size_t size = 1'000;
   auto data =
       makeArrayVector<int64_t>({{1, 2, 3, 0}, {4, 5, 4, 5}, {6, 6, 6, 6}});
@@ -401,6 +398,70 @@ TEST_P(ArraySortTest, constant) {
 
   result = evaluateConstant(2, data);
   expected = makeConstantArray<int64_t>(size, {6, 6, 6, 6});
+  assertEqualVectors(expected, result);
+}
+
+TEST_F(ArraySortTest, dictionaryEncodedElements) {
+  auto elementVector = makeNullableFlatVector<int64_t>({3, 1, 2, 4, 5});
+  auto dictionaryVector = BaseVector::wrapInDictionary(
+      makeNulls(5, nullEvery(2)), makeIndicesInReverse(5), 5, elementVector);
+  // Array vector with one array.
+  auto arrayVector = makeArrayVector({0}, dictionaryVector);
+  auto result = evaluate("array_sort(c0)", makeRowVector({arrayVector}));
+  assertEqualVectors(
+      result,
+      makeNullableArrayVector<int64_t>(
+          {{1, 4, std::nullopt, std::nullopt, std::nullopt}}));
+
+  // Array vector with 2 arrays.
+  arrayVector = makeArrayVector({0, 2}, dictionaryVector);
+  result = evaluate("array_sort(c0)", makeRowVector({arrayVector}));
+  assertEqualVectors(
+      result,
+      makeNullableArrayVector<int64_t>(
+          {{4, std::nullopt}, {1, std::nullopt, std::nullopt}}));
+}
+
+// Test arrays with dictionary-encoded elements of complex type.
+TEST_P(ArraySortTest, encodedElements) {
+  // Base vector: [0, 10, 20, 30, 40, 50].
+  // Dictionary reverses the order of rows, then repeats them:
+  // [50, 40, 30, 20, 10, 0, 50, 40, 30, 20, 10, 0]
+  // and adds nulls for even rows: [null, 40, null, 20, null, 0].
+  auto elements = BaseVector::wrapInDictionary(
+      makeNulls(12, nullEvery(2)),
+      makeIndices({5, 4, 3, 2, 1, 0, 5, 4, 3, 2, 1, 0}),
+      12,
+      makeRowVector({
+          makeFlatVector<int64_t>({0, 10, 20, 30, 40, 50}),
+          makeFlatVector<int32_t>({0, -10, -20, -30, -40, -50}),
+      }));
+
+  // Make an array vector with 3, 3, 6 elements per row:
+  // [[null, 40, null], [20, null, 0], [null, 40, null, 20, null, 0]].
+  auto array = makeArrayVector({0, 3, 6}, elements);
+
+  auto result = evaluate("array_sort(c0)", {makeRowVector({array})});
+
+  // After sorting we expect
+  //  [[40, null, null], [0, 20, null], [0, 20, 40, null, null, null]].
+  auto expected = makeArrayVector(
+      {0, 3, 6},
+      makeRowVector(
+          {
+              makeFlatVector<int64_t>(
+                  {40, -1, -1, 0, 20, -1, 0, 20, 40, -1, -1, -1}),
+              makeFlatVector<int32_t>(
+                  {-40, 1, 1, 0, -20, 1, 0, -20, -40, -1, -1, -1}),
+          },
+          // Nulls in rows 1, 2, 5, 9, 10, 11.
+          [](auto row) {
+            return row == 1 || row == 2 || row == 5 || row >= 9;
+          }));
+  assertEqualVectors(expected, result);
+
+  // Apply sort twice.
+  result = evaluate("array_sort(array_sort(c0))", {makeRowVector({array})});
   assertEqualVectors(expected, result);
 }
 

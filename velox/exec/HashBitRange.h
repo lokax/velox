@@ -15,7 +15,6 @@
  */
 #pragma once
 
-#include <velox/exec/VectorHasher.h>
 #include "velox/core/PlanNode.h"
 
 namespace facebook::velox::exec {
@@ -51,7 +50,7 @@ class HashBitRange {
   uint8_t numBits() const {
     return end_ - begin_;
   }
-
+    // 分区数
   int32_t numPartitions() const {
     return 1 << numBits();
   }

@@ -34,6 +34,22 @@ using namespace facebook::velox::common;
 using SubfieldFilters = std::unordered_map<Subfield, std::unique_ptr<Filter>>;
 
 struct FilterSpec {
+  FilterSpec() {}
+
+  explicit FilterSpec(
+      std::string field,
+      float startPct = 50,
+      float selectPct = 20,
+      FilterKind filterKind = FilterKind::kBigintRange,
+      bool isForRowGroupSkip = true,
+      bool allowNulls = true)
+      : field(field),
+        startPct(startPct),
+        selectPct(selectPct),
+        filterKind(filterKind),
+        isForRowGroupSkip(isForRowGroupSkip),
+        allowNulls_(allowNulls) {}
+
   std::string field;
   float startPct = 50;
   float selectPct = 20;
@@ -41,12 +57,13 @@ struct FilterSpec {
   // If true, makes a filter that matches max value in the column so as to skip
   // row groups on min/max.
   bool isForRowGroupSkip{false};
+  bool allowNulls_{true};
 };
 
 // Encodes a batch number and an index into the batch into an int32_t
-uint32_t batchPosition(uint32_t batchNumber, vector_size_t batchRow);
-uint32_t batchNumber(uint32_t position);
-vector_size_t batchRow(uint32_t position);
+uint64_t batchPosition(uint32_t batchNumber, vector_size_t batchRow);
+uint32_t batchNumber(uint64_t position);
+vector_size_t batchRow(uint64_t position);
 VectorPtr getChildBySubfield(
     RowVector* rowVector,
     const Subfield& subfield,
@@ -65,20 +82,17 @@ class AbstractColumnStats {
   virtual void sample(
       const std::vector<RowVectorPtr>& batches,
       const Subfield& subfield,
-      std::vector<uint32_t>& rows) = 0;
+      std::vector<uint64_t>& rows) = 0;
 
   virtual std::unique_ptr<Filter> filter(
-      float startPct,
-      float selectPct,
-      FilterKind filterKind,
       const std::vector<RowVectorPtr>& batches,
-      const Subfield& subfield,
-      std::vector<uint32_t>& hits) = 0;
+      const FilterSpec& filterSpec,
+      std::vector<uint64_t>& hits) = 0;
 
   virtual std::unique_ptr<Filter> rowGroupSkipFilter(
       const std::vector<RowVectorPtr>& /*batches*/,
       const Subfield& /*subfield*/,
-      std::vector<uint32_t>& /*hits*/) {
+      std::vector<uint64_t>& /*hits*/) {
     VELOX_NYI();
   }
 
@@ -88,7 +102,7 @@ class AbstractColumnStats {
   int32_t numDistinct_ = 0;
   int32_t numNulls_ = 0;
   int32_t numSamples_ = 0;
-  std::unordered_set<size_t> uniques_;
+  std::unordered_map<size_t, int> uniques_;
   static uint32_t counter_;
 };
 
@@ -101,7 +115,7 @@ class ColumnStats : public AbstractColumnStats {
   void sample(
       const std::vector<RowVectorPtr>& batches,
       const Subfield& subfield,
-      std::vector<uint32_t>& rows) override {
+      std::vector<uint64_t>& rows) override {
     int32_t previousBatch = -1;
     SimpleVector<T>* values = nullptr;
     for (auto row : rows) {
@@ -122,14 +136,12 @@ class ColumnStats : public AbstractColumnStats {
   }
 
   std::unique_ptr<Filter> filter(
-      float startPct,
-      float selectPct,
-      FilterKind filterKind,
       const std::vector<RowVectorPtr>& batches,
-      const Subfield& subfield,
-      std::vector<uint32_t>& hits) override {
+      const FilterSpec& filterSpec,
+      std::vector<uint64_t>& hits) override {
+    Subfield subfield(filterSpec.field);
     std::unique_ptr<Filter> filter;
-    switch (filterKind) {
+    switch (filterSpec.filterKind) {
       case FilterKind::kIsNull:
         filter = std::make_unique<velox::common::IsNull>();
         break;
@@ -137,7 +149,7 @@ class ColumnStats : public AbstractColumnStats {
         filter = std::make_unique<velox::common::IsNotNull>();
         break;
       default:
-        filter = makeRangeFilter(startPct, selectPct);
+        filter = makeRangeFilter(filterSpec);
         break;
     }
 
@@ -170,7 +182,7 @@ class ColumnStats : public AbstractColumnStats {
   std::unique_ptr<Filter> rowGroupSkipFilter(
       const std::vector<RowVectorPtr>& batches,
       const Subfield& subfield,
-      std::vector<uint32_t>& hits) override {
+      std::vector<uint64_t>& hits) override {
     std::unique_ptr<Filter> filter;
     filter = makeRowGroupSkipRangeFilter(batches, subfield);
     size_t numHits = 0;
@@ -209,15 +221,31 @@ class ColumnStats : public AbstractColumnStats {
     T value = vector->valueAt(index);
     size_t hash = folly::hasher<T>()(value) & kUniquesMask;
     if (uniques_.find(hash) != uniques_.end()) {
+      uniques_[hash]++;
       return;
     }
-    uniques_.insert(hash);
+    uniques_[hash]++;
     ++numDistinct_;
     values_.push_back(value);
   }
 
+  int32_t findIndex(float pct) {
+    int32_t index = 0;
+    int32_t sampleCount = 0;
+
+    for (; index < values_.size(); index++) {
+      auto value = values_[index];
+      size_t hash = folly::hasher<T>()(value) & kUniquesMask;
+      sampleCount += uniques_[hash];
+      if (sampleCount >= (pct / 100) * (numSamples_ - numNulls_)) {
+        break;
+      }
+    }
+    return index;
+  }
+
   T valueAtPct(float pct, int32_t* indexOut = nullptr) {
-    int32_t index = values_.size() * (pct / 100);
+    int32_t index = findIndex(pct);
     int32_t boundedIndex =
         std::min<int32_t>(values_.size() - 1, std::max<int32_t>(0, index));
     if (indexOut) {
@@ -226,32 +254,40 @@ class ColumnStats : public AbstractColumnStats {
     return values_[boundedIndex];
   }
 
-  std::unique_ptr<Filter> makeRangeFilter(float startPct, float selectPct) {
+  std::unique_ptr<Filter> makeRangeFilter(const FilterSpec& filterSpec) {
     if (values_.empty()) {
-      return std::make_unique<velox::common::IsNull>();
+      if (filterSpec.allowNulls_) {
+        return std::make_unique<velox::common::IsNull>();
+      } else {
+        return std::make_unique<velox::common::BigintRange>(0, 0, false);
+      }
     }
     int32_t lowerIndex;
     int32_t upperIndex;
-    T lower = valueAtPct(startPct, &lowerIndex);
-    T upper = valueAtPct(startPct + selectPct, &upperIndex);
+    T lower = valueAtPct(filterSpec.startPct, &lowerIndex);
+    T upper =
+        valueAtPct(filterSpec.startPct + filterSpec.selectPct, &upperIndex);
+    if (!filterSpec.allowNulls_) {
+      return std::make_unique<velox::common::BigintRange>(lower, upper, false);
+    }
     if (upperIndex - lowerIndex < 1000 && ++counter_ % 10 <= 3) {
       std::vector<int64_t> in;
       for (auto i = lowerIndex; i <= upperIndex; ++i) {
         in.push_back(values_[i]);
       }
       // make sure we don't accidentally generate an AlwaysFalse filter
-      if (counter_ % 2 == 1 && selectPct < 100.0) {
+      if (counter_ % 2 == 1 && filterSpec.selectPct < 100.0) {
         return velox::common::createNegatedBigintValues(in, true);
       }
       return velox::common::createBigintValues(in, true);
     }
     // sometimes make a negated filter instead (1/4 chance)
-    if (counter_ % 4 == 1 && selectPct < 100.0) {
+    if (counter_ % 4 == 1 && filterSpec.selectPct < 100.0) {
       return std::make_unique<velox::common::NegatedBigintRange>(
-          lower, upper, selectPct < 75);
+          lower, upper, filterSpec.selectPct < 75);
     }
     return std::make_unique<velox::common::BigintRange>(
-        lower, upper, selectPct > 25);
+        lower, upper, filterSpec.selectPct > 25);
   }
 
   std::unique_ptr<Filter> makeRowGroupSkipRangeFilter(
@@ -288,7 +324,8 @@ class ColumnStats : public AbstractColumnStats {
     }
   }
 
-  static constexpr size_t kUniquesMask = 0xfff;
+  // The sample size is 65536.
+  static constexpr size_t kUniquesMask = 0xffff;
   std::vector<T> values_;
 };
 
@@ -300,7 +337,7 @@ class ComplexColumnStats : public AbstractColumnStats {
   void sample(
       const std::vector<RowVectorPtr>& batches,
       const Subfield& subfield,
-      std::vector<uint32_t>& rows) override {
+      std::vector<uint64_t>& rows) override {
     int32_t previousBatch = -1;
     VectorPtr values = nullptr;
     for (auto row : rows) {
@@ -319,16 +356,14 @@ class ComplexColumnStats : public AbstractColumnStats {
   }
 
   std::unique_ptr<Filter> filter(
-      float startPct,
-      float selectPct,
-      FilterKind filterKind,
       const std::vector<RowVectorPtr>& batches,
-      const Subfield& subfield,
-      std::vector<uint32_t>& hits) override {
+      const FilterSpec& filterSpec,
+      std::vector<uint64_t>& hits) override {
+    Subfield subfield(filterSpec.field);
     std::unique_ptr<Filter> filter;
     // A complex type can only have is null and is not null filters. make an is
     // null if selective.
-    if (selectPct < 20) {
+    if (filterSpec.selectPct < 20) {
       filter = std::make_unique<velox::common::IsNull>();
     } else {
       filter = std::make_unique<velox::common::IsNotNull>();
@@ -361,12 +396,12 @@ class ComplexColumnStats : public AbstractColumnStats {
   std::unique_ptr<Filter> rowGroupSkipFilter(
       const std::vector<RowVectorPtr>& batches,
       const Subfield& subfield,
-      std::vector<uint32_t>& hits) override {
+      std::vector<uint64_t>& hits) override {
     VELOX_FAIL("N/A in ComplexType");
   }
 
  private:
-  std::unique_ptr<Filter> makeRangeFilter(float startPct, float selectPct) {
+  std::unique_ptr<Filter> makeRangeFilter(const FilterSpec&) {
     VELOX_FAIL("N/A in ComplexType");
   }
 
@@ -379,23 +414,19 @@ class ComplexColumnStats : public AbstractColumnStats {
 
 template <>
 std::unique_ptr<Filter> ColumnStats<bool>::makeRangeFilter(
-    float startPct,
-    float selectPct);
+    const FilterSpec& filterSpec);
 
 template <>
 std::unique_ptr<Filter> ColumnStats<float>::makeRangeFilter(
-    float startPct,
-    float selectPct);
+    const FilterSpec& filterSpec);
 
 template <>
 std::unique_ptr<Filter> ColumnStats<double>::makeRangeFilter(
-    float startPct,
-    float selectPct);
+    const FilterSpec& filterSpec);
 
 template <>
 std::unique_ptr<Filter> ColumnStats<StringView>::makeRangeFilter(
-    float startPct,
-    float selectPct);
+    const FilterSpec& filterSpec);
 
 template <>
 std::unique_ptr<Filter> ColumnStats<StringView>::makeRowGroupSkipRangeFilter(
@@ -431,7 +462,7 @@ class FilterGenerator {
   SubfieldFilters makeSubfieldFilters(
       const std::vector<FilterSpec>& filterSpecs,
       const std::vector<RowVectorPtr>& batches,
-      std::vector<uint32_t>& hitRows);
+      std::vector<uint64_t>& hitRows);
   std::vector<std::string> makeFilterables(uint32_t count, float pct);
   std::vector<FilterSpec> makeRandomSpecs(
       const std::vector<std::string>& filterable,

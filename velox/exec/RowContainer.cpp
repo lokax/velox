@@ -54,15 +54,15 @@ RowContainer::RowContainer(
     bool isJoinBuild,
     bool hasProbedFlag,
     bool hasNormalizedKeys,
-    memory::MappedMemory* mappedMemory,
+    memory::MemoryAllocator* allocator,
     const RowSerde& serde)
     : keyTypes_(keyTypes),
       nullableKeys_(nullableKeys),
       aggregates_(aggregates),
       isJoinBuild_(isJoinBuild),
       hasNormalizedKeys_(hasNormalizedKeys),
-      rows_(mappedMemory),
-      stringAllocator_(mappedMemory),
+      rows_(allocator),
+      stringAllocator_(allocator),
       serde_(serde) {
   // Compute the layout of the payload row.  The row has keys, null
   // flags, accumulators, dependent fields. All fields are fixed
@@ -92,14 +92,18 @@ RowContainer::RowContainer(
   int32_t offset = 0;
   int32_t nullOffset = 0;
   bool isVariableWidth = false;
+  // 遍历每一个keyType
   for (auto& type : keyTypes_) {
     typeKinds_.push_back(type->kind());
     types_.push_back(type);
+    // 保存行内偏移量？
     offsets_.push_back(offset);
     offset += typeKindSize(type->kind());
     nullOffsets_.push_back(nullOffset);
+    // 是否宽度可变
     isVariableWidth |= !type->isFixedWidth();
     if (nullableKeys) {
+        // 增加NULL偏移量
       ++nullOffset;
     }
   }
@@ -107,36 +111,49 @@ RowContainer::RowContainer(
   // free list next pointer below the bit at 'freeFlagOffset_'.
   offset = std::max<int32_t>(offset, sizeof(void*));
   int32_t firstAggregate = offsets_.size();
+  // 第一个聚合的偏移量
   int32_t firstAggregateOffset = offset;
+  // 遍历每一个聚合
   for (auto& aggregate : aggregates) {
     // Accumulator offset must be aligned by their alignment size.
+    // 首先让偏移量做对齐
     offset = bits::roundUp(offset, aggregate->accumulatorAlignmentSize());
     offsets_.push_back(offset);
+    // 使offset增加聚合状态的固定宽度
     offset += aggregate->accumulatorFixedWidthSize();
     nullOffsets_.push_back(nullOffset);
+    // 增加NULL的offset？
     ++nullOffset;
     isVariableWidth |= !aggregate->isFixedSize();
+    // 是否使用额外的内存
     usesExternalMemory_ |= aggregate->accumulatorUsesExternalMemory();
   }
+  // 遍历每一个payload类型
   for (auto& type : dependentTypes) {
     types_.push_back(type);
     typeKinds_.push_back(type->kind());
     offsets_.push_back(offset);
     offset += typeKindSize(type->kind());
     nullOffsets_.push_back(nullOffset);
+    // 直接增加偏移量
     ++nullOffset;
     isVariableWidth |= !type->isFixedWidth();
   }
+  
   if (isVariableWidth) {
+    // 这是用来存行的大小的吗？
     rowSizeOffset_ = offset;
     offset += sizeof(uint32_t);
   }
 
+    // 如果有探测标志的话
   if (hasProbedFlag) {
     nullOffsets_.push_back(nullOffset);
+    // 第一个聚合的偏移量 * 8 + 空值偏移量？
     probedFlagOffset_ = nullOffset + firstAggregateOffset * 8;
     ++nullOffset;
   }
+  // 这个是什么？
   // Free flag.
   nullOffsets_.push_back(nullOffset);
   freeFlagOffset_ = nullOffset + firstAggregateOffset * 8;
@@ -146,16 +163,20 @@ RowContainer::RowContainer(
     nullOffsets_[i] += firstAggregateOffset * 8;
   }
 
+    // 计算nullBit需要几个字节
   // Fixup the offset of aggregates to make space for null flags.
   int32_t nullBytes = bits::nbytes(nullOffsets_.size());
   if (rowSizeOffset_) {
     rowSizeOffset_ += nullBytes;
   }
+  // 遍历聚合和负载列类型
   for (int32_t i = 0; i < aggregates_.size() + dependentTypes.size(); ++i) {
+    // 移动nullByte
     offsets_[i + firstAggregate] += nullBytes;
+    // 获取nullOffset
     nullOffset = nullOffsets_[i + firstAggregate];
     if (i < aggregates.size()) {
-      aggregates_[i]->setAllocator(&stringAllocator_);
+      aggregates_[i]->setAllocator(&stringAllocator_); // 设置字符串内存分配器
       aggregates_[i]->setOffsets(
           offsets_[i + firstAggregate],
           nullByte(nullOffset),
@@ -178,6 +199,7 @@ RowContainer::RowContainer(
     // Aggregates are null on a new row.
     auto aggregateNullOffset = nullableKeys ? keyTypes.size() : 0;
     for (int32_t i = 0; i < aggregates_.size(); ++i) {
+        // 设置成NULL，给聚合函数状态使用的
       bits::setBit(initialNulls_.data(), i + aggregateNullOffset);
     }
   }
@@ -190,10 +212,12 @@ RowContainer::RowContainer(
   }
 }
 
+// 创建新行？
 char* RowContainer::newRow() {
   char* row;
   VELOX_DCHECK(
       !partitions_, "Rows may not be added after partitions() has been called");
+      // 增加行数
   ++numRows_;
   if (firstFreeRow_) {
     row = firstFreeRow_;
@@ -201,29 +225,35 @@ char* RowContainer::newRow() {
     firstFreeRow_ = nextFree(row);
     --numFreeRows_;
   } else {
+    // 分配内存
     row = rows_.allocateFixed(fixedRowSize_ + normalizedKeySize_) +
         normalizedKeySize_;
     if (normalizedKeySize_) {
+        // 增加这个东西
       ++numRowsWithNormalizedKey_;
     }
   }
+  // 初始化内存
   return initializeRow(row, false /* reuse */);
 }
 
 char* RowContainer::initializeRow(char* row, bool reuse) {
   if (reuse) {
+    // 释放空间
     auto rows = folly::Range<char**>(&row, 1);
     freeVariableWidthFields(rows);
     freeAggregates(rows);
   }
 
   if (!nullOffsets_.empty()) {
+    // 拷贝初始空置的内存到行里面去
     memcpy(
         row + nullByte(nullOffsets_[0]),
         initialNulls_.data(),
         initialNulls_.size());
   }
   if (rowSizeOffset_) {
+    // 可变行大小初始化为0
     variableRowSize(row) = 0;
   }
   return row;
@@ -235,6 +265,7 @@ void RowContainer::eraseRows(folly::Range<char**> rows) {
   numRows_ -= rows.size();
   for (auto* row : rows) {
     VELOX_CHECK(!bits::isBitSet(row, freeFlagOffset_), "Double free of row");
+    // 设置freeFlag
     bits::setBit(row, freeFlagOffset_);
     nextFree(row) = firstFreeRow_;
     firstFreeRow_ = row;
@@ -242,6 +273,7 @@ void RowContainer::eraseRows(folly::Range<char**> rows) {
   numFreeRows_ += rows.size();
 }
 
+// 释放变成字段的内存
 void RowContainer::freeVariableWidthFields(folly::Range<char**> rows) {
   for (auto i = 0; i < types_.size(); ++i) {
     switch (typeKinds_[i]) {
@@ -292,6 +324,7 @@ void RowContainer::checkConsistency() {
   VELOX_CHECK_EQ(allocatedRows, numRows_);
 }
 
+// 调用聚合函数状态的析构
 void RowContainer::freeAggregates(folly::Range<char**> rows) {
   for (auto& aggregate : aggregates_) {
     aggregate->destroy(rows);
@@ -304,6 +337,7 @@ void RowContainer::store(
     char* row,
     int32_t column) {
   auto numKeys = keyTypes_.size();
+  // 不存在NULLable key
   if (column < numKeys && !nullableKeys_) {
     VELOX_DYNAMIC_TYPE_DISPATCH(
         storeNoNulls,
@@ -367,6 +401,7 @@ void RowContainer::extractString(
       index, StringView(buffer->as<char>() + start, value.size()));
 }
 
+// 存储复杂类型
 void RowContainer::storeComplexType(
     const DecodedVector& decoded,
     vector_size_t index,
@@ -374,6 +409,7 @@ void RowContainer::storeComplexType(
     int32_t offset,
     int32_t nullByte,
     uint8_t nullMask) {
+        // 如果是NULL置
   if (decoded.isNullAt(index)) {
     VELOX_DCHECK(nullMask);
     row[nullByte] |= nullMask;
@@ -382,8 +418,10 @@ void RowContainer::storeComplexType(
   RowSizeTracker tracker(row[rowSizeOffset_], stringAllocator_);
   ByteStream stream(&stringAllocator_, false, false);
   auto position = stringAllocator_.newWrite(stream);
+  // 序列化数据进去
   serde_.serialize(*decoded.base(), decoded.index(index), stream);
   stringAllocator_.finishWrite(stream, 0);
+  // 保存StringView
   valueAt<StringView>(row, offset) =
       StringView(reinterpret_cast<char*>(position.position), stream.size());
 }
@@ -525,11 +563,47 @@ void RowContainer::setProbedFlag(char** rows, int32_t numRows) {
   }
 }
 
+void RowContainer::extractProbedFlags(
+    const char* FOLLY_NONNULL const* FOLLY_NONNULL rows,
+    int32_t numRows,
+    bool replaceFalseWithNull,
+    const VectorPtr& result) {
+  result->resize(numRows);
+  result->clearAllNulls();
+  auto flatResult = result->as<FlatVector<bool>>();
+  auto* rawValues = flatResult->mutableRawValues<uint64_t>();
+  for (auto i = 0; i < numRows; ++i) {
+    // Check if this row has null keys.
+    bool hasNullKey = false;
+    if (nullableKeys_) {
+      for (auto c = 0; c < keyTypes_.size(); ++c) {
+        bool isNull =
+            isNullAt(rows[i], columnAt(c).nullByte(), columnAt(c).nullMask());
+        if (isNull) {
+          hasNullKey = true;
+          break;
+        }
+      }
+    }
+
+    if (hasNullKey) {
+      flatResult->setNull(i, true);
+    } else {
+      bool probed = bits::isBitSet(rows[i], probedFlagOffset_);
+      if (replaceFalseWithNull && !probed) {
+        flatResult->setNull(i, true);
+      } else {
+        bits::setBit(rawValues, i, probed);
+      }
+    }
+  }
+}
+
 int64_t RowContainer::sizeIncrement(
     vector_size_t numRows,
     int64_t variableLengthBytes) const {
   constexpr int32_t kAllocUnit =
-      AllocationPool::kMinPages * memory::MappedMemory::kPageSize;
+      AllocationPool::kMinPages * memory::MemoryAllocator::kPageSize;
   int32_t needRows = std::max<int64_t>(0, numRows - numFreeRows_);
   int64_t needBytes =
       std::min<int64_t>(0, variableLengthBytes - stringAllocator_.freeSpace());
@@ -594,8 +668,7 @@ void RowContainer::skip(RowContainerIterator& iter, int32_t numRows) {
 
 RowPartitions& RowContainer::partitions() {
   if (!partitions_) {
-    partitions_ =
-        std::make_unique<RowPartitions>(numRows_, *rows_.mappedMemory());
+    partitions_ = std::make_unique<RowPartitions>(numRows_, *rows_.allocator());
   }
   return *partitions_;
 }
@@ -672,11 +745,11 @@ int32_t RowContainer::listPartitionRows(
 
 RowPartitions::RowPartitions(
     int32_t numRows,
-    memory::MappedMemory& mappedMemory)
-    : capacity_(numRows), allocation_(&mappedMemory) {
-  auto numPages = bits::roundUp(capacity_, memory::MappedMemory::kPageSize) /
-      memory::MappedMemory::kPageSize;
-  if (!mappedMemory.allocate(numPages, 0, allocation_)) {
+    memory::MemoryAllocator& allocator)
+    : capacity_(numRows), allocation_(&allocator) {
+  auto numPages = bits::roundUp(capacity_, memory::MemoryAllocator::kPageSize) /
+      memory::MemoryAllocator::kPageSize;
+  if (!allocator.allocateNonContiguous(numPages, 0, allocation_)) {
     VELOX_FAIL(
         "Failed to allocate RowContainer partitions: {} pages", numPages);
   }

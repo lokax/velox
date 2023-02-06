@@ -336,17 +336,24 @@ class ConstantVector final : public SimpleVector<T> {
  private:
   void setInternalState() {
     if (isLazyNotLoaded(*valueVector_)) {
+      VELOX_CHECK(
+          valueVector_->markAsContainingLazyAndWrapped(),
+          "An unloaded lazy vector cannot be wrapped by two different "
+          "top level vectors.");
       // Do not load Lazy vector
       return;
     }
-
+    // 是否为NULL
     isNull_ = valueVector_->isNullAt(index_);
     BaseVector::distinctValueCount_ = isNull_ ? 0 : 1;
     BaseVector::nullCount_ = isNull_ ? BaseVector::length_ : 0;
+    // 如果是标量类型
     if (valueVector_->isScalar()) {
       auto simple = valueVector_->loadedVector()->as<SimpleVector<T>>();
+      // 为什么这里还要再检查是否为NULL
       isNull_ = simple->isNullAt(index_);
       if (!isNull_) {
+        // 通过valueAt接口获取值
         value_ = simple->valueAt(index_);
         if constexpr (std::is_same_v<T, StringView>) {
           // Copy string value.
@@ -355,10 +362,12 @@ class ConstantVector final : public SimpleVector<T> {
 
           auto stringVector = simple->template as<SimpleVector<StringView>>();
           if (auto ascii = stringVector->isAscii(index_)) {
+            // 设置所有值都是ASCII，后续做计算就可以利用这个东西去选择特定的函数实现吧
             SimpleVector<T>::setAllIsAscii(ascii.value());
           }
         }
       }
+      // 置空，不再需要了
       valueVector_ = nullptr;
     }
     makeNullsBuffer();
@@ -373,6 +382,7 @@ class ConstantVector final : public SimpleVector<T> {
     }
   }
 
+    // 必要时创建NULL buffer
   void makeNullsBuffer() {
     if (!isNull_) {
       return;

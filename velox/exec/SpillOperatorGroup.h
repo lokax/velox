@@ -38,7 +38,7 @@ class SpillOperatorGroup {
  public:
   /// Define the internal execution state of a spill group. The valid state
   /// transition is depicted as below:
-
+  ///
   ///       kInit --->  kRunning  --->  kStopped
   ///                      ^               |
   ///                      |               v
@@ -61,7 +61,7 @@ class SpillOperatorGroup {
         state_(State::kInit) {}
 
   State state();
-
+    // 函数对象
   using SpillRunner = std::function<void(const std::vector<Operator*>& ops)>;
 
   /// Invoked by an operator on construction to add to this spill group.
@@ -115,6 +115,7 @@ class SpillOperatorGroup {
 
   // Return the number of non-stopped operators which includes both running and
   // waiting ones.
+  // 当前非停止的算子数量
   uint32_t numActiveOperatorsLocked() const {
     return operators_.size() - stoppedOperators_.size();
   }

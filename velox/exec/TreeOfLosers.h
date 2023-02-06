@@ -75,6 +75,7 @@ class TreeOfLosers {
     int32_t size = 0;
     int32_t levelSize = 1;
     int32_t numStreams = streams_.size();
+    // 计算需要几层
     while (numStreams > levelSize) {
       size += levelSize;
       levelSize *= 2;
@@ -129,6 +130,7 @@ class TreeOfLosers {
   // calling this again. Returns {nullptr, false} when all streams are at end.
   std::pair<Stream*, bool> nextWithEquals() {
     IndexAndFlag result;
+    // 第一次调用？
     if (UNLIKELY(lastIndex_ == kEmpty)) {
       // Only one stream. We handle this off the common path.
       if (values_.empty()) {
@@ -157,6 +159,7 @@ class TreeOfLosers {
 
   TIndex first(TIndex node) {
     if (node >= firstStream_) {
+        // 返回流的索引？
       return streams_[node - firstStream_]->hasData() ? node - firstStream_
                                                       : kEmpty;
     }
@@ -167,6 +170,7 @@ class TreeOfLosers {
     } else if (right == kEmpty) {
       return left;
     } else if (*streams_[left] < *streams_[right]) {
+        // 设置失败者？
       values_[node] = right;
       return left;
     } else {
@@ -176,16 +180,20 @@ class TreeOfLosers {
   }
 
   FOLLY_ALWAYS_INLINE TIndex propagate(TIndex node, TIndex value) {
+    // 一开始进来的时候，node是value的父亲
     while (UNLIKELY(values_[node] == kEmpty)) {
       if (UNLIKELY(node == 0)) {
         return value;
       }
+      // 遍历回到父节点
       node = parent(node);
     }
     for (;;) {
       if (UNLIKELY(values_[node] == kEmpty)) {
         // The value goes past the node and the node stays empty.
       } else if (UNLIKELY(value == kEmpty)) {
+        // 记住values_中存的是失败者
+        // 而value是当前胜者，因为value没有数据了，所有将value和values_[node]交换一下
         value = values_[node];
         values_[node] = kEmpty;
       } else if (*streams_[values_[node]] < *streams_[value]) {
@@ -198,13 +206,16 @@ class TreeOfLosers {
         ;
       }
       if (UNLIKELY(node == 0)) {
+        // 到根节点，直接返回当前的胜利者
         return value;
       }
+      // 递归到父节点
       node = parent(node);
     }
   }
 
   IndexAndFlag firstWithEquals(TIndex node) {
+    // 到达叶子节点
     if (node >= firstStream_) {
       VELOX_DCHECK_LT(node - firstStream_, streams_.size());
       return indexAndFlag(
@@ -212,6 +223,7 @@ class TreeOfLosers {
                                                    : kEmpty,
           false);
     }
+    // 递归处理
     auto left = firstWithEquals(leftChild(node));
     auto right = firstWithEquals(rightChild(node));
     if (left.first == kEmpty) {
@@ -219,8 +231,10 @@ class TreeOfLosers {
     } else if (right.first == kEmpty) {
       return left;
     } else {
+        // 两个值进行比较
       auto comparison = streams_[left.first]->compare(*streams_[right.first]);
       if (comparison == 0) {
+        // 设置成右边为失败者
         values_[node] = right.first;
         equals_[node] = right.second;
         return indexAndFlag(left.first, true);
@@ -239,6 +253,7 @@ class TreeOfLosers {
   FOLLY_ALWAYS_INLINE IndexAndFlag
   propagateWithEquals(TIndex node, TIndex valueIndex) {
     auto value = indexAndFlag(valueIndex, false);
+    // 这里和propagate(...)一样
     while (UNLIKELY(values_[node] == kEmpty)) {
       if (UNLIKELY(node == 0)) {
         return value;
@@ -247,15 +262,18 @@ class TreeOfLosers {
     }
     for (;;) {
       if (UNLIKELY(values_[node] == kEmpty)) {
+        // 不需要做什么，保持失败
         // The value goes past the node and the node stays empty.
       } else if (UNLIKELY(value.first == kEmpty)) {
         value = indexAndFlag(values_[node], equals_[node]);
         values_[node] = kEmpty;
         equals_[node] = false;
       } else {
+        // 进行比较
         auto comparison =
             streams_[values_[node]]->compare(*streams_[value.first]);
         if (comparison == 0) {
+            // 结果相等
           // the value goes up with equals set.
           value.second = true;
         } else if (comparison < 0) {
@@ -315,6 +333,7 @@ class MergeArray {
         streams_.push_back(std::move(stream));
       }
     }
+    // 先排序
     std::sort(
         streams_.begin(),
         streams_.end(),
@@ -325,18 +344,24 @@ class MergeArray {
   // expected to pop off the first element of the stream before
   // calling this again. Returns nullptr when all streams are at end.
   Stream* next() {
+    // 如果是true
     if (UNLIKELY(isFirst_)) {
+        // 设置为false
       isFirst_ = false;
       if (streams_.empty()) {
+        // 所有流都没有数据了
         return nullptr;
       }
+      // 返回第一个流
       // stream has data, else it would not be here after construction.
       return streams_[0].get();
     }
+    // 第一个流已经没有数据了，移除它
     if (!streams_[0]->hasData()) {
       streams_.erase(streams_.begin());
       return streams_.empty() ? nullptr : streams_[0].get();
     }
+    // 数组裸指针
     auto rawStreams = reinterpret_cast<Stream**>(streams_.data());
     auto first = rawStreams[0];
     auto it = std::lower_bound(
@@ -349,6 +374,7 @@ class MergeArray {
       simd::memcpy(rawStreams, rawStreams + 1, (offset - 1) * sizeof(Stream*));
       it[-1] = first;
     }
+    // 返回第一个流
     return streams_[0].get();
   }
 

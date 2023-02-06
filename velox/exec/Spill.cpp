@@ -16,6 +16,7 @@
 
 #include "velox/exec/Spill.h"
 #include "velox/common/file/FileSystems.h"
+#include "velox/exec/OperatorUtils.h"
 #include "velox/serializers/PrestoSerializer.h"
 
 namespace facebook::velox::exec {
@@ -31,10 +32,14 @@ static const serializer::presto::PrestoVectorSerde::PrestoOptions
 std::atomic<int32_t> SpillFile::ordinalCounter_;
 
 void SpillInput::next(bool /*throwIfPastEnd*/) {
+    // 需要读多少字节
   int32_t readBytes = std::min(input_->size() - offset_, buffer_->capacity());
   VELOX_CHECK_LT(0, readBytes, "Reading past end of spill file");
+  // 设置数据的范围
   setRange({buffer_->asMutable<uint8_t>(), readBytes, 0});
+  // 从文件中读数据
   input_->pread(offset_, readBytes, buffer_->asMutable<char>());
+  // 移动偏移量
   offset_ += readBytes;
 }
 
@@ -66,8 +71,10 @@ void SpillFile::startRead() {
       (1 << 20) - AlignedBuffer::kPaddedSize; // 1MB - padding.
   VELOX_CHECK(!output_);
   VELOX_CHECK(!input_);
+  // 打开文件
   auto fs = filesystems::getFileSystem(path_, nullptr);
   auto file = fs->openFileForRead(path_);
+  // 分配内存
   auto buffer = AlignedBuffer::allocate<char>(
       std::min<uint64_t>(fileSize_, kMaxReadBufferSize), &pool_);
   input_ = std::make_unique<SpillInput>(std::move(file), std::move(buffer));
@@ -77,6 +84,7 @@ bool SpillFile::nextBatch(RowVectorPtr& rowVector) {
   if (input_->atEnd()) {
     return false;
   }
+  // 这是把数据反序列回向量？
   VectorStreamGroup::read(
       input_.get(), &pool_, type_, &rowVector, &kDefaultSerdeOptions);
   return true;
@@ -84,7 +92,7 @@ bool SpillFile::nextBatch(RowVectorPtr& rowVector) {
 
 WriteFile& SpillFileList::currentOutput() {
   if (files_.empty() || !files_.back()->isWritable() ||
-      files_.back()->size() > targetFileSize_ * 1.5) {
+      files_.back()->size() > targetFileSize_) {
     if (!files_.empty() && files_.back()->isWritable()) {
       files_.back()->finishWrite();
     }
@@ -101,7 +109,7 @@ WriteFile& SpillFileList::currentOutput() {
 void SpillFileList::flush() {
   if (batch_) {
     IOBufOutputStream out(
-        mappedMemory_, nullptr, std::max<int64_t>(64 * 1024, batch_->size()));
+        allocator_, nullptr, std::max<int64_t>(64 * 1024, batch_->size()));
     batch_->flush(&out);
     batch_.reset();
     auto iobuf = out.getIOBuf();
@@ -117,7 +125,7 @@ void SpillFileList::write(
     const RowVectorPtr& rows,
     const folly::Range<IndexRange*>& indices) {
   if (!batch_) {
-    batch_ = std::make_unique<VectorStreamGroup>(&mappedMemory_);
+    batch_ = std::make_unique<VectorStreamGroup>(&allocator_);
     batch_->createStreamTree(
         std::static_pointer_cast<const RowType>(rows->type()),
         1000,
@@ -146,6 +154,14 @@ uint64_t SpillFileList::spilledBytes() const {
   return bytes;
 }
 
+void SpillFileList::recordRuntimeStats() {
+  for (const auto& file : files_) {
+    addThreadLocalRuntimeStat(
+        "spillFileSize",
+        RuntimeCounter(file->size(), RuntimeCounter::Unit::kBytes));
+  }
+}
+
 std::vector<std::string> SpillFileList::testingSpilledFilePaths() const {
   std::vector<std::string> spilledFiles;
   for (auto& file : files_) {
@@ -164,9 +180,11 @@ void SpillState::setPartitionSpilled(int32_t partition) {
 void SpillState::appendToPartition(
     int32_t partition,
     const RowVectorPtr& rows) {
+        // 这个分区已经被spilled?
   VELOX_CHECK(isPartitionSpilled(partition));
   // Ensure that partition exist before writing.
   if (!files_.at(partition)) {
+    // 文件不存在，则创建文件
     files_[partition] = std::make_unique<SpillFileList>(
         std::static_pointer_cast<const RowType>(rows->type()),
         numSortingKeys_,
@@ -174,7 +192,7 @@ void SpillState::appendToPartition(
         fmt::format("{}-spill-{}", path_, partition),
         targetFileSize_,
         pool_,
-        mappedMemory_);
+        allocator_);
   }
 
   IndexRange range{0, rows->size()};
@@ -187,11 +205,13 @@ std::unique_ptr<TreeOfLosers<SpillMergeStream>> SpillState::startMerge(
   VELOX_CHECK_LT(partition, files_.size());
   std::vector<std::unique_ptr<SpillMergeStream>> result;
   if (auto list = std::move(files_[partition]); list) {
+    // 遍历每个文件
     for (auto& file : list->files()) {
       result.push_back(FileSpillMergeStream::create(std::move(file)));
     }
   }
   VELOX_DCHECK_EQ(!result.empty(), isPartitionSpilled(partition));
+  // 额外的这部分是在内存中的数据
   if (extra != nullptr) {
     result.push_back(std::move(extra));
   }
@@ -230,8 +250,8 @@ const SpillPartitionNumSet& SpillState::spilledPartitionSet() const {
   return spilledPartitionSet_;
 }
 
-int64_t SpillState::spilledFiles() const {
-  int64_t numFiles = 0;
+uint64_t SpillState::spilledFiles() const {
+  uint64_t numFiles = 0;
   for (const auto& list : files_) {
     if (list != nullptr) {
       numFiles += list->spilledFiles();
@@ -254,11 +274,13 @@ std::vector<std::string> SpillState::testingSpilledFilePaths() const {
   return spilledFiles;
 }
 
+// 分成多个切片？
 std::vector<std::unique_ptr<SpillPartition>> SpillPartition::split(
     int numShards) {
+        // 这个计算不对阿？
   const int32_t numFilesPerShard = bits::roundUp(files_.size(), numShards);
   std::vector<std::unique_ptr<SpillPartition>> shards(numShards);
-
+    // 遍历每一个切片
   for (int shard = 0, fileIdx = 0; shard < numShards; ++shard) {
     SpillFiles shardFiles;
     shardFiles.reserve(numFilesPerShard);
@@ -283,7 +305,7 @@ SpillPartition::createReader() {
   return std::make_unique<UnorderedStreamReader<BatchStream>>(
       std::move(streams));
 }
-
+// 返回分区ID
 SpillPartitionIdSet toSpillPartitionIdSet(
     const SpillPartitionSet& partitionSet) {
   SpillPartitionIdSet partitionIdSet;

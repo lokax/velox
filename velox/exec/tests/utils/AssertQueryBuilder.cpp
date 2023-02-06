@@ -42,7 +42,8 @@ AssertQueryBuilder::AssertQueryBuilder(
 AssertQueryBuilder::AssertQueryBuilder(DuckDbQueryRunner& duckDbQueryRunner)
     : duckDbQueryRunner_{&duckDbQueryRunner} {}
 
-AssertQueryBuilder::AssertQueryBuilder(const core::PlanNodePtr& plan) {
+AssertQueryBuilder::AssertQueryBuilder(const core::PlanNodePtr& plan)
+    : duckDbQueryRunner_(nullptr) {
   params_.planNode = plan;
 }
 
@@ -158,7 +159,10 @@ std::shared_ptr<Task> AssertQueryBuilder::assertResults(
 RowVectorPtr AssertQueryBuilder::copyResults(memory::MemoryPool* pool) {
   auto [cursor, results] = readCursor();
 
-  VELOX_CHECK(!results.empty());
+  if (results.empty()) {
+    return BaseVector::create<RowVector>(
+        params_.planNode->outputType(), 0, pool);
+  }
 
   auto totalCount = 0;
   for (const auto& result : results) {
@@ -182,7 +186,9 @@ AssertQueryBuilder::readCursor() {
 
   if (!configs_.empty()) {
     if (!params_.queryCtx) {
-      params_.queryCtx = core::QueryCtx::createForTest();
+      // NOTE: the destructor of 'executor_' will wait for all the async task
+      // activities to finish on AssertQueryBuilder dtor.
+      params_.queryCtx = std::make_shared<core::QueryCtx>(executor_.get());
     }
     params_.queryCtx->setConfigOverridesUnsafe(std::move(configs_));
   }

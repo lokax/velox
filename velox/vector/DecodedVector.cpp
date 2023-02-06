@@ -33,28 +33,6 @@ std::vector<vector_size_t> makeConsecutiveIndices(size_t size) {
   }
   return consecutiveIndices;
 }
-
-// If `rows` is null applys the `func` to all rows in `vector` [0, size)
-// otherwise, applys it on selected rows only.
-template <typename Func>
-void applyToRows(
-    const BaseVector& vector,
-    const SelectivityVector* rows,
-    Func&& func) {
-  if (rows) {
-    rows->applyToSelected([&](vector_size_t row) { func(row); });
-    return;
-  } else {
-    for (auto i = 0; i < vector.size(); i++) {
-      func(i);
-    }
-  }
-}
-
-// If `rows` is null returns vector size, otherwise returns rows->end().
-vector_size_t end(const BaseVector& vector, const SelectivityVector* rows) {
-  return rows ? rows->end() : vector.size();
-}
 } // namespace
 
 const std::vector<vector_size_t>& DecodedVector::consecutiveIndices() {
@@ -72,13 +50,15 @@ void DecodedVector::decode(
     const BaseVector& vector,
     const SelectivityVector* rows,
     bool loadLazy) {
-  reset(end(vector, rows));
+  reset(end(vector.size(), rows));
   loadLazy_ = loadLazy;
   if (loadLazy_ && (isLazyNotLoaded(vector) || vector.isLazy())) {
+    // 如果vector是lazy的话，要拿出底层的已加载向量
     decode(*vector.loadedVector(), rows);
     return;
   }
 
+    // 获取vector的编码类型
   auto encoding = vector.encoding();
   switch (encoding) {
     case VectorEncoding::Simple::FLAT:
@@ -91,8 +71,10 @@ void DecodedVector::decode(
       setBaseData(vector, rows);
       return;
     case VectorEncoding::Simple::CONSTANT: {
+        // 设置为常量映射
       isConstantMapping_ = true;
       if (isLazyNotLoaded(vector)) {
+        // 拿出底层向量
         baseVector_ = vector.valueVector().get();
         constantIndex_ = vector.wrapInfo()->as<vector_size_t>()[0];
         mayHaveNulls_ = true;
@@ -117,9 +99,11 @@ void DecodedVector::makeIndices(
     const BaseVector& vector,
     const SelectivityVector* rows,
     int32_t numLevels) {
-  VELOX_CHECK_LE(end(vector, rows), vector.size());
+  if (rows) {
+    VELOX_CHECK_LE(rows->end(), vector.size());
+  }
 
-  reset(end(vector, rows));
+  reset(end(vector.size(), rows));
   combineWrappers(&vector, rows, numLevels);
 }
 
@@ -152,23 +136,24 @@ void DecodedVector::combineWrappers(
     const BaseVector* vector,
     const SelectivityVector* rows,
     int numLevels) {
+        // vector的编码
   auto topEncoding = vector->encoding();
   BaseVector* values = nullptr;
   if (topEncoding == VectorEncoding::Simple::DICTIONARY) {
+    // 如果是字典编码的话
+    // 获取索引的裸指针
     indices_ = vector->wrapInfo()->as<vector_size_t>();
+    // 获取字典裸指针？
     values = vector->valueVector().get();
+    // 获取nulls裸指针
     nulls_ = vector->rawNulls();
     if (nulls_) {
+        // 设置这些状态
       hasExtraNulls_ = true;
       mayHaveNulls_ = true;
     }
   } else if (topEncoding == VectorEncoding::Simple::SEQUENCE) {
-<<<<<<< HEAD
-    // RLE
-    copiedIndices_.resize(rows.end());
-=======
-    copiedIndices_.resize(end(*vector, rows));
->>>>>>> f59af650049951ec26465b4c12096e0a80428fea
+    copiedIndices_.resize(end(rows));
     indices_ = &copiedIndices_[0];
     auto sizes = vector->wrapInfo()->as<vector_size_t>();
     vector_size_t lastBegin = 0;
@@ -176,7 +161,7 @@ void DecodedVector::combineWrappers(
     vector_size_t lastIndex = 0;
     values = vector->valueVector().get();
 
-    applyToRows(*vector, rows, [&](vector_size_t row) {
+    applyToRows(rows, [&](vector_size_t row) {
       copiedIndices_[row] =
           offsetOfIndex(sizes, row, &lastBegin, &lastEnd, &lastIndex);
     });
@@ -187,18 +172,21 @@ void DecodedVector::combineWrappers(
         VectorEncoding::mapSimpleToName(topEncoding));
   }
   int32_t levelCounter = 0;
+  // 无限循环
   for (;;) {
+    // numLevel不是-1的话，就循环固定次数
     if (numLevels != -1 && ++levelCounter == numLevels) {
       baseVector_ = values;
       return;
     }
-
+    // 获取向量的编码类型
     auto encoding = values->encoding();
+    // 这个暂时不看
     if (loadLazy_ && encoding == VectorEncoding::Simple::LAZY) {
       values = values->loadedVector();
       encoding = values->encoding();
     }
-
+    // 检查编码类型
     switch (encoding) {
       case VectorEncoding::Simple::LAZY:
       case VectorEncoding::Simple::CONSTANT:
@@ -207,6 +195,7 @@ void DecodedVector::combineWrappers(
       case VectorEncoding::Simple::ROW:
       case VectorEncoding::Simple::ARRAY:
       case VectorEncoding::Simple::MAP:
+        // 如果遇到这些编码类型后，就直接返回了
         setBaseData(*values, rows);
         return;
       case VectorEncoding::Simple::DICTIONARY: {
@@ -228,7 +217,7 @@ void DecodedVector::combineWrappers(
 void DecodedVector::applyDictionaryWrapper(
     const BaseVector& dictionaryVector,
     const SelectivityVector* rows) {
-  if (dictionaryVector.size() == 0 || (rows && !rows->hasSelections())) {
+  if (size_ == 0 || (rows && !rows->hasSelections())) {
     // No further processing is needed.
     return;
   }
@@ -242,7 +231,7 @@ void DecodedVector::applyDictionaryWrapper(
     // buffer is not copied, make a copy because we may need to
     // change it when iterating through wrapped vector
     if (!nulls_ || nullsNotCopied()) {
-      copyNulls(end(dictionaryVector, rows));
+      copyNulls(end(rows));
     }
   }
   auto copiedNulls = copiedNulls_.data();
@@ -252,12 +241,13 @@ void DecodedVector::applyDictionaryWrapper(
     indices_ = copiedIndices_.data();
   }
 
-  applyToRows(dictionaryVector, rows, [&](vector_size_t row) {
+  applyToRows(rows, [&](vector_size_t row) {
     if (!nulls_ || !bits::isBitNull(nulls_, row)) {
       auto wrappedIndex = currentIndices[row];
       if (newNulls && bits::isBitNull(newNulls, wrappedIndex)) {
         bits::setNull(copiedNulls, row);
       } else {
+        // 重映射
         copiedIndices_[row] = newIndices[wrappedIndex];
       }
     }
@@ -267,18 +257,26 @@ void DecodedVector::applyDictionaryWrapper(
 void DecodedVector::applySequenceWrapper(
     const BaseVector& sequenceVector,
     const SelectivityVector* rows) {
-  if (sequenceVector.size() == 0 || (rows && !rows->hasSelections())) {
+  if (size_ == 0 || (rows && !rows->hasSelections())) {
     // No further processing is needed.
     return;
   }
 
+    // 长度向量的裸指针
   const auto* lengths = sequenceVector.wrapInfo()->as<vector_size_t>();
   auto newNulls = sequenceVector.rawNulls();
+  /*
+  // RLE不能添加NULL值
+  void addNulls(const uint64_t* bits, const SelectivityVector& rows) override {
+    throw std::runtime_error("addNulls not supported");
+  }
+  */
+ // 感觉这个逻辑没有必要？
   if (newNulls) {
     hasExtraNulls_ = true;
     mayHaveNulls_ = true;
     if (!nulls_ || nullsNotCopied()) {
-      copyNulls(end(sequenceVector, rows));
+      copyNulls(end(rows));
     }
   }
   auto copiedNulls = copiedNulls_.data();
@@ -292,12 +290,16 @@ void DecodedVector::applySequenceWrapper(
   vector_size_t lastEnd = lengths[0];
   vector_size_t lastIndex = 0;
 
-  applyToRows(sequenceVector, rows, [&](vector_size_t row) {
+  applyToRows(rows, [&](vector_size_t row) {
+    // 如果当前行在上一个wrapper中不是NULL，那么
     if (!nulls_ || !bits::isBitNull(nulls_, row)) {
+        // 拿出内部索引
       auto wrappedIndex = currentIndices[row];
+      // 如果是NULL值
       if (newNulls && bits::isBitNull(newNulls, wrappedIndex)) {
         bits::setNull(copiedNulls, row);
       } else {
+        // 更新索引
         copiedIndices_[row] = offsetOfIndex(
             lengths, wrappedIndex, &lastBegin, &lastEnd, &lastIndex);
       }
@@ -330,6 +332,7 @@ void DecodedVector::fillInIndices() {
       "DecodedVector::indices_ must be set for non-constant non-consecutive mapping.");
 }
 
+// 没懂
 void DecodedVector::makeIndicesMutable() {
   if (indicesNotCopied()) {
     copiedIndices_.resize(size_ > 0 ? size_ : 1);
@@ -355,7 +358,7 @@ void DecodedVector::decodeBiased(
       bits::roundUp(size_, sizeof(int64_t)) / (sizeof(int64_t) / sizeof(T));
   tempSpace_.resize(numInt64);
   T* data = reinterpret_cast<T*>(&tempSpace_[0]); // NOLINT
-  applyToRows(vector, rows, [data, biased](vector_size_t row) {
+  applyToRows(rows, [data, biased](vector_size_t row) {
     data[row] = biased->valueAt(row);
   });
   data_ = data;
@@ -365,12 +368,15 @@ void DecodedVector::setFlatNulls(
     const BaseVector& vector,
     const SelectivityVector* rows) {
   if (hasExtraNulls_) {
+    // 还没拷贝过，需要拷贝一下，避免修改原始向量中的nulls
     if (nullsNotCopied()) {
-      copyNulls(end(vector, rows));
+        // 拷贝一下
+      copyNulls(end(rows));
     }
     auto leafNulls = vector.rawNulls();
+    // 这是上一个wrapper的nulls？
     auto copiedNulls = &copiedNulls_[0];
-    applyToRows(vector, rows, [&](vector_size_t row) {
+    applyToRows(rows, [&](vector_size_t row) {
       if (!bits::isBitNull(nulls_, row) &&
           (leafNulls && bits::isBitNull(leafNulls, indices_[row]))) {
         bits::setNull(copiedNulls, row);
@@ -386,20 +392,24 @@ void DecodedVector::setFlatNulls(
 void DecodedVector::setBaseData(
     const BaseVector& vector,
     const SelectivityVector* rows) {
+        // 获取vector的编码
   auto encoding = vector.encoding();
   baseVector_ = &vector;
   switch (encoding) {
     case VectorEncoding::Simple::LAZY:
       break;
     case VectorEncoding::Simple::FLAT: {
+        // data_这个只针对简单类型
       // values() may be nullptr if 'vector' is all nulls.
       data_ = vector.values() ? vector.values()->as<void>() : nullptr;
+      // 设置NULLS值
       setFlatNulls(vector, rows);
       break;
     }
     case VectorEncoding::Simple::ROW:
     case VectorEncoding::Simple::ARRAY:
     case VectorEncoding::Simple::MAP: {
+        // 这些复杂类型就不处理data_了
       setFlatNulls(vector, rows);
       break;
     }
@@ -431,17 +441,20 @@ void DecodedVector::setBaseDataForConstant(
     indices_ = nullptr;
     nulls_ = vector.isNullAt(0) ? &constantNullMask_ : nullptr;
   } else {
+    // 让索引可写？
     makeIndicesMutable();
 
-    applyToRows(vector, rows, [this](vector_size_t row) {
+    applyToRows(rows, [this](vector_size_t row) {
       copiedIndices_[row] = constantIndex_;
     });
     setFlatNulls(vector, rows);
   }
+  // 设置data_
   data_ = vector.valuesAsVoid();
   if (!nulls_) {
     nulls_ = vector.isNullAt(0) ? &constantNullMask_ : nullptr;
   }
+  // 设置是否可能存在NULL值
   mayHaveNulls_ = hasExtraNulls_ || nulls_;
 }
 
@@ -519,6 +532,8 @@ DecodedVector::DictionaryWrapping DecodedVector::dictionaryWrapping(
     // Re-use indices and nulls buffers.
     return {wrapper.wrapInfo(), wrapper.nulls()};
   } else {
+    // 这里之所以要拷贝，是因为多层封装下的indices和nulls不来自wrapper向量
+    // 而是DecodedVector拥有所有权，当析构时就访问无效内存了？
     // Make a copy of the indices and nulls buffers.
     BufferPtr indices = copyIndicesBuffer(indices_, size, wrapper.pool());
     // Only copy nulls if we have nulls coming from one of the wrappers, don't
@@ -585,5 +600,17 @@ const uint64_t* DecodedVector::nulls() {
   }
 
   return allNulls_.value();
+}
+
+template <typename Func>
+void DecodedVector::applyToRows(const SelectivityVector* rows, Func&& func)
+    const {
+  if (rows) {
+    rows->applyToSelected([&](vector_size_t row) { func(row); });
+  } else {
+    for (auto i = 0; i < size_; i++) {
+      func(i);
+    }
+  }
 }
 } // namespace facebook::velox

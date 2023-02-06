@@ -235,7 +235,8 @@ class SimpleVector : public BaseVector {
   /// present. Returns computed value.
   template <typename U = T>
   typename std::enable_if_t<std::is_same_v<U, StringView>, bool>
-  computeAndSetIsAscii(const SelectivityVector& rows) {
+  computeAndSetIsAsciicomputeAndSetIsAscii(const SelectivityVector& rows) {
+    // 如果是子集，返回是否所有都是ascii
     if (rows.isSubset(asciiSetRows_)) {
       return isAllAscii_;
     }
@@ -295,6 +296,7 @@ class SimpleVector : public BaseVector {
   template <typename U = T>
   typename std::enable_if_t<std::is_same_v<U, StringView>, void>
   ensureIsAsciiCapacity(vector_size_t size) {
+    // 扩容
     if (asciiSetRows_.size() < size) {
       asciiSetRows_.resize(size, false);
     }

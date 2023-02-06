@@ -19,6 +19,8 @@
 #include <gtest/gtest.h>
 
 #include <folly/Benchmark.h>
+#include <folly/init/Init.h>
+
 #include <optional>
 #include "velox/core/PlanNode.h"
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
@@ -102,8 +104,8 @@ class CodegenTestCore {
             udfManager_,
             useSymbolForArithmetic_,
             eventSequence_);
-    pool_ = memory::getDefaultScopedMemoryPool();
-    queryCtx_ = core::QueryCtx::createForTest();
+    pool_ = memory::getDefaultMemoryPool();
+    queryCtx_ = std::make_shared<core::QueryCtx>(executor_.get());
     execCtx_ = std::make_unique<core::ExecCtx>(pool_.get(), queryCtx_.get());
 
     parse::registerTypeResolver();
@@ -279,8 +281,11 @@ class CodegenTestCore {
     return failed;
   }
 
+  std::shared_ptr<folly::Executor> executor_{
+      std::make_shared<folly::CPUThreadPoolExecutor>(
+          std::thread::hardware_concurrency())};
   std::unique_ptr<CodegenCompiledExpressionTransform> codegenTransformation_;
-  std::unique_ptr<facebook::velox::memory::MemoryPool> pool_;
+  std::shared_ptr<facebook::velox::memory::MemoryPool> pool_;
   std::unique_ptr<core::ExecCtx> execCtx_;
   std::shared_ptr<core::QueryCtx> queryCtx_;
   UDFManager udfManager_;

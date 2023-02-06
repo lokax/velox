@@ -88,6 +88,7 @@ std::vector<std::shared_ptr<SerializedPage>> DestinationBuffer::acknowledge(
     return {};
   }
   if (numDeleted <= 0) {
+    // 网络消息可能乱序到达
     // Acknowledges come out of order, e.g. ack of 10 and 9 have
     // swapped places in flight.
     VLOG(0) << this << " Out of order ack: " << sequence << " over "
@@ -110,6 +111,7 @@ std::vector<std::shared_ptr<SerializedPage>> DestinationBuffer::acknowledge(
   return freed;
 }
 
+// 释放所有的数据？
 std::vector<std::shared_ptr<SerializedPage>>
 DestinationBuffer::deleteResults() {
   std::vector<std::shared_ptr<SerializedPage>> freed;
@@ -141,6 +143,7 @@ void releaseAfterAcknowledge(
     std::vector<std::shared_ptr<SerializedPage>>& freed,
     std::vector<ContinuePromise>& promises) {
   freed.clear();
+  // 通知
   for (auto& promise : promises) {
     promise.setValue();
   }
@@ -180,9 +183,12 @@ void PartitionedOutputBuffer::updateBroadcastOutputBuffers(
     if (!noMoreBuffers) {
       return;
     }
+    // 如果不会再添加buffer了
 
     noMoreBroadcastBuffers_ = true;
+    // 检查是否完成了
     isFinished = isFinishedLocked();
+    // 因为不会再增加广播Buffer了，所以这里尝试释放dataToBroadcast_的数据？
     updateAfterAcknowledgeLocked(dataToBroadcast_, promises);
   }
 
@@ -215,9 +221,11 @@ void PartitionedOutputBuffer::addBroadcastOutputBuffersLocked(int numBuffers) {
     // 创建buffer
     auto buffer = std::make_unique<DestinationBuffer>();
     for (const auto& data : dataToBroadcast_) {
+        // 把要进行广播的数据全部放进新Buffer的队列中
       buffer->enqueue(data);
     }
     if (atEnd_) {
+        // 如果到达末尾了，添加一个空标记
       buffer->enqueue(nullptr);
     }
     buffers_.emplace_back(std::move(buffer));
@@ -548,8 +556,8 @@ void PartitionedOutputBufferManager::deleteResults(
         }
         return it->second;
       });
-  if (buffer && buffer->deleteResults(destination)) {
-    buffers_.withLock([&](auto& buffers) { buffers.erase(taskId); });
+  if (buffer) {
+    buffer->deleteResults(destination);
   }
 }
 

@@ -1327,6 +1327,7 @@ TEST_F(TableScanTest, filterPushdown) {
 
   // Do the same for count, no filter, no projections.
   assignments.clear();
+  subfieldFilters.clear(); // Explicitly clear this.
   tableHandle = makeTableHandle(std::move(subfieldFilters));
   assertQuery(
       PlanBuilder()
@@ -1679,7 +1680,7 @@ TEST_F(TableScanTest, aggregationPushdown) {
       {filePath},
       "SELECT c5, max(c0), sum(c1), sum(c2), sum(c3), sum(c4) FROM tmp group by c5");
   // 5 aggregates processing 10K rows each via pushdown.
-  EXPECT_EQ(5 * 10'000, loadedToValueHook(task));
+  EXPECT_EQ(5 * 10'000, loadedToValueHook(task, 1));
 
   op = PlanBuilder()
            .tableScan(rowType_)
@@ -1692,7 +1693,7 @@ TEST_F(TableScanTest, aggregationPushdown) {
       {filePath},
       "SELECT c5, max(c0), max(c1), max(c2), max(c3), max(c4) FROM tmp group by c5");
   // 5 aggregates processing 10K rows each via pushdown.
-  EXPECT_EQ(5 * 10'000, loadedToValueHook(task));
+  EXPECT_EQ(5 * 10'000, loadedToValueHook(task, 1));
 
   op = PlanBuilder()
            .tableScan(rowType_)
@@ -1705,7 +1706,7 @@ TEST_F(TableScanTest, aggregationPushdown) {
       {filePath},
       "SELECT c5, min(c0), min(c1), min(c2), min(c3), min(c4) FROM tmp group by c5");
   // 5 aggregates processing 10K rows each via pushdown.
-  EXPECT_EQ(5 * 10'000, loadedToValueHook(task));
+  EXPECT_EQ(5 * 10'000, loadedToValueHook(task, 1));
 
   // Pushdown should also happen if there is a FilterProject node that doesn't
   // touch columns being aggregated
@@ -1719,7 +1720,7 @@ TEST_F(TableScanTest, aggregationPushdown) {
       assertQuery(op, {filePath}, "SELECT c0 % 5, sum(c1) FROM tmp group by 1");
   // LazyVector stats are reported on the closest operator upstream of the
   // aggregation, e.g. project operator.
-  EXPECT_EQ(10'000, loadedToValueHook(task, 1));
+  EXPECT_EQ(10'000, loadedToValueHook(task, 2));
 
   // Add remaining filter to scan to expose LazyVectors wrapped in Dictionary to
   // aggregation.
@@ -1732,8 +1733,8 @@ TEST_F(TableScanTest, aggregationPushdown) {
       {filePath},
       "SELECT c5, max(c0) FROM tmp WHERE length(c5) % 2 = 0 GROUP BY c5");
   // Values in rows that passed the filter should be aggregated via pushdown.
-  EXPECT_GT(loadedToValueHook(task), 0);
-  EXPECT_LT(loadedToValueHook(task), 10'000);
+  EXPECT_GT(loadedToValueHook(task, 1), 0);
+  EXPECT_LT(loadedToValueHook(task, 1), 10'000);
 
   // No pushdown if two aggregates use the same column or a column is not a
   // LazyVector
@@ -1914,7 +1915,7 @@ TEST_F(TableScanTest, groupedExecutionWithOutputBuffer) {
           .planFragment();
   planFragment.executionStrategy = core::ExecutionStrategy::kGrouped;
   planFragment.numSplitGroups = 10;
-  auto queryCtx = core::QueryCtx::createForTest();
+  auto queryCtx = std::make_shared<core::QueryCtx>(executor_.get());
   auto task = std::make_shared<exec::Task>(
       "0", std::move(planFragment), 0, std::move(queryCtx));
   // 3 drivers max and 1 concurrent split group.
@@ -2099,15 +2100,15 @@ TEST_F(TableScanTest, addSplitsToFailedTask) {
 }
 
 TEST_F(TableScanTest, errorInLoadLazy) {
-  auto cache =
-      dynamic_cast<cache::AsyncDataCache*>(memory::MappedMemory::getInstance());
+  auto cache = dynamic_cast<cache::AsyncDataCache*>(
+      memory::MemoryAllocator::getInstance());
   VELOX_CHECK_NOT_NULL(cache);
 
   auto vectors = makeVectors(10, 1'000);
   auto filePath = TempFilePath::create();
   writeToFile(filePath->path, vectors);
 
-  int32_t counter = 0;
+  std::atomic<int32_t> counter = 0;
   cache->setVerifyHook([&](const cache::AsyncDataCacheEntry&) {
     if (++counter >= 7) {
       VELOX_FAIL("Testing error");

@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_library(velox_expression_test_utility ArgumentTypeFuzzer.cpp)
+add_library(velox_expression_test_utility ArgumentTypeFuzzer.cpp
+                                          FuzzerToolkit.cpp)
 
 target_link_libraries(velox_expression_test_utility velox_type
                       velox_expression_functions)
@@ -20,6 +21,7 @@ target_link_libraries(velox_expression_test_utility velox_type
 add_executable(
   velox_expression_test
   ArgumentTypeFuzzerTest.cpp
+  CustomTypeTest.cpp
   ExprEncodingsTest.cpp
   ExprTest.cpp
   ExprCompilerTest.cpp
@@ -33,6 +35,7 @@ add_executable(
   ReverseSignatureBinderTest.cpp
   RowWriterTest.cpp
   EvalSimplifiedTest.cpp
+  FunctionCallToSpecialFormTest.cpp
   SignatureBinderTest.cpp
   SimpleFunctionTest.cpp
   SimpleFunctionInitTest.cpp
@@ -80,10 +83,22 @@ target_link_libraries(
   glog::glog
   ${FMT})
 
+add_library(velox_expression_verifier ExpressionVerifier.cpp)
+
+target_link_libraries(
+  velox_expression_verifier velox_vector_test_lib velox_vector_fuzzer
+  velox_type velox_expression_test_utility)
+
 add_library(velox_expression_fuzzer ExpressionFuzzer.cpp)
 
-target_link_libraries(velox_expression_fuzzer velox_type velox_vector_fuzzer
-                      velox_vector_test_lib velox_function_registry)
+target_link_libraries(
+  velox_expression_fuzzer
+  velox_expression_verifier
+  velox_type
+  velox_vector_fuzzer
+  velox_vector_test_lib
+  velox_function_registry
+  velox_expression_test_utility)
 
 add_executable(velox_expression_fuzzer_unit_test ExpressionFuzzerUnitTest.cpp)
 
@@ -93,6 +108,30 @@ target_link_libraries(
   velox_functions_prestosql
   velox_core
   velox_expression
+  gtest
+  gtest_main)
+
+add_library(velox_expression_runner ExpressionRunner.cpp)
+target_link_libraries(velox_expression_runner velox_expression_verifier
+                      velox_functions_prestosql velox_parse_parser gtest)
+
+add_executable(velox_expression_runner_test ExpressionRunnerTest.cpp)
+target_link_libraries(
+  velox_expression_runner_test velox_expression_runner velox_exec_test_lib
+  velox_function_registry gtest gtest_main)
+
+add_executable(velox_expression_runner_unit_test ExpressionRunnerUnitTest.cpp)
+target_link_libraries(
+  velox_expression_runner_unit_test
+  velox_dwio_common_test_utils
+  velox_expression
+  velox_expression_runner
+  velox_expression_fuzzer
+  velox_expression_verifier
+  velox_function_registry
+  velox_temp_path
+  velox_exec_test_lib
+  velox_vector_test_lib
   gtest
   gtest_main)
 

@@ -15,7 +15,7 @@
  */
 #pragma once
 
-#include "velox/common/memory/MappedMemory.h"
+#include "velox/common/memory/MemoryAllocator.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/Operator.h"
 #include "velox/exec/RowContainer.h"
@@ -89,6 +89,10 @@ class BaseHashTable {
   struct RowsIterator {
     int32_t hashTableIndex_{-1};
     RowContainerIterator rowContainerIterator_;
+
+    void reset() {
+      *this = {};
+    }
   };
 
   /// Takes ownership of 'hashers'. These are used to keep key-level
@@ -135,6 +139,13 @@ class BaseHashTable {
 
   /// Returns rows with 'probed' flag set. Used by the right semi join.
   virtual int32_t listProbedRows(
+      RowsIterator* FOLLY_NULLABLE iter,
+      int32_t maxRows,
+      uint64_t maxBytes,
+      char* FOLLY_NULLABLE* FOLLY_NULLABLE rows) = 0;
+
+  /// Returns all rows. Used by the right semi join project.
+  virtual int32_t listAllRows(
       RowsIterator* FOLLY_NULLABLE iter,
       int32_t maxRows,
       uint64_t maxBytes,
@@ -272,12 +283,12 @@ class HashTable : public BaseHashTable {
       bool allowDuplicates,
       bool isJoinBuild,
       bool hasProbedFlag,
-      memory::MappedMemory* FOLLY_NULLABLE memory);
+      memory::MemoryAllocator* FOLLY_NULLABLE memory);
 
   static std::unique_ptr<HashTable> createForAggregation(
       std::vector<std::unique_ptr<VectorHasher>>&& hashers,
       const std::vector<std::unique_ptr<Aggregate>>& aggregates,
-      memory::MappedMemory* FOLLY_NULLABLE memory) {
+      memory::MemoryAllocator* FOLLY_NULLABLE memory) {
     return std::make_unique<HashTable>(
         std::move(hashers),
         aggregates,
@@ -293,7 +304,7 @@ class HashTable : public BaseHashTable {
       const std::vector<TypePtr>& dependentTypes,
       bool allowDuplicates,
       bool hasProbedFlag,
-      memory::MappedMemory* FOLLY_NULLABLE memory) {
+      memory::MemoryAllocator* FOLLY_NULLABLE memory) {
     static const std::vector<std::unique_ptr<Aggregate>> kNoAggregates;
     return std::make_unique<HashTable>(
         std::move(hashers),
@@ -324,6 +335,12 @@ class HashTable : public BaseHashTable {
       char* FOLLY_NULLABLE* FOLLY_NULLABLE rows) override;
 
   int32_t listProbedRows(
+      RowsIterator* FOLLY_NULLABLE iter,
+      int32_t maxRows,
+      uint64_t maxBytes,
+      char* FOLLY_NULLABLE* FOLLY_NULLABLE rows) override;
+
+  int32_t listAllRows(
       RowsIterator* FOLLY_NULLABLE iter,
       int32_t maxRows,
       uint64_t maxBytes,
@@ -380,13 +397,17 @@ class HashTable : public BaseHashTable {
     return 0;
   }
 
+  uint64_t rehashSize() const {
+    return rehashSize(size_);
+  }
+
   std::string toString() override;
 
  private:
   // Returns the number of entries after which the table gets rehashed.
-  uint64_t rehashSize() const {
+  static uint64_t rehashSize(int64_t size) {
     // This implements the F14 load factor: Resize if less than 1/8 unoccupied.
-    return size_ - (size_ / 8);
+    return size - (size / 8);
   }
 
   template <RowContainer::ProbeType probeType>
@@ -472,6 +493,16 @@ class HashTable : public BaseHashTable {
       char* FOLLY_NULLABLE* FOLLY_NULLABLE groups,
       uint64_t* FOLLY_NULLABLE hashes,
       int32_t numGroups);
+
+  /// Checks if we can apply parallel table build optimization for hash join.
+  /// The function returns true if all of the following conditions:
+  /// 1. the hash table is built for parallel join;
+  /// 2. there is more than one sub-tables;
+  /// 3. the build executor has been set;
+  /// 4. the table is not in kArray mode;
+  /// 5. the number of table entries per each parallel build shard is no less
+  ///    than a pre-defined threshold: 1000 for now.
+  bool canApplyParallelJoinBuild() const;
 
   // Builds a join table with '1 + otherTables_.size()' independent
   // threads using 'executor_'. First all RowContainers get partition
@@ -573,7 +604,7 @@ class HashTable : public BaseHashTable {
   int32_t nextOffset_;
   uint8_t* FOLLY_NULLABLE tags_ = nullptr;
   char* FOLLY_NULLABLE* FOLLY_NULLABLE table_ = nullptr;
-  memory::MappedMemory::ContiguousAllocation tableAllocation_;
+  memory::MemoryAllocator::ContiguousAllocation tableAllocation_;
   int64_t size_ = 0;
   int64_t sizeMask_ = 0;
   int64_t numDistinct_ = 0;

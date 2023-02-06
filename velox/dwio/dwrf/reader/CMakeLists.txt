@@ -19,10 +19,10 @@ add_library(
   DwrfData.cpp
   DwrfReader.cpp
   FlatMapColumnReader.cpp
-  FlatMapHelper.cpp
   ReaderBase.cpp
   SelectiveDwrfReader.cpp
   SelectiveByteRleColumnReader.cpp
+  SelectiveFlatMapColumnReader.cpp
   SelectiveIntegerDirectColumnReader.cpp
   SelectiveIntegerDictionaryColumnReader.cpp
   SelectiveStringDirectColumnReader.cpp

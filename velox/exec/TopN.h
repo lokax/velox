@@ -110,6 +110,7 @@ class TopN : public Operator {
   // RowContainer to generate the TopN's output.
   std::unique_ptr<RowContainer> data_;
   Comparator comparator_;
+  // 优先级队列
   std::priority_queue<char*, std::vector<char*>, Comparator> topRows_;
   std::vector<char*> rows_;
 

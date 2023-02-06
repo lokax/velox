@@ -25,26 +25,47 @@ class ValueListTest : public functions::test::FunctionBaseTest {
  protected:
   ValueListTest() : functions::test::FunctionBaseTest() {}
 
-  void testRoundTrip(const VectorPtr& data) {
-    auto size = data->size();
+  // Make sure to test sizes that are multiples of 64.
+  static constexpr vector_size_t kTestSizes[6] =
+      {10, 64, 128, 1'000, 1'024, 10'000};
 
-    SelectivityVector allRows(size);
-    DecodedVector decoded(*data, allRows);
-
-    aggregate::ValueList values;
-    for (auto i = 0; i < size; i++) {
-      values.appendValue(decoded, i, allocator());
-    }
-
-    values.finalize(allocator());
-
+  VectorPtr
+  read(aggregate::ValueList& values, const TypePtr& type, vector_size_t size) {
     aggregate::ValueListReader reader(values);
-    auto result = BaseVector::create(data->type(), size, pool());
+    auto result = BaseVector::create(type, size, pool());
     for (auto i = 0; i < size; i++) {
       reader.next(*result, i);
     }
+    return result;
+  }
 
-    assertEqualVectors(data, result);
+  void testRoundTrip(const VectorPtr& data) {
+    auto size = data->size();
+
+    // Use ValueList::appendValue.
+    {
+      DecodedVector decoded(*data);
+      aggregate::ValueList values;
+      for (auto i = 0; i < size; i++) {
+        values.appendValue(decoded, i, allocator());
+      }
+
+      ASSERT_EQ(size, values.size());
+      auto result = read(values, data->type(), size);
+
+      assertEqualVectors(data, result);
+    }
+
+    // Use ValueList::appendRange.
+    {
+      aggregate::ValueList values;
+      values.appendRange(data, 0, size, allocator());
+
+      ASSERT_EQ(size, values.size());
+      auto result = read(values, data->type(), size);
+
+      assertEqualVectors(data, result);
+    }
   }
 
   HashStringAllocator* allocator() {
@@ -53,19 +74,24 @@ class ValueListTest : public functions::test::FunctionBaseTest {
 
   std::unique_ptr<HashStringAllocator> allocator_{
       std::make_unique<HashStringAllocator>(
-          memory::MappedMemory::getInstance())};
+          memory::MemoryAllocator::getInstance())};
 };
 
+TEST_F(ValueListTest, empty) {
+  aggregate::ValueList values;
+  ASSERT_EQ(0, values.size());
+}
+
 TEST_F(ValueListTest, integers) {
-  // no nulls
-  for (auto size : {10, 1'000, 10'000}) {
+  // No nulls.
+  for (auto size : kTestSizes) {
     auto data = makeFlatVector<int32_t>(size, [](auto row) { return row; });
 
     testRoundTrip(data);
   }
 
-  // different percentage of nulls
-  for (auto size : {10, 1'000, 10'000}) {
+  // Different percentage of nulls.
+  for (auto size : kTestSizes) {
     for (auto nullEvery : {2, 7, 97}) {
       auto data = makeFlatVector<int32_t>(
           size,
@@ -78,8 +104,8 @@ TEST_F(ValueListTest, integers) {
 }
 
 TEST_F(ValueListTest, arrays) {
-  // no nulls
-  for (auto size : {10, 1'000, 10'000}) {
+  // No nulls.
+  for (auto size : kTestSizes) {
     auto data = makeArrayVector<int32_t>(
         size,
         [](auto row) { return row % 7; },
@@ -88,8 +114,8 @@ TEST_F(ValueListTest, arrays) {
     testRoundTrip(data);
   }
 
-  // different percentage of nulls
-  for (auto size : {10, 1'000, 10'000}) {
+  // Different percentage of nulls.
+  for (auto size : kTestSizes) {
     for (auto nullEvery : {2, 7, 97}) {
       auto data = makeArrayVector<int32_t>(
           size,

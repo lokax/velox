@@ -58,12 +58,13 @@ class SelectivityInfo {
 class SelectivityTimer {
  public:
   SelectivityTimer(SelectivityInfo& info, uint64_t numIn)
-      : startClocks_(folly::hardware_timestamp()),
+      : startClocks_(folly::hardware_timestamp()), // 设置开始时间
         totalClocks_(&info.timeClocks_) {
     info.numIn_ += numIn;
   }
 
   ~SelectivityTimer() {
+    // 设置总时间
     *totalClocks_ += folly::hardware_timestamp() - startClocks_;
   }
 

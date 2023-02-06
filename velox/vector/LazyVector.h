@@ -15,7 +15,6 @@
  */
 #pragma once
 
-#include "velox/common/base/RuntimeMetrics.h"
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/SimpleVector.h"
 
@@ -99,21 +98,6 @@ class VectorLoader {
       VectorPtr* result);
 };
 
-// Simple interface to implement logging runtime stats to Velox operators.
-// Inherit a concrete class from this with operator pointer.
-class BaseRuntimeStatWriter {
- public:
-  virtual ~BaseRuntimeStatWriter() = default;
-
-  virtual void addRuntimeStat(
-      const std::string& /* name */,
-      const RuntimeCounter& /* value */) {}
-};
-
-// Setting a concrete runtime stats writer on the thread will ensure that lazy
-// vectors will add time spent on loading data using that writer.
-void setRunTimeStatWriter(std::unique_ptr<BaseRuntimeStatWriter>&& ptr);
-
 // Vector class which produces values on first use. This is used for
 // loading columns on demand. This allows eliding load of
 // columns which have all values filtered out by e.g. joins or which
@@ -122,6 +106,9 @@ void setRunTimeStatWriter(std::unique_ptr<BaseRuntimeStatWriter>&& ptr);
 // ever be accessed, loading can be limited to these positions. This
 // also allows pushing down computation into loading a column, hence
 // bypassing materialization into a vector.
+// Unloaded LazyVectors should be referenced only by one top-level vector.
+// Otherwise, it runs the risk of being loaded for different set of rows by each
+// top-level vector.
 class LazyVector : public BaseVector {
  public:
   LazyVector(
@@ -157,6 +144,7 @@ class LazyVector : public BaseVector {
     allLoaded_ = true;
     if (rows.empty()) {
       if (!vector_) {
+        // 创建一个空向量
         vector_ = BaseVector::create(type_, 0, pool_);
       }
       return;
@@ -191,16 +179,21 @@ class LazyVector : public BaseVector {
     return loadedVectorShared().get();
   }
 
-  // Returns a shared_ptr to the vector holding the values.
+  // Returns a shared_ptr to the vector holding the values. If vector is not
+  // loaded, loads all the rows, otherwise returns the loaded vector which can
+  // have partially loaded rows.
   const VectorPtr& loadedVectorShared() const {
     if (!allLoaded_) {
       if (!vector_) {
+        // 创建一个vector
         vector_ = BaseVector::create(type_, 0, pool_);
       }
       SelectivityVector allRows(BaseVector::length_);
+      // 加载所有行
       loader_->load(allRows, nullptr, &vector_);
       VELOX_CHECK(vector_);
       if (vector_->encoding() == VectorEncoding::Simple::LAZY) {
+        // 这种情况怎么回事？
         vector_ = vector_->asUnchecked<LazyVector>()->loadedVectorShared();
       } else {
         // If the load produced a wrapper, load the wrapped vector.

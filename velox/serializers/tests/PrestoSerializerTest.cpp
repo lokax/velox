@@ -29,7 +29,7 @@ using namespace facebook::velox::test;
 class PrestoSerializerTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    pool_ = memory::getDefaultScopedMemoryPool();
+    pool_ = memory::getDefaultMemoryPool();
     serde_ = std::make_unique<serializer::presto::PrestoVectorSerde>();
     vectorMaker_ = std::make_unique<test::VectorMaker>(pool_.get());
   }
@@ -61,7 +61,7 @@ class PrestoSerializerTest : public ::testing::Test {
         rowVector, folly::Range(rows.data(), numRows));
 
     auto arena =
-        std::make_unique<StreamArena>(memory::MappedMemory::getInstance());
+        std::make_unique<StreamArena>(memory::MemoryAllocator::getInstance());
     auto rowType = asRowType(rowVector->type());
     auto serializer =
         serde_->createSerializer(rowType, numRows, arena.get(), serdeOptions);
@@ -79,7 +79,7 @@ class PrestoSerializerTest : public ::testing::Test {
     facebook::velox::serializer::presto::PrestoOutputStreamListener listener;
     OStreamOutputStream out(output, &listener);
     auto arena =
-        std::make_unique<StreamArena>(memory::MappedMemory::getInstance());
+        std::make_unique<StreamArena>(memory::MemoryAllocator::getInstance());
     serde_->serializeConstants(rowVector, arena.get(), serdeOptions, &out);
   }
 
@@ -139,7 +139,7 @@ class PrestoSerializerTest : public ::testing::Test {
     assertEqualVectors(rowVector, deserialized);
   }
 
-  std::unique_ptr<memory::MemoryPool> pool_;
+  std::shared_ptr<memory::MemoryPool> pool_;
   std::unique_ptr<serializer::presto::PrestoVectorSerde> serde_;
   std::unique_ptr<test::VectorMaker> vectorMaker_;
 };

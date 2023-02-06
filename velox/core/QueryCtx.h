@@ -17,8 +17,8 @@
 
 #include <folly/Executor.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
-#include "velox/common/memory/MappedMemory.h"
 #include "velox/common/memory/Memory.h"
+#include "velox/common/memory/MemoryAllocator.h"
 #include "velox/core/Context.h"
 #include "velox/core/QueryConfig.h"
 #include "velox/vector/DecodedVector.h"
@@ -28,43 +28,34 @@ namespace facebook::velox::core {
 
 class QueryCtx : public Context {
  public:
-  // Returns QueryCtx with new executor created if not supplied. For testing
-  // purpose.
-  static std::shared_ptr<QueryCtx> createForTest(
-      std::shared_ptr<Config> config = std::make_shared<MemConfig>(),
-      std::shared_ptr<folly::Executor> executor =
-          std::make_shared<folly::CPUThreadPoolExecutor>(
-              std::thread::hardware_concurrency())) {
-    return std::make_shared<QueryCtx>(std::move(executor), std::move(config));
-  }
-
-  // QueryCtx is used in different places. When used with `Task`, it's required
-  // that callers supply executors. In contrast, when used in expression
-  // evaluation through `ExecCtx`, executor is not needed. Hence, we don't
-  // require executor to always be passed in here, but instead, ensure that
-  // executor exists when actually being used.
-  //
-  // This constructor keeps the ownership of `executor`.
+  // QueryCtx is used in different places. When used with `Task::start()`, it's
+  // required that the caller supplies the executor and ensure its lifetime
+  // outlives the tasks that use it. In contrast, when used in expression
+  // evaluation through `ExecCtx` or 'Task::next()' for single thread execution
+  // mode, executor is not needed. Hence, we don't require executor to always be
+  // passed in here, but instead, ensure that executor exists when actually
+  // being used.
   QueryCtx(
-      std::shared_ptr<folly::Executor> executor = nullptr,
+      folly::Executor* FOLLY_NULLABLE executor = nullptr,
       std::shared_ptr<Config> config = std::make_shared<MemConfig>(),
       std::unordered_map<std::string, std::shared_ptr<Config>>
           connectorConfigs = {},
-      memory::MappedMemory* FOLLY_NONNULL mappedMemory =
-          memory::MappedMemory::getInstance(),
-      std::unique_ptr<memory::MemoryPool> pool = nullptr,
+      memory::MemoryAllocator* FOLLY_NONNULL allocator =
+          memory::MemoryAllocator::getInstance(),
+      std::shared_ptr<memory::MemoryPool> pool = nullptr,
       std::shared_ptr<folly::Executor> spillExecutor = nullptr,
       const std::string& queryId = "")
       : Context{ContextScope::QUERY},
         pool_(std::move(pool)),
-        mappedMemory_(mappedMemory),
+        allocator_(allocator),
         connectorConfigs_(connectorConfigs),
-        executor_{std::move(executor)},
+        executor_(executor),
         config_{this},
         queryId_(queryId),
         spillExecutor_(std::move(spillExecutor)) {
     setConfigOverrides(config);
     if (!pool_) {
+        // 如果没有传进来内存池，则初始化内存池
       initPool(queryId);
     }
   }
@@ -73,18 +64,18 @@ class QueryCtx : public Context {
   // object is alive.
   //
   // This constructor does not keep the ownership of executor.
-  explicit QueryCtx(
+  QueryCtx(
       folly::Executor::KeepAlive<> executorKeepalive,
       std::shared_ptr<Config> config = std::make_shared<MemConfig>(),
       std::unordered_map<std::string, std::shared_ptr<Config>>
           connectorConfigs = {},
-      memory::MappedMemory* FOLLY_NONNULL mappedMemory =
-          memory::MappedMemory::getInstance(),
-      std::unique_ptr<memory::MemoryPool> pool = nullptr,
+      memory::MemoryAllocator* FOLLY_NONNULL allocator =
+          memory::MemoryAllocator::getInstance(),
+      std::shared_ptr<memory::MemoryPool> pool = nullptr,
       const std::string& queryId = "")
       : Context{ContextScope::QUERY},
         pool_(std::move(pool)),
-        mappedMemory_(mappedMemory),
+        allocator_(allocator),
         connectorConfigs_(connectorConfigs),
         executorKeepalive_(std::move(executorKeepalive)),
         config_{this},
@@ -95,27 +86,32 @@ class QueryCtx : public Context {
     }
   }
 
+    // 静态函数，生成内存池的名字
   static std::string generatePoolName(const std::string& queryId) {
     return fmt::format("query.{}", queryId.c_str());
   }
 
+    // 返回内存池的指针
   memory::MemoryPool* FOLLY_NONNULL pool() const {
     return pool_.get();
   }
 
-  memory::MappedMemory* FOLLY_NONNULL mappedMemory() const {
-    return mappedMemory_;
+    // 返回分配器
+  memory::MemoryAllocator* FOLLY_NONNULL allocator() const {
+    return allocator_;
   }
 
+    // 返回executor
   folly::Executor* FOLLY_NONNULL executor() const {
-    if (executor_) {
-      return executor_.get();
+    if (executor_ != nullptr) {
+      return executor_;
     }
     auto executor = executorKeepalive_.get();
     VELOX_CHECK(executor, "Executor was not supplied.");
     return executor;
   }
 
+    // 返回配置
   const QueryConfig& config() const {
     return config_;
   }
@@ -146,6 +142,7 @@ class QueryCtx : public Context {
   }
 
  private:
+    // 静态单例
   static Config* FOLLY_NONNULL getEmptyConfig() {
     static const std::unique_ptr<Config> kEmptyConfig =
         std::make_unique<MemConfig>();
@@ -153,17 +150,18 @@ class QueryCtx : public Context {
   }
 
   void initPool(const std::string& queryId) {
-    pool_ = memory::getProcessDefaultMemoryManager().getRoot().addScopedChild(
+    // 从进程内存管理器中的根内存池上面创建一个孩子内存池
+    pool_ = memory::getProcessDefaultMemoryManager().getRoot().addChild(
         QueryCtx::generatePoolName(queryId));
     static const auto kUnlimited = std::numeric_limits<int64_t>::max();
     pool_->setMemoryUsageTracker(
         memory::MemoryUsageTracker::create(kUnlimited, kUnlimited, kUnlimited));
   }
 
-  std::unique_ptr<memory::MemoryPool> pool_;
-  memory::MappedMemory* FOLLY_NONNULL mappedMemory_;
+  std::shared_ptr<memory::MemoryPool> pool_;
+  memory::MemoryAllocator* FOLLY_NONNULL allocator_;
   std::unordered_map<std::string, std::shared_ptr<Config>> connectorConfigs_;
-  std::shared_ptr<folly::Executor> executor_;
+  folly::Executor* FOLLY_NULLABLE executor_;
   folly::Executor::KeepAlive<> executorKeepalive_;
   QueryConfig config_;
   const std::string queryId_;
@@ -185,6 +183,7 @@ class ExecCtx : public Context {
     return pool_;
   }
 
+    // 返回queryCtx
   QueryCtx* FOLLY_NONNULL queryCtx() const {
     return queryCtx_;
   }
@@ -196,9 +195,11 @@ class ExecCtx : public Context {
   /// Prefer using LocalSelectivityVector which takes care of returning the
   /// vector to the pool on destruction.
   std::unique_ptr<SelectivityVector> getSelectivityVector(int32_t size) {
+    // 如果池中没有，则创建一个
     if (selectivityVectorPool_.empty()) {
       return std::make_unique<SelectivityVector>(size);
     }
+    // 从内存池中返回最后一个
     auto vector = std::move(selectivityVectorPool_.back());
     selectivityVectorPool_.pop_back();
     vector->resize(size);
@@ -216,11 +217,12 @@ class ExecCtx : public Context {
     selectivityVectorPool_.pop_back();
     return vector;
   }
-
+    // 释放选择向量
   void releaseSelectivityVector(std::unique_ptr<SelectivityVector>&& vector) {
     selectivityVectorPool_.push_back(std::move(vector));
   }
 
+    // 从池中返回解码向量，如果没有，则创建一个新的
   std::unique_ptr<DecodedVector> getDecodedVector() {
     if (decodedVectorPool_.empty()) {
       return std::make_unique<DecodedVector>();
@@ -229,15 +231,16 @@ class ExecCtx : public Context {
     decodedVectorPool_.pop_back();
     return vector;
   }
-
+    // 释放解码向量
   void releaseDecodedVector(std::unique_ptr<DecodedVector>&& vector) {
     decodedVectorPool_.push_back(std::move(vector));
   }
-
+    // 返回向量池
   VectorPool& vectorPool() {
     return vectorPool_;
   }
 
+    // 从向量池中返回一个某个类型的向量
   /// Gets a possibly recycled vector of 'type and 'size'. Allocates from
   /// 'pool_' if no pre-allocated vector.
   VectorPtr getVector(const TypePtr& type, vector_size_t size) {

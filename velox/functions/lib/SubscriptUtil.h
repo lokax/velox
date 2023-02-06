@@ -82,7 +82,7 @@ class SubscriptImpl : public exec::VectorFunction {
             .build(),
         // map(K,V), K -> V
         exec::FunctionSignatureBuilder()
-            .typeVariable("K")
+            .knownTypeVariable("K")
             .typeVariable("V")
             .returnType("V")
             .argumentType("map(K,V)")
@@ -167,6 +167,12 @@ class SubscriptImpl : public exec::VectorFunction {
     auto baseArray = decodedArray->base()->as<ArrayVector>();
     auto arrayIndices = decodedArray->indices();
 
+    // Subscript into empty arrays always returns NULLs.
+    if (baseArray->elements()->size() == 0) {
+      return BaseVector::createNullConstant(
+          baseArray->elements()->type(), rows.size(), context.pool());
+    }
+
     exec::LocalDecodedVector indexHolder(context, *indexArg, rows);
     auto decodedIndices = indexHolder.get();
 
@@ -181,8 +187,7 @@ class SubscriptImpl : public exec::VectorFunction {
       try {
         adjustedIndex = adjustIndex(decodedIndices->valueAt<I>(0));
       } catch (const std::exception& e) {
-        rows.applyToSelected(
-            [&](auto row) { context.setError(row, std::current_exception()); });
+        context.setErrors(rows, std::current_exception());
         allFailed = true;
       }
 
@@ -295,6 +300,12 @@ class SubscriptImpl : public exec::VectorFunction {
     auto decodedMap = mapHolder.get();
     auto baseMap = decodedMap->base()->as<MapVector>();
     auto mapIndices = decodedMap->indices();
+
+    // Subscript into empty maps always returns NULLs.
+    if (baseMap->mapValues()->size() == 0) {
+      return BaseVector::createNullConstant(
+          baseMap->mapValues()->type(), rows.size(), context.pool());
+    }
 
     // Get map keys.
     auto mapKeys = baseMap->mapKeys();

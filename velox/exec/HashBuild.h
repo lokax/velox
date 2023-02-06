@@ -81,7 +81,7 @@ class HashBuild final : public Operator {
 
  private:
   void setState(State state);
-  void stateTransitionCheck(State state);
+  void checkStateTransition(State state);
 
   void setRunning();
   bool isRunning() const;
@@ -105,6 +105,14 @@ class HashBuild final : public Operator {
   // it will transition to 'kWaitForProbe' to wait for the next spill data to
   // process which will be set by the join probe side.
   void postHashBuildProcess();
+
+  // Checks if the spilling is allowed for this hash join. As for now, we don't
+  // allow spilling for null-aware anti-join with filter set. It requires to
+  // cross join the null-key probe rows with all the build-side rows for filter
+  // evaluation which is not supported under spilling.
+  bool isSpillAllowed() const {
+    return !isNullAwareAntiJoinWithFilter(joinNode_);
+  }
 
   bool spillEnabled() const {
     return spillConfig_.has_value();
@@ -210,17 +218,17 @@ class HashBuild final : public Operator {
   // Invoked to process data from spill input reader on restoring.
   void processSpillInput();
 
-  // Set up for null-aware anti-join with filter processing.
-  void setupFilterForNullAwareAntiJoin(
+  // Set up for null-aware and regular anti-join with filter processing.
+  void setupFilterForAntiJoins(
       const folly::F14FastMap<column_index_t, column_index_t>& keyChannelMap);
 
-  // Invoked when preparing for null-aware anti join with null-propagating
-  // filter. The function deselects the input rows which have any null in the
-  // filter input columns. This is an optimization for null-aware anti join
-  // processing at the probe side as any probe matches with the deselected rows
-  // can't pass the null-propagating filter and will be added to the joined
-  // output.
-  void removeInputRowsForNullAwareAntiJoinFilter();
+  // Invoked when preparing for null-aware and regular anti join with
+  // null-propagating filter. The function deselects the input rows which have
+  // any null in the filter input columns. This is an optimization for
+  // null-aware and regular anti join processing at the probe side as any probe
+  // matches with the deselected rows can't pass the null-propagating filter and
+  // will be added to the joined output.
+  void removeInputRowsForAntiJoinFilter();
 
   void addRuntimeStats();
 
@@ -232,7 +240,7 @@ class HashBuild final : public Operator {
   const core::JoinType joinType_;
 
   // Holds the areas in RowContainer of 'table_'
-  memory::MappedMemory* const FOLLY_NONNULL mappedMemory_;
+  memory::MemoryAllocator* const FOLLY_NONNULL allocator_;
 
   const std::shared_ptr<HashJoinBridge> joinBridge_;
 
@@ -271,9 +279,9 @@ class HashBuild final : public Operator {
   // Set of active rows during addInput().
   SelectivityVector activeRows_;
 
-  // True if this is a build side of an anti join and has at least one entry
-  // with null join keys.
-  bool antiJoinHasNullKeys_{false};
+  // True if this is a build side of an anti or left semi project join and has
+  // at least one entry with null join keys.
+  bool joinHasNullKeys_{false};
 
   // Counts input batches and triggers spilling if folly hash of this % 100 <=
   // 'testSpillPct_';.
@@ -310,5 +318,4 @@ inline std::ostream& operator<<(std::ostream& os, HashBuild::State state) {
   os << HashBuild::stateName(state);
   return os;
 }
-
 } // namespace facebook::velox::exec

@@ -41,18 +41,6 @@ void initKeyInfo(
   }
 }
 
-void checkDefaultWindowFrame(const core::WindowNode::Function& windowFunction) {
-  VELOX_CHECK_EQ(
-      windowFunction.frame.type, core::WindowNode::WindowType::kRange);
-  VELOX_CHECK_EQ(
-      windowFunction.frame.startType,
-      core::WindowNode::BoundType::kUnboundedPreceding);
-  VELOX_CHECK_EQ(
-      windowFunction.frame.endType, core::WindowNode::BoundType::kCurrentRow);
-  VELOX_CHECK_EQ(windowFunction.frame.startValue, nullptr);
-  VELOX_CHECK_EQ(windowFunction.frame.endValue, nullptr);
-}
-
 }; // namespace
 
 Window::Window(
@@ -70,8 +58,9 @@ Window::Window(
       numInputColumns_(windowNode->sources()[0]->outputType()->size()),
       data_(std::make_unique<RowContainer>(
           windowNode->sources()[0]->outputType()->children(),
-          operatorCtx_->mappedMemory())),
-      decodedInputVectors_(numInputColumns_) {
+          operatorCtx_->allocator())),
+      decodedInputVectors_(numInputColumns_),
+      stringAllocator_(operatorCtx_->allocator()) {
   auto inputType = windowNode->sources()[0]->outputType();
   initKeyInfo(inputType, windowNode->partitionKeys(), {}, partitionKeyInfo_);
   initKeyInfo(
@@ -145,9 +134,8 @@ void Window::createWindowFunctions(
         windowNodeFunction.functionCall->name(),
         functionArgs,
         windowNodeFunction.functionCall->type(),
-        operatorCtx_->pool()));
-
-    checkDefaultWindowFrame(windowNodeFunction);
+        operatorCtx_->pool(),
+        &stringAllocator_));
 
     windowFrames_.push_back(
         {windowNodeFunction.frame.type,
@@ -159,8 +147,9 @@ void Window::createWindowFunctions(
 }
 
 void Window::addInput(RowVectorPtr input) {
+    // 扩容
   inputRows_.resize(input->size());
-
+    // 遍历每一列？
   for (auto col = 0; col < input->childrenSize(); ++col) {
     decodedInputVectors_[col].decode(*input->childAt(col), inputRows_);
   }
@@ -181,6 +170,7 @@ inline bool Window::compareRowsWithKeys(
     const char* rhs,
     const std::vector<std::pair<column_index_t, core::SortOrder>>& keys) {
   if (lhs == rhs) {
+    // 相同指针，直接返回false
     return false;
   }
   for (auto& key : keys) {
@@ -200,11 +190,13 @@ void Window::createPeerAndFrameBuffers() {
   // the input columns size. We need to also account for the output columns.
   numRowsPerOutput_ = data_->estimatedNumRowsPerBatch(outputBatchSizeInBytes_);
 
+    // 分配对齐内存
   peerStartBuffer_ = AlignedBuffer::allocate<vector_size_t>(
       numRowsPerOutput_, operatorCtx_->pool());
   peerEndBuffer_ = AlignedBuffer::allocate<vector_size_t>(
       numRowsPerOutput_, operatorCtx_->pool());
 
+    // 窗口函数的数量
   auto numFuncs = windowFunctions_.size();
   frameStartBuffers_.reserve(numFuncs);
   frameEndBuffers_.reserve(numFuncs);
@@ -221,6 +213,7 @@ void Window::createPeerAndFrameBuffers() {
 
 void Window::computePartitionStartRows() {
   // Randomly assuming that max 10000 partitions are in the data.
+  // 如果rows很多，不是创建了很多空闲空间？
   partitionStartRows_.reserve(numRows_);
   auto partitionCompare = [&](const char* lhs, const char* rhs) -> bool {
     return compareRowsWithKeys(lhs, rhs, partitionKeyInfo_);
@@ -236,6 +229,7 @@ void Window::computePartitionStartRows() {
   VELOX_CHECK_GT(sortedRows_.size(), 0);
   for (auto i = 1; i < sortedRows_.size(); i++) {
     if (partitionCompare(sortedRows_[i - 1], sortedRows_[i])) {
+        // 不同分区
       partitionStartRows_.push_back(i);
     }
   }
@@ -250,6 +244,8 @@ void Window::sortPartitions() {
   // by partition keys + sort keys.
   // Sort the pointers to the rows in RowContainer (data_) instead of sorting
   // the rows.
+
+  // 扩容一下指针数组
   sortedRows_.resize(numRows_);
   RowContainerIterator iter;
   data_->listRows(&iter, numRows_, sortedRows_.data());
@@ -262,14 +258,16 @@ void Window::sortPartitions() {
       });
 
   computePartitionStartRows();
-
+    // 当前分区
   currentPartition_ = 0;
 }
 
 void Window::noMoreInput() {
+    // 没有更多输入了
   Operator::noMoreInput();
   // No data.
   if (numRows_ == 0) {
+    // 没有数据，直接设置成完成，其他什么都不用做
     finished_ = true;
     return;
   }
@@ -284,12 +282,14 @@ void Window::noMoreInput() {
 }
 
 void Window::callResetPartition(vector_size_t partitionNumber) {
+    // 分区的行数？
   auto partitionSize = partitionStartRows_[partitionNumber + 1] -
       partitionStartRows_[partitionNumber];
   auto partition = folly::Range(
       sortedRows_.data() + partitionStartRows_[partitionNumber], partitionSize);
   windowPartition_->resetPartition(partition);
   for (int i = 0; i < windowFunctions_.size(); i++) {
+    // 窗口函数也重设置分区？
     windowFunctions_[i]->resetPartition(windowPartition_.get());
   }
 }
@@ -299,17 +299,22 @@ void Window::callApplyForPartitionRows(
     vector_size_t endRow,
     const std::vector<VectorPtr>& result,
     vector_size_t resultOffset) {
+        // 新分区的开始，重新设置分区
   if (partitionStartRows_[currentPartition_] == startRow) {
     callResetPartition(currentPartition_);
   }
 
+    // 有几行
   vector_size_t numRows = endRow - startRow;
+  // 窗口函数的数量
   vector_size_t numFuncs = windowFunctions_.size();
 
   // Size buffers for the call to WindowFunction::apply.
   auto bufferSize = numRows * sizeof(vector_size_t);
+  // 设置buffer的size
   peerStartBuffer_->setSize(bufferSize);
   peerEndBuffer_->setSize(bufferSize);
+  // 裸指针
   auto rawPeerStarts = peerStartBuffer_->asMutable<vector_size_t>();
   auto rawPeerEnds = peerEndBuffer_->asMutable<vector_size_t>();
 
@@ -317,6 +322,7 @@ void Window::callApplyForPartitionRows(
   std::vector<vector_size_t*> rawFrameEndBuffers;
   rawFrameStartBuffers.reserve(numFuncs);
   rawFrameEndBuffers.reserve(numFuncs);
+  // 简单保存些指针
   for (auto w = 0; w < numFuncs; w++) {
     frameStartBuffers_[w]->setSize(bufferSize);
     frameEndBuffers_[w]->setSize(bufferSize);
@@ -331,6 +337,7 @@ void Window::callApplyForPartitionRows(
   auto peerCompare = [&](const char* lhs, const char* rhs) -> bool {
     return compareRowsWithKeys(lhs, rhs, sortKeyInfo_);
   };
+  // 当前分区的第一行和最后一行
   auto firstPartitionRow = partitionStartRows_[currentPartition_];
   auto lastPartitionRow = partitionStartRows_[currentPartition_ + 1] - 1;
   for (auto i = startRow, j = 0; i < endRow; i++, j++) {
@@ -345,6 +352,8 @@ void Window::callApplyForPartitionRows(
 
     // Compute peerStart and peerEnd rows for the first row of the partition or
     // when past the previous peerGroup.
+
+    // 计算分区
     if (i == firstPartitionRow || i >= peerEndRow_) {
       peerStartRow_ = i;
       peerEndRow_ = i;
@@ -360,9 +369,60 @@ void Window::callApplyForPartitionRows(
     // as WindowFunction only sees one partition at a time.
     rawPeerStarts[j] = peerStartRow_ - firstPartitionRow;
     rawPeerEnds[j] = peerEndRow_ - 1 - firstPartitionRow;
-
-    // TODO: Calculate frame buffer values.
   }
+
+  auto updateFrameBounds = [&](vector_size_t* rawFrameBounds,
+                               core::WindowNode::BoundType boundType,
+                               core::WindowNode::WindowType type,
+                               bool isStartBound) -> void {
+    switch (boundType) {
+      case core::WindowNode::BoundType::kUnboundedPreceding:
+        std::memset(rawFrameBounds, 0, numRows * sizeof(vector_size_t));
+        break;
+      case core::WindowNode::BoundType::kUnboundedFollowing:
+        std::fill_n(
+            rawFrameBounds, numRows, lastPartitionRow - firstPartitionRow);
+        break;
+      case core::WindowNode::BoundType::kCurrentRow: {
+        if (type == core::WindowNode::WindowType::kRange) {
+            // 这种情况要设置peer
+          vector_size_t* rawPeerBuffer =
+              isStartBound ? rawPeerStarts : rawPeerEnds;
+          std::copy(rawPeerBuffer, rawPeerBuffer + numRows, rawFrameBounds);
+        } else {
+          // Fills the frameBound buffer with increasing value of row indices
+          // (corresponding to CURRENT ROW) from the startRow of the current
+          // output buffer. The startRow has to be adjusted relative to the
+          // partition start row.
+          std::iota(
+              rawFrameBounds,
+              rawFrameBounds + numRows,
+              startRow - firstPartitionRow);
+        }
+        break;
+      }
+      case core::WindowNode::BoundType::kPreceding:
+      case core::WindowNode::BoundType::kFollowing:
+        // 这个暂时不支持
+        VELOX_NYI("Not supported");
+      default:
+        VELOX_USER_FAIL("Invalid frame bound type");
+    }
+  };
+    // 遍历每个函数，更新边界
+  for (auto i = 0; i < numFuncs; i++) {
+    updateFrameBounds(
+        rawFrameStartBuffers[i],
+        windowFrames_[i].startType,
+        windowFrames_[i].type,
+        true);
+    updateFrameBounds(
+        rawFrameEndBuffers[i],
+        windowFrames_[i].endType,
+        windowFrames_[i].type,
+        false);
+  }
+
   // Invoke the apply method for the WindowFunctions.
   for (auto w = 0; w < numFuncs; w++) {
     windowFunctions_[w]->apply(
@@ -388,10 +448,13 @@ void Window::callApplyLoop(
 
   vector_size_t resultIndex = 0;
   vector_size_t numOutputRowsLeft = numOutputRows;
+  // 还有输出行剩余，就一直循环
   while (numOutputRowsLeft > 0) {
+    // 当前分区剩余多少行
     auto rowsForCurrentPartition =
         partitionStartRows_[currentPartition_ + 1] - numProcessedRows_;
     if (rowsForCurrentPartition <= numOutputRowsLeft) {
+        // 只处理一个分区内的数据
       // Current partition can fit completely in the output buffer.
       // So output all its rows.
       callApplyForPartitionRows(
@@ -418,16 +481,21 @@ void Window::callApplyLoop(
 
 RowVectorPtr Window::getOutput() {
   if (finished_ || !noMoreInput_) {
+    // 完成了，则直接返回空指针
     return nullptr;
   }
 
+    // 剩下多少行没有处理
   auto numRowsLeft = numRows_ - numProcessedRows_;
+  // 要输出多少行
   auto numOutputRows = std::min(numRowsPerOutput_, numRowsLeft);
+  // 创建一个行向量
   auto result = std::dynamic_pointer_cast<RowVector>(
       BaseVector::create(outputType_, numOutputRows, operatorCtx_->pool()));
 
   // Set all passthrough input columns.
   for (int i = 0; i < numInputColumns_; ++i) {
+    // 把数据提取出来？
     data_->extractColumn(
         sortedRows_.data() + numProcessedRows_,
         numOutputRows,
@@ -451,6 +519,7 @@ RowVectorPtr Window::getOutput() {
     result->childAt(j) = windowOutputs[j - numInputColumns_];
   }
 
+    // 设置是否完成
   finished_ = (numProcessedRows_ == sortedRows_.size());
   return result;
 }

@@ -650,7 +650,7 @@ class DecimalType : public ScalarType<KIND> {
   }
 
   std::string toString() const override {
-    return fmt::format("{}({},{})", TypeTraits<KIND>::name, precision_, scale_);
+    return fmt::format("DECIMAL({},{})", precision_, scale_);
   }
 
   folly::dynamic serialize() const override {
@@ -1578,6 +1578,14 @@ struct DynamicRow {
   DynamicRow() {}
 };
 
+// T must be a struct with T::type being a built-in type and T::typeName
+// type name to use in FunctionSignature.
+template <typename T>
+struct CustomType {
+ private:
+  CustomType() {}
+};
+
 template <typename T>
 struct CppToType {};
 
@@ -1728,6 +1736,13 @@ struct CppToType<UnscaledLongDecimal>
 
 template <>
 struct CppToType<UnknownValue> : public CppToTypeBase<TypeKind::UNKNOWN> {};
+
+template <typename T>
+struct CppToType<CustomType<T>> : public CppToType<typename T::type> {
+  static auto create() {
+    return CppToType<typename T::type>::create();
+  }
+};
 
 // todo: remaining cpp2type
 
@@ -1965,6 +1980,9 @@ struct CastTypeChecker<Row<T...>> {
 
 /// Return the scalar type for a given 'kind'.
 TypePtr fromKindToScalerType(TypeKind kind);
+
+/// Appends type's SQL string to 'out'. Uses DuckDB SQL.
+void toTypeSql(const TypePtr& type, std::ostream& out);
 
 } // namespace facebook::velox
 

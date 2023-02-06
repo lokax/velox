@@ -126,8 +126,12 @@ enum class BlockingReason {
   kWaitForSplit,
   kWaitForExchange,
   kWaitForJoinBuild,
-  /// Build operator is blocked waiting for the probe operators to finish
-  /// probing before build the next hash table from the previously spilled data.
+  /// For a build operator, it is blocked waiting for the probe operators to
+  /// finish probing before build the next hash table from one of the previously
+  /// spilled partition data.
+  /// For a probe operator, it is blocked waiting for all its peer probe
+  /// operators to finish probing before notifying the build operators to build
+  /// the next hash table from the previously spilled data.
   kWaitForJoinProbe,
   kWaitForMemory,
   kWaitForConnector,
@@ -205,8 +209,9 @@ struct DriverCtx {
 
   const core::QueryConfig& queryConfig() const;
 
-  velox::memory::MemoryPool* FOLLY_NONNULL
-  addOperatorPool(const std::string& operatorType = "");
+  velox::memory::MemoryPool* FOLLY_NONNULL addOperatorPool(
+      const core::PlanNodeId& planNodeId,
+      const std::string& operatorType);
 };
 
 class Driver : public std::enable_shared_from_this<Driver> {
@@ -281,6 +286,10 @@ class Driver : public std::enable_shared_from_this<Driver> {
   // closing non-running Drivers.
   void closeByTask();
 
+  BlockingReason blockingReason() const {
+    return blockingReason_;
+  }
+
  private:
   void enqueueInternal();
 
@@ -297,9 +306,15 @@ class Driver : public std::enable_shared_from_this<Driver> {
   // position in the pipeline.
   void pushdownFilters(int operatorIndex);
 
-  std::unique_ptr<CpuWallTimer> cpuWallTimer(CpuWallTiming& timing) {
-    return trackOperatorCpuUsage_ ? std::make_unique<CpuWallTimer>(timing)
-                                  : nullptr;
+  /// If 'trackOperatorCpuUsage_' is true, returns initialized timer object to
+  /// track cpu and wall time of an operation. Returns null otherwise.
+  /// The delta CpuWallTiming object would be passes to 'func' upon destruction
+  /// of the timer.
+  template <typename F>
+  std::unique_ptr<DeltaCpuWallTimer<F>> createDeltaCpuWallTimer(F&& func) {
+    return trackOperatorCpuUsage_
+        ? std::make_unique<DeltaCpuWallTimer<F>>(std::move(func))
+        : nullptr;
   }
 
   std::unique_ptr<DriverCtx> ctx_;

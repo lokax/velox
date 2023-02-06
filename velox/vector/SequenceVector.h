@@ -54,10 +54,12 @@ class SequenceVector : public SimpleVector<T> {
  public:
   ~SequenceVector() override = default;
 
+    // 返回内部向量是否有NULL值
   bool mayHaveNulls() const override {
     return sequenceValues_->mayHaveNulls();
   }
 
+    // 递归？
   bool mayHaveNullsRecursive() const override {
     return sequenceValues_->mayHaveNullsRecursive();
   }

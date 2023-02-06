@@ -16,8 +16,9 @@
 
 #pragma once
 
+#include <folly/container/F14Set.h>
+
 #include "velox/common/file/File.h"
-#include "velox/exec/Operator.h"
 #include "velox/exec/TreeOfLosers.h"
 #include "velox/exec/UnorderedStreamReader.h"
 #include "velox/vector/ComplexVector.h"
@@ -33,7 +34,7 @@ class SpillInput : public ByteStream {
   SpillInput(std::unique_ptr<ReadFile>&& input, BufferPtr buffer)
       : input_(std::move(input)),
         buffer_(std::move(buffer)),
-        size_(input_->size()) {
+        size_(input_->size()) { // 文件大小
     next(true);
   }
 
@@ -170,14 +171,14 @@ class SpillFileList {
       const std::string& path,
       uint64_t targetFileSize,
       memory::MemoryPool& pool,
-      memory::MappedMemory& mappedMemory)
+      memory::MemoryAllocator& allocator)
       : type_(type),
         numSortingKeys_(numSortingKeys),
         sortCompareFlags_(sortCompareFlags),
         path_(path),
         targetFileSize_(targetFileSize),
         pool_(pool),
-        mappedMemory_(mappedMemory) {
+        allocator_(allocator) {
     // NOTE: if the associated spilling operator has specified the sort
     // comparison flags, then it must match the number of sorting keys.
     VELOX_CHECK(
@@ -200,12 +201,13 @@ class SpillFileList {
   SpillFiles files() {
     VELOX_CHECK(!files_.empty());
     finishFile();
+    recordRuntimeStats();
     return std::move(files_);
   }
 
   uint64_t spilledBytes() const;
 
-  int64_t spilledFiles() const {
+  uint64_t spilledFiles() const {
     return files_.size();
   }
 
@@ -214,8 +216,13 @@ class SpillFileList {
  private:
   // Returns the current file to write to and creates one if needed.
   WriteFile& currentOutput();
+
   // Writes data from 'batch_' to the current output file.
   void flush();
+
+  // Invoked by 'files()' to record stats when finish writing all the spill
+  // files.
+  void recordRuntimeStats();
 
   const RowTypePtr type_;
   const int32_t numSortingKeys_;
@@ -223,7 +230,7 @@ class SpillFileList {
   const std::string path_;
   const uint64_t targetFileSize_;
   memory::MemoryPool& pool_;
-  memory::MappedMemory& mappedMemory_;
+  memory::MemoryAllocator& allocator_;
   std::unique_ptr<VectorStreamGroup> batch_;
   SpillFiles files_;
 };
@@ -234,21 +241,26 @@ class SpillMergeStream : public MergeStream {
   SpillMergeStream() = default;
   virtual ~SpillMergeStream() = default;
 
+    // 返回是否还有数据
   bool hasData() const final {
     return index_ < size_;
   }
-
+    // 进行比较
   bool operator<(const MergeStream& other) const final {
     return compare(other) < 0;
   }
 
   int32_t compare(const MergeStream& other) const override {
+    // 对另一个流进行类型转换
     auto& otherStream = static_cast<const SpillMergeStream&>(other);
+    // 拿出行向量的孩子
     auto& children = rowVector_->children();
     auto& otherChildren = otherStream.current().children();
     int32_t key = 0;
+    // 如果比较标志是空？
     if (sortCompareFlags().empty()) {
       do {
+        // index_表明第几行吧
         auto result = children[key]
                           ->compare(
                               otherChildren[key].get(),
@@ -259,6 +271,7 @@ class SpillMergeStream : public MergeStream {
         if (result != 0) {
           return result;
         }
+        // result是0的话，就继续循环比较下一列
       } while (++key < numSortingKeys());
     } else {
       do {
@@ -274,11 +287,13 @@ class SpillMergeStream : public MergeStream {
         }
       } while (++key < numSortingKeys());
     }
+    // 表示相等
     return 0;
   }
 
   void pop();
 
+    // 当前行向量
   const RowVector& current() const {
     return *rowVector_;
   }
@@ -552,16 +567,17 @@ class SpillState {
       const std::vector<CompareFlags>& sortCompareFlags,
       uint64_t targetFileSize,
       memory::MemoryPool& pool,
-      memory::MappedMemory& mappedMemory)
+      memory::MemoryAllocator& allocator)
       : path_(path),
         maxPartitions_(maxPartitions),
         numSortingKeys_(numSortingKeys),
         sortCompareFlags_(sortCompareFlags),
         targetFileSize_(targetFileSize),
         pool_(pool),
-        mappedMemory_(mappedMemory),
+        allocator_(allocator),
         files_(maxPartitions_) {}
 
+    // 返回某个分区是否被落到磁盘上？S
   /// Indicates if a given 'partition' has been spilled or not.
   bool isPartitionSpilled(int32_t partition) const {
     VELOX_DCHECK_LT(partition, maxPartitions_);
@@ -631,7 +647,8 @@ class SpillState {
   /// Return the spilled partition number set.
   const SpillPartitionNumSet& spilledPartitionSet() const;
 
-  int64_t spilledFiles() const;
+  /// Returns the number of spilled files we have.
+  uint64_t spilledFiles() const;
 
   std::vector<std::string> testingSpilledFilePaths() const;
 
@@ -644,7 +661,7 @@ class SpillState {
   const uint64_t targetFileSize_;
 
   memory::MemoryPool& pool_;
-  memory::MappedMemory& mappedMemory_;
+  memory::MemoryAllocator& allocator_;
 
   // A set of spilled partition numbers.
   SpillPartitionNumSet spilledPartitionSet_;

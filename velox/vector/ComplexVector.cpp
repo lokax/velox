@@ -169,8 +169,7 @@ void RowVector::copy(
   // Copy non-null values.
   SelectivityVector nonNullRows = rows;
 
-  SelectivityVector allRows(source->size());
-  DecodedVector decodedSource(*source, allRows);
+  DecodedVector decodedSource(*source);
   if (decodedSource.isIdentityMapping()) {
     if (source->mayHaveNulls()) {
       auto rawNulls = source->rawNulls();
@@ -233,6 +232,71 @@ void RowVector::copy(
     if (nullRows.hasSelections()) {
       ensureNulls();
       nullRows.setNulls(nulls_);
+    }
+  }
+}
+
+void RowVector::copyRanges(
+    const BaseVector* source,
+    const folly::Range<const CopyRange*>& ranges) {
+  if (ranges.empty()) {
+    return;
+  }
+
+  auto minTargetIndex = std::numeric_limits<vector_size_t>::max();
+  auto maxTargetIndex = std::numeric_limits<vector_size_t>::min();
+  for (auto& r : ranges) {
+    minTargetIndex = std::min(minTargetIndex, r.targetIndex);
+    maxTargetIndex = std::max(maxTargetIndex, r.targetIndex + r.count);
+  }
+  SelectivityVector rows(maxTargetIndex);
+  rows.setValidRange(0, minTargetIndex, false);
+  rows.updateBounds();
+  for (auto i = 0; i < children_.size(); ++i) {
+    BaseVector::ensureWritable(
+        rows, type()->asRow().childAt(i), pool(), children_[i]);
+  }
+
+  DecodedVector decoded(*source);
+  if (decoded.isIdentityMapping() && !decoded.mayHaveNulls()) {
+    if (rawNulls_) {
+      auto* rawNulls = mutableRawNulls();
+      for (auto& r : ranges) {
+        bits::fillBits(rawNulls, r.targetIndex, r.count, bits::kNotNull);
+      }
+    }
+    auto* rowSource = source->loadedVector()->as<RowVector>();
+    for (int i = 0; i < children_.size(); ++i) {
+      children_[i]->copyRanges(rowSource->childAt(i)->loadedVector(), ranges);
+    }
+  } else {
+    std::vector<BaseVector::CopyRange> baseRanges;
+    baseRanges.reserve(ranges.size());
+    for (auto& r : ranges) {
+      for (vector_size_t i = 0; i < r.count; ++i) {
+        bool isNull = decoded.isNullAt(r.sourceIndex + i);
+        setNull(r.targetIndex + i, isNull);
+        if (isNull) {
+          continue;
+        }
+        auto baseIndex = decoded.index(r.sourceIndex + i);
+        if (!baseRanges.empty() &&
+            baseRanges.back().sourceIndex + 1 == baseIndex &&
+            baseRanges.back().targetIndex + 1 == r.targetIndex + i) {
+          ++baseRanges.back().count;
+        } else {
+          baseRanges.push_back({
+              .sourceIndex = baseIndex,
+              .targetIndex = r.targetIndex + i,
+              .count = 1,
+          });
+        }
+      }
+    }
+    auto* rowSource = decoded.base()->as<RowVector>();
+    for (int i = 0; i < children_.size(); ++i) {
+      children_[i]->copyRanges(
+          rowSource->childAt(i)->loadedVector(), baseRanges);
     }
   }
 }
@@ -458,6 +522,33 @@ void ArrayVectorBase::copyRangesImpl(
     if (targetKeys) {
       targetKeys->get()->resize(childSize);
       targetKeys->get()->copyRanges(sourceKeys, outRanges);
+    }
+  }
+}
+
+void ArrayVectorBase::checkRanges() const {
+  std::unordered_map<vector_size_t, vector_size_t> seenElements;
+  seenElements.reserve(size());
+
+  for (vector_size_t i = 0; i < size(); ++i) {
+    auto size = sizeAt(i);
+    auto offset = offsetAt(i);
+
+    for (vector_size_t j = 0; j < size; ++j) {
+      auto it = seenElements.find(offset + j);
+      if (it != seenElements.end()) {
+        VELOX_FAIL(
+            "checkRanges() found overlap at idx {}: element {} has offset {} "
+            "and size {}, and element {} has offset {} and size {}.",
+            offset + j,
+            it->second,
+            offsetAt(it->second),
+            sizeAt(it->second),
+            i,
+            offset,
+            size);
+      }
+      seenElements.emplace(offset + j, i);
     }
   }
 }
@@ -771,15 +862,6 @@ std::unique_ptr<SimpleVector<uint64_t>> MapVector::hashAll() const {
   VELOX_NYI();
 }
 
-vector_size_t MapVector::reserveMap(vector_size_t offset, vector_size_t size) {
-  auto keySize = keys_->size();
-  keys_->resize(keySize + size);
-  values_->resize(keySize + size);
-  offsets_->asMutable<vector_size_t>()[offset] = keySize;
-  sizes_->asMutable<vector_size_t>()[offset] = size;
-  return keySize;
-}
-
 bool MapVector::isSorted(vector_size_t index) const {
   if (isNullAt(index)) {
     return true;
@@ -807,29 +889,28 @@ void MapVector::canonicalize(
   // non-destructive.
   VELOX_CHECK(map.unique());
   BufferPtr indices;
-  folly::Range<vector_size_t*> indicesRange;
+  vector_size_t* indicesRange;
   for (auto i = 0; i < map->BaseVector::length_; ++i) {
     if (map->isSorted(i)) {
       continue;
     }
     if (!indices) {
       indices = map->elementIndices();
-      indicesRange = folly::Range<vector_size_t*>(
-          indices->asMutable<vector_size_t>(), map->keys_->size());
+      indicesRange = indices->asMutable<vector_size_t>();
     }
     auto offset = map->rawOffsets_[i];
     auto size = map->rawSizes_[i];
     if (useStableSort) {
       std::stable_sort(
-          indicesRange.begin() + offset,
-          indicesRange.begin() + offset + size,
+          indicesRange + offset,
+          indicesRange + offset + size,
           [&](vector_size_t left, vector_size_t right) {
             return map->keys_->compare(map->keys_.get(), left, right) < 0;
           });
     } else {
       std::sort(
-          indicesRange.begin() + offset,
-          indicesRange.begin() + offset + size,
+          indicesRange + offset,
+          indicesRange + offset + size,
           [&](vector_size_t left, vector_size_t right) {
             return map->keys_->compare(map->keys_.get(), left, right) < 0;
           });
@@ -853,7 +934,7 @@ std::vector<vector_size_t> MapVector::sortedKeyIndices(
 }
 
 BufferPtr MapVector::elementIndices() const {
-  auto numElements = keys_->size();
+  auto numElements = std::min<vector_size_t>(keys_->size(), values_->size());
   BufferPtr buffer =
       AlignedBuffer::allocate<vector_size_t>(numElements, BaseVector::pool_);
   auto data = buffer->asMutable<vector_size_t>();

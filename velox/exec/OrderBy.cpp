@@ -36,16 +36,12 @@ OrderBy::OrderBy(
           operatorId,
           orderByNode->id(),
           "OrderBy"),
-      mappedMemory_(operatorCtx_->mappedMemory()),
+      allocator_(operatorCtx_->allocator()),
       numSortKeys_(orderByNode->sortingKeys().size()),
       spillMemoryThreshold_(operatorCtx_->driverCtx()
                                 ->queryConfig()
                                 .orderBySpillMemoryThreshold()),
-      spillConfig_(makeOperatorSpillConfig(
-          *operatorCtx_->task()->queryCtx(),
-          *operatorCtx_,
-          core::QueryConfig::kOrderBySpillEnabled,
-          operatorId)) {
+      spillConfig_(operatorCtx_->makeSpillConfig(Spiller::Type::kOrderBy)) {
   std::vector<TypePtr> keyTypes;
   std::vector<TypePtr> dependentTypes;
   std::vector<TypePtr> types;
@@ -85,8 +81,7 @@ OrderBy::OrderBy(
   }
 
   // Create row container.
-  data_ = std::make_unique<RowContainer>(
-      keyTypes, dependentTypes, operatorCtx_->mappedMemory());
+  data_ = std::make_unique<RowContainer>(keyTypes, dependentTypes, allocator_);
   internalStoreType_ = ROW(std::move(names), std::move(types));
 #ifndef NDEBUG
   for (int i = 0; i < internalStoreType_->children().size(); ++i) {
@@ -117,11 +112,13 @@ void OrderBy::addInput(RowVectorPtr input) {
 
   numRows_ += allRows.size();
   if (spiller_ != nullptr) {
-    const auto stats = spiller_->stats();
-    stats_.spilledBytes = stats.spilledBytes;
-    stats_.spilledRows = stats.spilledRows;
-    stats_.spilledPartitions = stats.spilledPartitions;
-    VELOX_DCHECK_LE(stats_.spilledPartitions, 1);
+    const auto spillStats = spiller_->stats();
+    auto lockedStats = stats_.wlock();
+    lockedStats->spilledBytes = spillStats.spilledBytes;
+    lockedStats->spilledRows = spillStats.spilledRows;
+    lockedStats->spilledPartitions = spillStats.spilledPartitions;
+    lockedStats->spilledFiles = spillStats.spilledFiles;
+    VELOX_DCHECK_LE(lockedStats->spilledPartitions, 1);
   }
 }
 
@@ -154,7 +151,7 @@ void OrderBy::ensureInputFits(const RowVectorPtr& input) {
     return;
   }
 
-  auto tracker = mappedMemory_->tracker();
+  auto tracker = allocator_->tracker();
   VELOX_CHECK_NOT_NULL(tracker);
   const auto currentUsage = tracker->getCurrentUserBytes();
   if (spillMemoryThreshold_ != 0 && currentUsage > spillMemoryThreshold_) {
@@ -209,10 +206,8 @@ void OrderBy::spill(int64_t targetRows, int64_t targetBytes) {
   VELOX_CHECK_GE(targetBytes, 0);
 
   if (spiller_ == nullptr) {
-    VELOX_DCHECK(mappedMemory_->tracker() != nullptr);
+    VELOX_DCHECK(allocator_->tracker() != nullptr);
     const auto& spillConfig = spillConfig_.value();
-    const auto spillFileSize = mappedMemory_->tracker()->getCurrentUserBytes() *
-        spillConfig.fileSizeFactor;
     spiller_ = std::make_unique<Spiller>(
         Spiller::Type::kOrderBy,
         data_.get(),
@@ -221,7 +216,8 @@ void OrderBy::spill(int64_t targetRows, int64_t targetBytes) {
         data_->keyTypes().size(),
         keyCompareFlags_,
         spillConfig.filePath,
-        spillFileSize,
+        spillConfig.maxFileSize,
+        spillConfig.minSpillRunSize,
         Spiller::spillPool(),
         spillConfig.executor);
     VELOX_CHECK_EQ(spiller_->state().maxPartitions(), 1);
@@ -262,6 +258,7 @@ void OrderBy::noMoreInput() {
     // Finish spill, and we shouldn't get any rows from non-spilled partition as
     // there is only one hash partition for orderBy operator.
     Spiller::SpillRows nonSpilledRows = spiller_->finishSpill();
+    // nonSpilledRows需要是empty
     VELOX_CHECK(nonSpilledRows.empty());
     VELOX_CHECK_NULL(spillMerge_);
 

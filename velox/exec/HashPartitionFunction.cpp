@@ -49,6 +49,7 @@ void HashPartitionFunction::init(
     } else {
       const auto& constValue = constValues[constChannel++];
       hashers_.emplace_back(VectorHasher::create(constValue->type(), channel));
+      // 常量的情况，预先计算哈希值？
       hashers_.back()->precompute(*constValue);
     }
   }
@@ -57,6 +58,7 @@ void HashPartitionFunction::init(
 void HashPartitionFunction::partition(
     const RowVector& input,
     std::vector<uint32_t>& partitions) {
+        // 输入数据行数
   auto size = input.size();
 
   rows_.resize(size);
@@ -69,10 +71,12 @@ void HashPartitionFunction::partition(
       hashers_[i]->decode(*input.childAt(hasher->channel()), rows_);
       hashers_[i]->hash(rows_, i > 0, hashes_);
     } else {
+        // constant的情况直接使用之前预计算的哈希值
       hashers_[i]->hashPrecomputed(rows_, i > 0, hashes_);
     }
   }
 
+    // 计算每一行数据在哪个分区上
   partitions.resize(size);
   if (hashBitRange_.has_value()) {
     for (auto i = 0; i < size; ++i) {

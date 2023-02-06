@@ -31,19 +31,18 @@ HiveConnectorTestBase::HiveConnectorTestBase() {
 
 void HiveConnectorTestBase::SetUp() {
   OperatorTestBase::SetUp();
-  executor_ = std::make_unique<folly::IOThreadPoolExecutor>(3);
   auto hiveConnector =
       connector::getConnectorFactory(
           connector::hive::HiveConnectorFactory::kHiveConnectorName)
-          ->newConnector(kHiveConnectorId, nullptr, executor_.get());
+          ->newConnector(kHiveConnectorId, nullptr, ioExecutor_.get());
   connector::registerConnector(hiveConnector);
   dwrf::registerDwrfReaderFactory();
 }
 
 void HiveConnectorTestBase::TearDown() {
-  if (executor_) {
-    executor_->join();
-  }
+  // Make sure all pending loads are finished or cancelled before unregister
+  // connector.
+  ioExecutor_.reset();
   dwrf::unregisterDwrfReaderFactory();
   connector::unregisterConnector(kHiveConnectorId);
   OperatorTestBase::TearDown();
@@ -66,11 +65,9 @@ void HiveConnectorTestBase::writeToFile(
   options.schema = vectors[0]->type();
   auto sink =
       std::make_unique<facebook::velox::dwio::common::FileSink>(filePath);
-  facebook::velox::dwrf::Writer writer{
-      options,
-      std::move(sink),
-      pool_->addChild(kWriter, std::numeric_limits<int64_t>::max())};
-
+  auto childPool =
+      pool_->addChild(kWriter, std::numeric_limits<int64_t>::max());
+  facebook::velox::dwrf::Writer writer{options, std::move(sink), *childPool};
   for (size_t i = 0; i < vectors.size(); ++i) {
     writer.write(vectors[i]);
   }
@@ -150,6 +147,38 @@ HiveConnectorTestBase::makeHiveConnectorSplit(
       .start(start)
       .length(length)
       .build();
+}
+
+// static
+std::shared_ptr<connector::hive::HiveInsertTableHandle>
+HiveConnectorTestBase::makeHiveInsertTableHandle(
+    const std::vector<std::string>& tableColumnNames,
+    const std::vector<TypePtr>& tableColumnTypes,
+    const std::vector<std::string>& partitionedBy,
+    std::shared_ptr<connector::hive::LocationHandle> locationHandle) {
+  std::vector<std::shared_ptr<const connector::hive::HiveColumnHandle>>
+      columnHandles;
+  for (int i = 0; i < tableColumnNames.size(); ++i) {
+    if (std::find(
+            partitionedBy.cbegin(),
+            partitionedBy.cend(),
+            tableColumnNames.at(i)) != partitionedBy.cend()) {
+      columnHandles.push_back(
+          std::make_shared<connector::hive::HiveColumnHandle>(
+              tableColumnNames.at(i),
+              connector::hive::HiveColumnHandle::ColumnType::kPartitionKey,
+              tableColumnTypes.at(i)));
+    } else {
+      columnHandles.push_back(
+          std::make_shared<connector::hive::HiveColumnHandle>(
+              tableColumnNames.at(i),
+              connector::hive::HiveColumnHandle::ColumnType::kRegular,
+              tableColumnTypes.at(i)));
+    }
+  }
+
+  return std::make_shared<connector::hive::HiveInsertTableHandle>(
+      columnHandles, locationHandle);
 }
 
 std::shared_ptr<connector::hive::HiveColumnHandle>

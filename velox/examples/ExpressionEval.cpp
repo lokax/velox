@@ -56,7 +56,9 @@ int main(int argc, char** argv) {
   // QueryCtx holds the metadata and configuration associated with a
   // particular query. This is shared between all threads of execution
   // for the same query (one object per query).
-  auto queryCtx = core::QueryCtx::createForTest();
+
+  // 一个查询一个QueryCtx
+  auto queryCtx = std::make_shared<core::QueryCtx>();
 
   // ExecCtx holds structures associated with a single thread of execution
   // (one per thread). Each thread of execution requires a scoped memory pool,
@@ -64,8 +66,9 @@ int main(int argc, char** argv) {
   // pointer to this pool can be obtained using execCtx.pool().
   //
   // Optionally, one can control the per-thread memory cap by passing it as an
-  // argument to getDefaultScopedMemoryPool() - no limit by default.
-  auto pool = memory::getDefaultScopedMemoryPool();
+  // argument to getDefaultMemoryPool() - no limit by default.
+  // 这里创建一个内存池，和queryCtx里面初始化的内存池不一样？
+  auto pool = memory::getDefaultMemoryPool();
   core::ExecCtx execCtx{pool.get(), queryCtx.get()};
 
   // Next, let's create an expression tree to be executed in this example. On a
@@ -82,6 +85,7 @@ int main(int argc, char** argv) {
   //
   // Let's first define a type for the input dataset used in this example. In
   // this case, a single input column called "my_col", typed as bigint:
+  // 创建一个类型
   auto inputRowType = ROW({{"my_col", BIGINT()}});
 
   // FieldAccessTypedExpr let us choose a particular field/column from the input
@@ -109,6 +113,8 @@ int main(int argc, char** argv) {
   // evaluated). ExprSet will output one column per input exprTree. It also
   // takes the execution context associated with the current thread of
   // execution.
+  // TODO(lokax):
+  // 这里传execCtx的指针进去
   exec::ExprSet exprSet({exprTree}, &execCtx);
 
   // Generate input batch.
@@ -125,6 +131,7 @@ int main(int argc, char** argv) {
   auto rawValues = flatVector->mutableRawValues();
   std::iota(rawValues, rawValues + vectorSize, 0); // 0, 1, 2, 3, ...
 
+    // 创建一个行向量
   // Then, let's wrap the generated flatVector in a RowVector:
   auto rowVector = std::make_shared<RowVector>(
       execCtx.pool(), // pool where allocations will be made.

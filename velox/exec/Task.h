@@ -219,11 +219,9 @@ class Task : public std::enable_shared_from_this<Task> {
   /// occurred.
   std::string errorMessage() const;
 
-  // Returns by copy as other threads might be updating the structure.
-  TaskStats taskStats() const {
-    std::lock_guard<std::mutex> l(mutex_);
-    return taskStats_;
-  }
+  /// Returns Task Stats by copy as other threads might be updating the
+  /// structure.
+  TaskStats taskStats() const;
 
   /// Returns time (ms) since the task execution started or zero, if not
   /// started.
@@ -260,19 +258,24 @@ class Task : public std::enable_shared_from_this<Task> {
   /// library components (Driver, Operator, etc.) and should not be called by
   /// the library users.
 
-  memory::MemoryPool* FOLLY_NONNULL addDriverPool(int pipelineId, int driverId);
+  /// Creates new instance of MemoryPool for a plan node, stores it in the task
+  /// to ensure lifetime and returns a raw pointer. Not thread safe, e.g. must
+  /// be called from the Operator's constructor via addOperatorPool().
+  memory::MemoryPool* FOLLY_NONNULL
+  getOrAddNodePool(const core::PlanNodeId& planNodeId);
 
-  /// Creates new instance of MemoryPool, stores it in the task to ensure
-  /// lifetime and returns a raw pointer. Not thread safe, e.g. must be called
-  /// from the Operator's constructor.
-  memory::MemoryPool* FOLLY_NONNULL addOperatorPool(
-      memory::MemoryPool* FOLLY_NONNULL driverPool,
-      const std::string& operatorType = "");
+  /// Creates new instance of MemoryPool for an operator, stores it in the task
+  /// to ensure lifetime and returns a raw pointer. Not thread safe, e.g. must
+  /// be called from the Operator's constructor.
+  velox::memory::MemoryPool* FOLLY_NONNULL addOperatorPool(
+      const core::PlanNodeId& planNodeId,
+      int pipelineId,
+      const std::string& operatorType);
 
   /// Creates new instance of MappedMemory, stores it in the task to ensure
   /// lifetime and returns a raw pointer. Not thread safe, e.g. must be called
   /// from the Operator's constructor.
-  memory::MappedMemory* FOLLY_NONNULL
+  memory::MemoryAllocator* FOLLY_NONNULL
   addOperatorMemory(const std::shared_ptr<memory::MemoryUsageTracker>& tracker);
 
   // Removes driver from the set of drivers in 'self'. The task will be kept
@@ -725,15 +728,21 @@ class Task : public std::enable_shared_from_this<Task> {
   // Root MemoryPool for this Task. All member variables that hold references
   // to pool_ must be defined after pool_, childPools_, and
   // childMappedMemories_
-  std::unique_ptr<memory::MemoryPool> pool_;
+  std::shared_ptr<memory::MemoryPool> pool_;
 
   // Keep driver and operator memory pools alive for the duration of the task
   // to allow for sharing vectors across drivers without copy.
-  std::vector<std::unique_ptr<memory::MemoryPool>> childPools_;
+  std::vector<std::shared_ptr<memory::MemoryPool>> childPools_;
 
-  // Keep operator MappedMemory instances alive for the duration of the task to
-  // allow for sharing data without copy.
-  std::vector<std::shared_ptr<memory::MappedMemory>> childMappedMemories_;
+  // The map from plan node it to the corresponding memory pool object's raw
+  // pointer.
+  //
+  // NOTE: ''childPools_' holds the ownerships of node memory pools.
+  std::unordered_map<core::PlanNodeId, memory::MemoryPool*> nodePools_;
+
+  // Keep operator MemoryAllocator instances alive for the duration of the task
+  // to allow for sharing data without copy.
+  std::vector<std::shared_ptr<memory::MemoryAllocator>> childAllocators_;
 
   // A set of IDs of leaf plan nodes that require splits. Used to check plan
   // node IDs specified in split management methods.

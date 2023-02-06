@@ -365,10 +365,12 @@ class BaseVector {
     clearNulls(0, size());
   }
 
-  // Sets the size to 'size' and ensures there is space for the
-  // indicated number of nulls and top level values.
-  // 'setNotNull' indicates if nulls in range [oldSize, newSize) should be set
-  // to not null.
+  // Sets the size to 'newSize' and ensures there is space for the
+  // indicated number of nulls and top level values (eg. values for Flat,
+  // indices for Dictionary, etc). Any immutable buffers that need to be resized
+  // are copied. 'setNotNull' indicates if nulls in range [oldSize, newSize]
+  // should be set to not null.
+  // Note: caller must ensure that the vector is singly referenced.
   virtual void resize(vector_size_t newSize, bool setNotNull = true);
 
   // Sets the rows of 'this' given by 'rows' to
@@ -536,6 +538,7 @@ class BaseVector {
     VELOX_UNSUPPORTED("Vector is not a wrapper");
   }
 
+    // 直接返回自己
   virtual BaseVector* loadedVector() {
     return this;
   }
@@ -723,6 +726,17 @@ class BaseVector {
     return isCodegenOutput_;
   }
 
+  /// Marks the vector as containing or being a lazy vector and being wrapped.
+  /// Should only be used if 'this' is lazy or has a nested lazy vector.
+  /// Returns true if this is the first time it was wrapped, else returns false.
+  bool markAsContainingLazyAndWrapped() {
+    if (containsLazyAndIsWrapped_) {
+      return false;
+    }
+    containsLazyAndIsWrapped_ = true;
+    return true;
+  }
+
  protected:
   /// Returns a brief summary of the vector. The default implementation includes
   /// encoding, type, number of rows and number of nulls.
@@ -810,6 +824,13 @@ class BaseVector {
   bool isCodegenOutput_ = false;
 
   friend class LazyVector;
+
+  /// Is true if this vector is a lazy vector or contains one and is being
+  /// wrapped. Keeping track of this helps to enforce the invariant that an
+  /// unloaded lazy vector should not be wrapped by two separate top level
+  /// vectors. This would ensure we avoid it being loaded for two separate set
+  /// of rows.
+  bool containsLazyAndIsWrapped_{false};
 };
 
 template <>

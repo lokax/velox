@@ -31,7 +31,7 @@ TopN::TopN(
       count_(topNNode->count()),
       data_(std::make_unique<RowContainer>(
           outputType_->children(),
-          operatorCtx_->mappedMemory())),
+          operatorCtx_->allocator())),
       comparator_(
           outputType_,
           topNNode->sortingKeys(),
@@ -58,6 +58,7 @@ TopN::Comparator::Comparator(
 }
 
 void TopN::addInput(RowVectorPtr input) {
+    // 所有行
   SelectivityVector allRows(input->size());
 
   // TODO Decode keys first, then decode the rest only for passing positions
@@ -65,21 +66,24 @@ void TopN::addInput(RowVectorPtr input) {
     decodedVectors_[col].decode(*input->childAt(col), allRows);
   }
 
+    // 遍历每一行
   for (int row = 0; row < input->size(); ++row) {
     char* newRow = nullptr;
     if (topRows_.size() < count_) {
+        // 从容器中分配新行
       newRow = data_->newRow();
     } else {
       char* topRow = topRows_.top();
-
+        // 比较结果为true，则不需要往堆里面添加数据
       if (comparator_(topRow, decodedVectors_, row)) {
         continue;
       }
+      // 否则弹走
       topRows_.pop();
       // Reuse the topRow's memory.
       newRow = data_->initializeRow(topRow, true /* reuse */);
     }
-
+    // 下面的操作就是存储数据到rowContainer中
     for (int col = 0; col < input->childrenSize(); ++col) {
       data_->store(decodedVectors_[col], row, newRow, col);
     }
@@ -97,9 +101,11 @@ RowVectorPtr TopN::getOutput() {
       std::min(kMaxNumRowsToReturn, rows_.size() - numRowsReturned_);
   VELOX_CHECK(numRowsToReturn > 0);
 
+    // 创建行向量
   auto result = std::dynamic_pointer_cast<RowVector>(
       BaseVector::create(outputType_, numRowsToReturn, operatorCtx_->pool()));
 
+    // 提取数据
   for (int i = 0; i < outputType_->size(); ++i) {
     data_->extractColumn(
         rows_.data() + numRowsReturned_,

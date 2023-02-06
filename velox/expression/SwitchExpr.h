@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "velox/expression/FunctionCallToSpecialForm.h"
 #include "velox/expression/SpecialForm.h"
 
 namespace facebook::velox::exec {
@@ -48,14 +49,33 @@ class SwitchExpr : public SpecialForm {
       VectorPtr& result) override;
 
   bool propagatesNulls() const override;
-
+    // 
   bool isConditional() const override {
     return true;
   }
 
  private:
+  static TypePtr resolveType(const std::vector<TypePtr>& argTypes);
+
   const size_t numCases_;
   const bool hasElseClause_;
   BufferPtr tempValues_;
+
+  friend class SwitchCallToSpecialForm;
+};
+
+class SwitchCallToSpecialForm : public FunctionCallToSpecialForm {
+ public:
+  TypePtr resolveType(const std::vector<TypePtr>& argTypes) override;
+
+  ExprPtr constructSpecialForm(
+      const TypePtr& type,
+      std::vector<ExprPtr>&& compiledChildren,
+      bool trackCpuUsage) override;
+};
+
+class IfCallToSpecialForm : public SwitchCallToSpecialForm {
+ public:
+  TypePtr resolveType(const std::vector<TypePtr>& argTypes) override;
 };
 } // namespace facebook::velox::exec

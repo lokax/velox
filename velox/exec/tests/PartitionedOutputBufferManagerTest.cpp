@@ -14,8 +14,10 @@
  * limitations under the License.
  */
 #include "velox/exec/PartitionedOutputBufferManager.h"
+
 #include <gtest/gtest.h>
-#include <velox/common/memory/MappedMemory.h>
+
+#include "velox/common/memory/MemoryAllocator.h"
 #include "velox/dwio/common/tests/utils/BatchMaker.h"
 #include "velox/exec/Exchange.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
@@ -29,8 +31,8 @@ using facebook::velox::test::BatchMaker;
 class PartitionedOutputBufferManagerTest : public testing::Test {
  protected:
   void SetUp() override {
-    pool_ = facebook::velox::memory::getDefaultScopedMemoryPool();
-    mappedMemory_ = memory::MappedMemory::getInstance();
+    pool_ = facebook::velox::memory::getDefaultMemoryPool();
+    allocator_ = memory::MemoryAllocator::getInstance();
     bufferManager_ = PartitionedOutputBufferManager::getInstance().lock();
     if (!isRegisteredVectorSerde()) {
       facebook::velox::serializer::presto::PrestoVectorSerde::
@@ -54,7 +56,10 @@ class PartitionedOutputBufferManagerTest : public testing::Test {
                                 BatchMaker::createBatch(rowType, 100, *pool_))})
                             .planFragment();
     auto task = std::make_shared<Task>(
-        taskId, std::move(planFragment), 0, core::QueryCtx::createForTest());
+        taskId,
+        std::move(planFragment),
+        0,
+        std::make_shared<core::QueryCtx>(executor_.get()));
 
     bufferManager_->initializeTask(task, false, numDestinations, numDrivers);
     return task;
@@ -69,7 +74,7 @@ class PartitionedOutputBufferManagerTest : public testing::Test {
   }
 
   std::unique_ptr<SerializedPage> toSerializedPage(VectorPtr vector) {
-    auto data = std::make_unique<VectorStreamGroup>(mappedMemory_);
+    auto data = std::make_unique<VectorStreamGroup>(allocator_);
     auto size = vector->size();
     auto range = IndexRange{0, size};
     data->createStreamTree(
@@ -77,7 +82,7 @@ class PartitionedOutputBufferManagerTest : public testing::Test {
     data->append(
         std::dynamic_pointer_cast<RowVector>(vector), folly::Range(&range, 1));
     auto listener = bufferManager_->newListener();
-    IOBufOutputStream stream(*mappedMemory_, listener.get(), data->size());
+    IOBufOutputStream stream(*allocator_, listener.get(), data->size());
     data->flush(&stream);
     return std::make_unique<SerializedPage>(stream.getIOBuf());
   }
@@ -224,8 +229,11 @@ class PartitionedOutputBufferManagerTest : public testing::Test {
     EXPECT_FALSE(receivedData) << "for destination " << destination;
   }
 
-  std::unique_ptr<facebook::velox::memory::ScopedMemoryPool> pool_;
-  memory::MappedMemory* mappedMemory_;
+  std::shared_ptr<folly::Executor> executor_{
+      std::make_shared<folly::CPUThreadPoolExecutor>(
+          std::thread::hardware_concurrency())};
+  std::shared_ptr<facebook::velox::memory::MemoryPool> pool_;
+  memory::MemoryAllocator* allocator_;
   std::shared_ptr<PartitionedOutputBufferManager> bufferManager_;
 };
 
@@ -290,7 +298,7 @@ TEST_F(PartitionedOutputBufferManagerTest, basic) {
   EXPECT_TRUE(task->isRunning());
   deleteResults(taskId, 3);
   fetchEndMarker(taskId, 4, 2);
-
+  bufferManager_->removeTask(taskId);
   EXPECT_TRUE(task->isFinished());
 }
 
@@ -323,6 +331,7 @@ TEST_F(PartitionedOutputBufferManagerTest, maxBytes) {
   for (int destination = 2; destination < 5; destination++) {
     fetchEndMarker(taskId, destination, 0);
   }
+  bufferManager_->removeTask(taskId);
 }
 
 TEST_F(PartitionedOutputBufferManagerTest, outOfOrderAcks) {
@@ -392,7 +401,7 @@ TEST_F(PartitionedOutputBufferManagerTest, serializedPage) {
 
   // External managed memory case
   {
-    auto mappedMemory = memory::MappedMemory::getInstance();
+    auto mappedMemory = memory::MemoryAllocator::getInstance();
     void* buffer = mappedMemory->allocateBytes(kBufferSize);
     auto iobuf = folly::IOBuf::wrapBuffer(buffer, kBufferSize);
     std::string payload = "abcdefghijklmnopq";

@@ -56,6 +56,7 @@ std::vector<ContinuePromise> LocalExchangeMemoryManager::decreaseMemoryUsage(
 }
 
 void LocalExchangeQueue::addProducer() {
+    // 获取写锁
   queue_.withWLock([&](auto& /*queue*/) {
     VELOX_CHECK(!noMoreProducers_, "addProducer called after noMoreProducers");
     // 增加pending的producer？
@@ -95,6 +96,7 @@ BlockingReason LocalExchangeQueue::enqueue(
   std::vector<ContinuePromise> consumerPromises;
   bool isClosed = queue_.withWLock([&](auto& queue) {
     if (closed_) {
+        // 队列已经关闭
       return true;
     }
     // push到队列中
@@ -105,6 +107,7 @@ BlockingReason LocalExchangeQueue::enqueue(
   });
 
   if (isClosed) {
+    // 返回不阻塞
     return BlockingReason::kNotBlocked;
   }
     // 通知每一个消费者
@@ -242,7 +245,7 @@ LocalExchange::LocalExchange(
           operatorId,
           planNodeId,
           "LocalExchange"),
-      partition_{partition},
+      partition_{partition}, // 哪个分区
       queue_{operatorCtx_->task()->getLocalExchangeQueue(
           ctx->splitGroupId,
           planNodeId,
@@ -266,8 +269,9 @@ RowVectorPtr LocalExchange::getOutput() {
     return nullptr;
   }
   if (data != nullptr) {
-    stats().inputPositions += data->size();
-    stats().inputBytes += data->estimateFlatSize();
+    auto lockedStats = stats_.wlock();
+    lockedStats->inputPositions += data->size();
+    lockedStats->inputBytes += data->estimateFlatSize();
   }
   return data;
 }
@@ -288,14 +292,16 @@ LocalPartition::LocalPartition(
           "LocalPartition"),
       queues_{
           ctx->task->getLocalExchangeQueues(ctx->splitGroupId, planNode->id())},
-      numPartitions_{queues_.size()},
+      numPartitions_{queues_.size()}, // 几个队列就几个分区
       partitionFunction_(
           numPartitions_ == 1
               ? nullptr
               : planNode->partitionFunctionFactory()(numPartitions_)),
       blockingReasons_{numPartitions_} {
+        // 检查不变量
   VELOX_CHECK(numPartitions_ == 1 || partitionFunction_ != nullptr);
 
+    // 遍历每个队列，添加生产者？
   for (auto& queue : queues_) {
     queue->addProducer();
   }
@@ -342,11 +348,14 @@ wrapChildren(const RowVectorPtr& input, vector_size_t size, BufferPtr indices) {
       input->pool(), input->type(), BufferPtr(nullptr), size, wrappedChildren);
 }
 } // namespace
+
 // 添加输入数据
 void LocalPartition::addInput(RowVectorPtr input) {
-    // 更新统计数据
-  stats_.outputBytes += input->estimateFlatSize();
-  stats_.outputPositions += input->size();
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->outputBytes += input->estimateFlatSize();
+    lockedStats->outputPositions += input->size();
+  }
 
   // Lazy vectors must be loaded or processed.
   for (auto& child : input->children()) {
@@ -356,12 +365,14 @@ void LocalPartition::addInput(RowVectorPtr input) {
   input_ = std::move(input);
     // 如果只有一个分区
   if (numPartitions_ == 1) {
+    // 把数据放进队列中
     blockingReasons_[0] = queues_[0]->enqueue(input_, &futures_[0]);
     if (blockingReasons_[0] != BlockingReason::kNotBlocked) {
         // 一个阻塞的分区
       numBlockedPartitions_ = 1;
     }
   } else {
+    // 对数据进行分区
     partitionFunction_->partition(*input_, partitions_);
 
     auto numInput = input_->size();
@@ -381,6 +392,7 @@ void LocalPartition::addInput(RowVectorPtr input) {
         // Do not enqueue empty partitions.
         continue;
       }
+      // 封装成字典向量
       indexBuffers[i]->setSize(partitionSize * sizeof(vector_size_t));
       auto partitionData =
           wrapChildren(input_, partitionSize, std::move(indexBuffers[i]));
@@ -388,6 +400,7 @@ void LocalPartition::addInput(RowVectorPtr input) {
       ContinueFuture future;
       auto reason = queues_[i]->enqueue(partitionData, &future);
       if (reason != BlockingReason::kNotBlocked) {
+        // 保存阻塞原因
         blockingReasons_[numBlockedPartitions_] = reason;
         futures_[numBlockedPartitions_] = std::move(future);
         ++numBlockedPartitions_;

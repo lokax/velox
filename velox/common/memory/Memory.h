@@ -36,7 +36,7 @@
 #include "velox/common/base/CheckedArithmetic.h"
 #include "velox/common/base/GTestMacros.h"
 #include "velox/common/base/SuccinctPrinter.h"
-#include "velox/common/memory/MappedMemory.h"
+#include "velox/common/memory/MemoryAllocator.h"
 #include "velox/common/memory/MemoryUsage.h"
 #include "velox/common/memory/MemoryUsageTracker.h"
 
@@ -45,9 +45,6 @@ DECLARE_int32(memory_usage_aggregation_interval_millis);
 namespace facebook {
 namespace velox {
 namespace memory {
-constexpr uint16_t kNoAlignment = alignof(max_align_t);
-constexpr uint16_t kDefaultAlignment = 64;
-
 #define VELOX_MEM_MANAGER_CAP_EXCEEDED(cap)                         \
   _VELOX_THROW(                                                     \
       ::facebook::velox::VeloxRuntimeError,                         \
@@ -65,92 +62,194 @@ constexpr uint16_t kDefaultAlignment = 64;
       /* isRetriable */ true,                                       \
       "Memory allocation manually capped");
 
-class ScopedMemoryPool;
-
-class AbstractMemoryPool {
+/// This class provides the memory allocation interfaces for a query execution.
+/// Each query execution entity creates a dedicated memory pool object. The
+/// memory pool objects from a query are organized as a tree with four levels
+/// which reflects the query's physical execution plan:
+///
+/// The top level is a single root pool object (query pool) associated with the
+/// query. The query pool is created on the first executed query task and owned
+/// by QueryCtx. Note that the query pool is optional as not all the engines
+/// using memory pool are creating multiple tasks for the same query in the same
+/// process.
+///
+/// The second level is a number of intermediate pool objects (task pool) with
+/// one per each query task. The query pool is the parent of all the task pools
+/// from the same query. The task pool is created by the query task and owned by
+/// Task.
+///
+/// The third level is a number of intermediate pool objects (node pool) with
+/// one per each query plan node. The task pool is the parent of all the node
+/// pools from the task's physical query plan fragment. The node pool is created
+/// by the first instantiated operator. It is owned by Task in 'childPools_' to
+/// enable the memory sharing within a query task without copy.
+///
+/// The bottom level is a number of leaf pool objects (operator pool) with one
+/// per with each instantiated query operator. Each node pool is the parent of
+/// all the operators instantiated from associated query plan node with one per
+/// each driver. For instance, if the pipeline of a query plan node N has M
+/// drivers in par, then N node pool has M child operator pools. The operator
+/// pool is created by the operator. It is also owned by Task in 'childPools_'
+/// to enable the memory sharing within a query task without copy.
+///
+/// The query pool is created from IMemoryManager::getChild() as a child of a
+/// singleton root pool object (system pool). There is only one system pool for
+/// a velox runtime system. Hence each query pool objects forms a subtree rooted
+/// from the system pool.
+///
+/// Each child pool object holds a shared reference on its parent pool object.
+/// The parent object tracks its child pool objects through the raw pool object
+/// pointer with lock protected. The child pool object destruction first removes
+/// its raw pointer from its parent through dropChild() and then drops the
+/// shared reference on the parent.
+///
+/// NOTE: for the users that integrate at expression evaluation level, we don't
+/// need to build the memory pool hierarchy as described above. Users can either
+/// create a single memory pool from IMemoryManager::getChild() to share with
+/// all the concurrent expression evaluations or create one dedicated memory
+/// pool for each expression evaluation if they need per-expression memory quota
+/// enforcement.
+///
+/// In addition to providing memory allocation functions, the memory pool object
+/// also provides the memory usage counting through MemoryUsageTracker which
+/// will be merged into memory pool object implementation later.
+///
+/// TODO: extend to provide contiguous and non-contiguous large chunk memory
+/// allocation and remove ScopedMappedMemory.
+class MemoryPool : public std::enable_shared_from_this<MemoryPool> {
  public:
-  virtual ~AbstractMemoryPool() {}
+  /// Constructs a named memory pool with specified 'parent'.
+  MemoryPool(const std::string& name, std::shared_ptr<MemoryPool> parent);
+
+  /// Removes this memory pool's tracking from its parent through dropChild()
+  /// as well as drops the shared reference on its parent.
+  virtual ~MemoryPool();
+
+  /// Tree methods used to access and manage the memory hierarchy.
+  /// Returns the name of this memory pool.
+  virtual const std::string& name() const;
+
+  /// Returns the raw pointer to the parent pool. The root memory pool has
+  /// no parent.
+  ///
+  /// NOTE: users are only safe to access the returned parent pool pointer while
+  /// they hold the shared reference on this child memory pool. Otherwise, the
+  /// parent memory pool might have been destroyed.
+  virtual MemoryPool* FOLLY_NULLABLE parent() const;
+
+  /// Returns the number of child memory pools.
+  virtual uint64_t getChildCount() const;
+
+  /// Invoked to traverse the memory pool subtree rooted at this, and calls
+  /// 'visitor' on each visited child memory pool.
+  virtual void visitChildren(
+      std::function<void(MemoryPool* FOLLY_NONNULL)> visitor) const;
+
+  /// Invoked to create a named child memory pool from this with specified
+  /// 'cap'.
+  virtual std::shared_ptr<MemoryPool> addChild(
+      const std::string& name,
+      int64_t cap = kMaxMemory);
+
+  /// Invoked to allocate a buffer with specified 'size'.
   virtual void* FOLLY_NULLABLE allocate(int64_t size) = 0;
+
+  /// Invoked to allocate a zero-filled buffer with capacity that can store
+  /// 'numEntries' entries with each size of 'sizeEach'.
   virtual void* FOLLY_NULLABLE
-  allocateZeroFilled(int64_t numMembers, int64_t sizeEach) = 0;
+  allocateZeroFilled(int64_t numEntries, int64_t sizeEach) = 0;
+
+  /// Invoked to re-allocate from an existing buffer with 'newSize' and update
+  /// memory usage counting accordingly. If 'newSize' is larger than the current
+  /// buffer 'size', the function will allocate a new buffer and free the old
+  /// buffer.
   virtual void* FOLLY_NULLABLE
   reallocate(void* FOLLY_NULLABLE p, int64_t size, int64_t newSize) = 0;
-  virtual void free(void* FOLLY_NULLABLE p, int64_t size) = 0;
-  virtual size_t getPreferredSize(size_t size) = 0;
-};
 
-class MemoryPool : public AbstractMemoryPool {
- public:
-  virtual ~MemoryPool() {}
-  // Accounting/governing methods, lazily managed and expensive for intermediate
-  // tree nodes, cheap for leaf nodes.
-  virtual int64_t getCurrentBytes() const = 0;
-  virtual int64_t getMaxBytes() const = 0;
-  // Tracks memory usage from leaf nodes to root and updates immediately
-  // with atomic operations.
-  // Unlike pool's getCurrentBytes(), getMaxBytes(), trace's API's returns
-  // the aggregated usage of subtree. See 'ScopedChildUsageTest' for
-  // difference in their behavior.
-  virtual void setMemoryUsageTracker(
-      const std::shared_ptr<MemoryUsageTracker>& tracker) = 0;
-  virtual const std::shared_ptr<MemoryUsageTracker>& getMemoryUsageTracker()
-      const = 0;
-  // Used for external aggregation.
-  virtual void setSubtreeMemoryUsage(int64_t size) = 0;
-  virtual int64_t updateSubtreeMemoryUsage(int64_t size) = 0;
-  // Get the cap for the memory node and its subtree.
-  virtual int64_t getCap() const = 0;
+  /// Invoked to free an allocated buffer.
+  virtual void free(void* FOLLY_NULLABLE p, int64_t size) = 0;
+
+  /// Rounds up to a power of 2 >= size, or to a size halfway between
+  /// two consecutive powers of two, i.e 8, 12, 16, 24, 32, .... This
+  /// coincides with JEMalloc size classes.
+  virtual size_t getPreferredSize(size_t size);
+
+  /// Returns the memory allocation alignment size applied internally by this
+  /// memory pool object.
   virtual uint16_t getAlignment() const = 0;
 
-  ////////////////////// resource governing methods ////////////////////
-  // Called by MemoryManager and MemoryPool upon memory usage updates and
-  // propagates down the subtree recursively.
-  virtual void capMemoryAllocation() = 0;
-  // Called by MemoryManager and propagates down recursively if applicable.
-  virtual void uncapMemoryAllocation() = 0;
-  // We might need to freeze memory allocating operations under severe global
-  // memory pressure.
-  virtual bool isMemoryCapped() const = 0;
+  /// Resource governing methods used to track and limit the memory usage
+  /// through this memory pool object.
 
-  ////////////////////////// tree methods ////////////////////////////
-  // TODO: might be able to move implementation to abstract class
-  // name of the node, preferably unique among siblings, but not enforced.
-  virtual const std::string& getName() const = 0;
-  virtual std::weak_ptr<MemoryPool> getWeakPtr() = 0;
-  virtual MemoryPool& getChildByName(const std::string& name) = 0;
-  virtual uint64_t getChildCount() const = 0;
-  virtual void visitChildren(
-      std::function<void(MemoryPool* FOLLY_NONNULL)> visitor) const = 0;
+  /// Accounting/governing methods, lazily managed and expensive for
+  /// intermediate tree nodes, cheap for leaf nodes.
+  virtual int64_t getCurrentBytes() const = 0;
 
-  virtual std::shared_ptr<MemoryPool> genChild(
-      std::weak_ptr<MemoryPool> parent,
-      const std::string& name,
-      int64_t cap) = 0;
-  virtual MemoryPool& addChild(
-      const std::string& name,
-      int64_t cap = kMaxMemory) = 0;
-  virtual std::unique_ptr<ScopedMemoryPool> addScopedChild(
-      const std::string& name,
-      int64_t cap = kMaxMemory) = 0;
-  virtual void dropChild(const MemoryPool* FOLLY_NONNULL child) = 0;
+  /// Returns the peak memory usage of this memory pool.
+  virtual int64_t getMaxBytes() const = 0;
 
-  // Used to explicitly remove self when a user is done with the node, since
-  // nodes are owned by parents and users only get object references. Any
-  // reference to self would be invalid after this call. This will also drop the
-  // entire subtree.
-  virtual void removeSelf() = 0;
+  /// Tracks memory usage from leaf nodes to root and updates immediately
+  /// with atomic operations.
+  /// Unlike pool's getCurrentBytes(), getMaxBytes(), trace's API's returns
+  /// the aggregated usage of subtree. See 'ScopedChildUsageTest' for
+  /// difference in their behavior.
+  virtual void setMemoryUsageTracker(
+      const std::shared_ptr<MemoryUsageTracker>& tracker) = 0;
 
-  // Used to manage existing externally allocated memories without doing a new
-  // allocation.
+  /// Returns the memory usage tracker associated with this memory pool.
+  virtual const std::shared_ptr<MemoryUsageTracker>& getMemoryUsageTracker()
+      const = 0;
+
+  /// Used for external aggregation.
+  virtual void setSubtreeMemoryUsage(int64_t size) = 0;
+
+  virtual int64_t updateSubtreeMemoryUsage(int64_t size) = 0;
+
+  /// Used to manage existing externally allocated memories without doing a new
+  /// allocation.
   virtual void reserve(int64_t /* bytes */) {
     VELOX_NYI("reserve() needs to be implemented in derived memory pool.");
   }
-  // Sometimes in memory governance we want to mock an update for quota
-  // accounting purposes and different implementations can
-  // choose to accommodate this differently.
+
+  /// Sometimes in memory governance we want to mock an update for quota
+  /// accounting purposes and different implementations can
+  /// choose to accommodate this differently.
   virtual void release(int64_t /* bytes */, bool /* mock */ = false) {
     VELOX_NYI("release() needs to be implemented in derived memory pool.");
   }
+
+  /// Get the cap for the memory node and its subtree.
+  virtual int64_t cap() const = 0;
+
+  /// Called by MemoryManager and MemoryPool upon memory usage updates and
+  /// propagates down the subtree recursively.
+  virtual void capMemoryAllocation() = 0;
+
+  /// Called by MemoryManager and propagates down recursively if applicable.
+  virtual void uncapMemoryAllocation() = 0;
+
+  /// We might need to freeze memory allocating operations under severe global
+  /// memory pressure.
+  virtual bool isMemoryCapped() const = 0;
+
+ protected:
+  /// Invoked by addChild() to create a child memory pool object. 'parent' is
+  /// a shared pointer created from this.
+  virtual std::shared_ptr<MemoryPool> genChild(
+      std::shared_ptr<MemoryPool> parent,
+      const std::string& name,
+      int64_t cap) = 0;
+
+  /// Invoked only on object destructor to remove this memory pool from its
+  /// parent's child memory pool tracking.
+  virtual void dropChild(const MemoryPool* FOLLY_NONNULL child);
+
+  const std::string name_;
+  std::shared_ptr<MemoryPool> parent_;
+
+  /// Used protect the concurrent access to 'children_'.
+  mutable folly::SharedMutex childrenMutex_;
+  std::list<MemoryPool*> children_;
 };
 
 namespace detail {
@@ -161,266 +260,17 @@ static inline MemoryPool& getCheckedReference(std::weak_ptr<MemoryPool> ptr) {
 };
 } // namespace detail
 
-class ScopedMemoryPool final : public MemoryPool {
- public:
-  explicit ScopedMemoryPool(std::weak_ptr<MemoryPool> poolPtr)
-      : poolPtr_{poolPtr}, pool_{detail::getCheckedReference(poolPtr)} {}
-
-  ~ScopedMemoryPool() {
-    if (auto sptr = poolPtr_.lock()) {
-      sptr->removeSelf();
-    }
-  }
-
-  int64_t getCurrentBytes() const override {
-    return pool_.getCurrentBytes();
-  }
-
-  int64_t getMaxBytes() const override {
-    return pool_.getMaxBytes();
-  }
-
-  void setMemoryUsageTracker(
-      const std::shared_ptr<MemoryUsageTracker>& tracker) override {
-    pool_.setMemoryUsageTracker(tracker);
-  }
-
-  const std::shared_ptr<MemoryUsageTracker>& getMemoryUsageTracker()
-      const override {
-    return pool_.getMemoryUsageTracker();
-  }
-
-  void* FOLLY_NULLABLE allocate(int64_t size) override {
-    return pool_.allocate(size);
-  }
-
-  void* FOLLY_NULLABLE
-  reallocate(void* FOLLY_NULLABLE p, int64_t size, int64_t newSize) override {
-    return pool_.reallocate(p, size, newSize);
-  }
-
-  void free(void* FOLLY_NULLABLE p, int64_t size) override {
-    return pool_.free(p, size);
-  }
-
-  // Rounds up to a power of 2 >= size, or to a size halfway between
-  // two consecutive powers of two, i.e 8, 12, 16, 24, 32, .... This
-  // coincides with JEMalloc size classes.
-  size_t getPreferredSize(size_t size) override {
-    return pool_.getPreferredSize(size);
-  }
-
-  int64_t updateSubtreeMemoryUsage(int64_t size) override {
-    return pool_.updateSubtreeMemoryUsage(size);
-  }
-
-  void* FOLLY_NULLABLE
-  allocateZeroFilled(int64_t numMembers, int64_t sizeEach) override {
-    return pool_.allocateZeroFilled(numMembers, sizeEach);
-  }
-
-  int64_t getCap() const override {
-    return pool_.getCap();
-  }
-
-  uint16_t getAlignment() const override {
-    return pool_.getAlignment();
-  }
-
-  void capMemoryAllocation() override {
-    pool_.capMemoryAllocation();
-  }
-
-  void uncapMemoryAllocation() override {
-    pool_.uncapMemoryAllocation();
-  }
-  bool isMemoryCapped() const override {
-    return pool_.isMemoryCapped();
-  }
-
-  const std::string& getName() const override {
-    return pool_.getName();
-  }
-
-  std::weak_ptr<MemoryPool> getWeakPtr() override {
-    VELOX_NYI();
-  }
-
-  MemoryPool& getChildByName(const std::string& name) override {
-    return pool_.getChildByName(name);
-  }
-
-  uint64_t getChildCount() const override {
-    return pool_.getChildCount();
-  }
-
-  std::shared_ptr<MemoryPool> genChild(
-      std::weak_ptr<MemoryPool> parent,
-      const std::string& name,
-      int64_t cap) override {
-    return pool_.genChild(parent, name, cap);
-  }
-
-  MemoryPool& addChild(const std::string& name, int64_t cap = kMaxMemory)
-      override {
-    return pool_.addChild(name, cap);
-  }
-
-  std::unique_ptr<memory::ScopedMemoryPool> addScopedChild(
-      const std::string& name,
-      int64_t cap = kMaxMemory) override {
-    return pool_.addScopedChild(name, cap);
-  }
-
-  void removeSelf() override {
-    VELOX_NYI();
-  }
-
-  void visitChildren(
-      std::function<void(velox::memory::MemoryPool* FOLLY_NONNULL)> visitor)
-      const override {
-    pool_.visitChildren(visitor);
-  }
-
-  void dropChild(
-      const velox::memory::MemoryPool* FOLLY_NONNULL child) override {
-    pool_.dropChild(child);
-  }
-
-  void setSubtreeMemoryUsage(int64_t size) override {
-    pool_.setSubtreeMemoryUsage(size);
-  }
-
-  MemoryPool& getPool() {
-    return pool_;
-  }
-
-  void reserve(int64_t bytes) override {
-    pool_.reserve(bytes);
-  }
-
-  void release(int64_t bytes, bool mock = false) override {
-    pool_.release(bytes, mock);
-  }
-
- private:
-  std::weak_ptr<MemoryPool> poolPtr_;
-  MemoryPool& pool_;
-};
-
-// A standard allocator interface for the actual allocator of the memory
-// node tree.
-class MemoryAllocator {
- public:
-  static std::shared_ptr<MemoryAllocator> createDefaultAllocator();
-
-  virtual ~MemoryAllocator() {}
-
-  virtual void* FOLLY_NULLABLE alloc(int64_t size);
-  virtual void* FOLLY_NULLABLE
-  allocZeroFilled(int64_t numMembers, int64_t sizeEach);
-  // TODO: might be able to collapse this with templated class
-  virtual void* FOLLY_NULLABLE allocAligned(uint16_t alignment, int64_t size);
-  virtual void* FOLLY_NULLABLE
-  realloc(void* FOLLY_NULLABLE p, int64_t size, int64_t newSize);
-  virtual void* FOLLY_NULLABLE reallocAligned(
-      void* FOLLY_NULLABLE p,
-      uint16_t alignment,
-      int64_t size,
-      int64_t newSize);
-  virtual void free(void* FOLLY_NULLABLE p, int64_t size);
-};
-
-// An allocator that uses memory::MappedMemory to allocate memory. We leverage
-// MappedMemory for relatively small allocations. Allocations less than 3/4 of
-// smallest size class and larger than largest size class are delegated to
-// malloc still.
-class MmapMemoryAllocator : public MemoryAllocator {
- public:
-  static std::shared_ptr<MmapMemoryAllocator> createDefaultAllocator();
-
-  MmapMemoryAllocator() : mappedMemory_(MappedMemory::getInstance()) {}
-  void* FOLLY_NULLABLE alloc(int64_t size) override;
-  void* FOLLY_NULLABLE
-  allocZeroFilled(int64_t numMembers, int64_t sizeEach) override;
-  void* FOLLY_NULLABLE allocAligned(uint16_t alignment, int64_t size) override;
-  void* FOLLY_NULLABLE
-  realloc(void* FOLLY_NULLABLE p, int64_t size, int64_t newSize) override;
-  void* FOLLY_NULLABLE reallocAligned(
-      void* FOLLY_NULLABLE p,
-      uint16_t alignment,
-      int64_t size,
-      int64_t newSize) override;
-  void free(void* FOLLY_NULLABLE p, int64_t size) override;
-
-  MappedMemory* FOLLY_NONNULL mappedMemory() {
-    return mappedMemory_;
-  }
-
- private:
-  MappedMemory* FOLLY_NONNULL mappedMemory_;
-};
-
-class MemoryPoolBase : public std::enable_shared_from_this<MemoryPoolBase>,
-                       public MemoryPool {
- public:
-  MemoryPoolBase(const std::string& name, std::weak_ptr<MemoryPool> parent);
-  virtual ~MemoryPoolBase();
-
-  // Gets the unique name corresponding to the node in MemoryManager's
-  // registry.
-  const std::string& getName() const override;
-  std::weak_ptr<MemoryPool> getWeakPtr() override;
-  MemoryPool& getChildByName(const std::string& name) override;
-  uint64_t getChildCount() const override;
-  void visitChildren(
-      std::function<void(MemoryPool* FOLLY_NONNULL)> visitor) const override;
-
-  MemoryPool& addChild(const std::string& name, int64_t cap = kMaxMemory)
-      override;
-  std::unique_ptr<ScopedMemoryPool> addScopedChild(
-      const std::string& name,
-      int64_t cap = kMaxMemory) override;
-  // Drops child (and implicitly the entire subtree) to reclaim memory.
-  // Derived classes can override this behavior. e.g. append only semantics.
-  void dropChild(const MemoryPool* FOLLY_NONNULL child) override;
-  // Used to explicitly remove self when a user is done with the node, since
-  // nodes are owned by parents and users only get object references. Any
-  // reference to self would be invalid after this call. This will also drop the
-  // entire subtree.
-  void removeSelf() override;
-
-  size_t getPreferredSize(size_t size) override;
-
- protected:
-  const std::string name_;
-  std::weak_ptr<MemoryPool> parent_;
-
-  mutable folly::SharedMutex childrenMutex_;
-  std::list<std::shared_ptr<MemoryPool>> children_;
-};
-
-template <typename Allocator, uint16_t ALIGNMENT>
 class MemoryManager;
-template <typename Allocator, uint16_t ALIGNMENT>
-class MemoryPoolImpl;
 
-// Signaling for trimming and dropping. Component can either derive this class
-// or use this class as pure signaling. Dropping of component can be implicit.
-// NOTE: MemoryPoolImpl being templated by type means we don't track memory
-// across different allocators and need external workarounds, e.g. static
-// boundaries.
-template <
-    typename Allocator = MemoryAllocator,
-    uint16_t ALIGNMENT = kNoAlignment>
-class MemoryPoolImpl : public MemoryPoolBase {
+/// The implementation of MemoryPool interface with a specified memory manager.
+class MemoryPoolImpl : public MemoryPool {
  public:
   // Should perhaps make this method private so that we only create node through
   // parent.
   MemoryPoolImpl(
-      MemoryManager<Allocator, ALIGNMENT>& memoryManager,
+      MemoryManager& memoryManager,
       const std::string& name,
-      std::weak_ptr<MemoryPool> parent,
+      std::shared_ptr<MemoryPool> parent,
       int64_t cap = kMaxMemory);
 
   ~MemoryPoolImpl() {
@@ -442,12 +292,14 @@ class MemoryPoolImpl : public MemoryPoolBase {
   // tree periodically, this is slightly stale and we have to reserve our own
   // overhead.
   void* FOLLY_NULLABLE allocate(int64_t size) override;
+
   void* FOLLY_NULLABLE
   allocateZeroFilled(int64_t numMembers, int64_t sizeEach) override;
 
   // No-op for attempts to shrink buffer.
   void* FOLLY_NULLABLE
   reallocate(void* FOLLY_NULLABLE p, int64_t size, int64_t newSize) override;
+
   void free(void* FOLLY_NULLABLE p, int64_t size) override;
 
   //////////////////// Memory Management methods /////////////////////
@@ -473,23 +325,31 @@ class MemoryPoolImpl : public MemoryPoolBase {
 
   // TODO: Consider putting these in base class also.
   int64_t getCurrentBytes() const override;
+
   int64_t getMaxBytes() const override;
+
   void setMemoryUsageTracker(
       const std::shared_ptr<MemoryUsageTracker>& tracker) override;
+
   const std::shared_ptr<MemoryUsageTracker>& getMemoryUsageTracker()
       const override;
+
   void setSubtreeMemoryUsage(int64_t size) override;
+
   int64_t updateSubtreeMemoryUsage(int64_t size) override;
-  // Get the cap for the memory node and its subtree.
-  int64_t getCap() const override;
+
+  int64_t cap() const override;
+
   uint16_t getAlignment() const override;
 
   void capMemoryAllocation() override;
+
   void uncapMemoryAllocation() override;
+
   bool isMemoryCapped() const override;
 
   std::shared_ptr<MemoryPool> genChild(
-      std::weak_ptr<MemoryPool> parent,
+      std::shared_ptr<MemoryPool> parent,
       const std::string& name,
       int64_t cap) override;
 
@@ -501,63 +361,30 @@ class MemoryPoolImpl : public MemoryPoolBase {
   // Get the total memory consumption of the subtree, self + all recursive
   // children.
   int64_t getAggregateBytes() const;
+
   int64_t getSubtreeMaxBytes() const;
 
   // TODO: consider returning bool instead.
   void reserve(int64_t size) override;
+
   void release(int64_t size, bool mock = false) override;
 
  private:
   VELOX_FRIEND_TEST(MemoryPoolTest, Ctor);
 
-  template <uint16_t A>
-  struct ALIGNER {};
+  static int64_t sizeAlign(int64_t size);
 
-  template <uint16_t A, typename = std::enable_if_t<A != kNoAlignment>>
-  int64_t sizeAlign(ALIGNER<A> /* unused */, int64_t size) {
-    auto remainder = size % ALIGNMENT;
-    return (remainder == 0) ? size : (size + ALIGNMENT - remainder);
-  }
-
-  template <uint16_t A>
-  int64_t sizeAlign(ALIGNER<kNoAlignment> /* unused */, int64_t size) {
-    return size;
-  }
-
-  template <uint16_t A, typename = std::enable_if_t<A != kNoAlignment>>
-  void* FOLLY_NULLABLE allocAligned(ALIGNER<A> /* unused */, int64_t size) {
-    return allocator_.allocAligned(A, size);
-  }
-
-  template <uint16_t A>
   void* FOLLY_NULLABLE
-  allocAligned(ALIGNER<kNoAlignment> /* unused */, int64_t size) {
-    return allocator_.alloc(size);
-  }
-
-  template <uint16_t A, typename = std::enable_if_t<A != kNoAlignment>>
-  void* FOLLY_NULLABLE reallocAligned(
-      ALIGNER<A> /* unused */,
-      void* FOLLY_NULLABLE p,
-      int64_t size,
-      int64_t newSize) {
-    return allocator_.reallocAligned(p, A, size, newSize);
-  }
-
-  template <uint16_t A>
-  void* FOLLY_NULLABLE reallocAligned(
-      ALIGNER<kNoAlignment> /* unused */,
-      void* FOLLY_NULLABLE p,
-      int64_t size,
-      int64_t newSize) {
-    return allocator_.realloc(p, size, newSize);
+  reallocAligned(void* FOLLY_NULLABLE p, int64_t size, int64_t newSize) {
+    return allocator_.reallocateBytes(p, size, newSize, alignment_);
   }
 
   void accessSubtreeMemoryUsage(
       std::function<void(const MemoryUsage&)> visitor) const;
   void updateSubtreeMemoryUsage(std::function<void(MemoryUsage&)> visitor);
-
-  MemoryManager<Allocator, ALIGNMENT>& memoryManager_;
+    // 对齐到64
+  static constexpr uint16_t alignment_{MemoryAllocator::kMaxAlignment};
+  MemoryManager& memoryManager_;
 
   // Memory allocated attributed to the memory node.
   MemoryUsage localMemoryUsage_;
@@ -567,57 +394,60 @@ class MemoryPoolImpl : public MemoryPoolBase {
   int64_t cap_;
   std::atomic_bool capped_{false};
 
-  Allocator& allocator_;
+  MemoryAllocator& allocator_;
 };
 
 constexpr folly::StringPiece kRootNodeName{"__root__"};
 
+/// This class provides the interface of memory manager. The memory manager is
+/// responsible for enforcing the memory usage quota as well as managing the
+/// memory pools.
 class IMemoryManager {
  public:
   virtual ~IMemoryManager() {}
-  // Returns the total memory usage allowed under this MemoryManager.
-  // MemoryManager maintains this quota as a hard cap, and any allocation
-  // that would cause a quota breach results in exceptions.
+
+  /// Returns the total memory usage allowed under this memory manager.
+  /// The memory manager maintains this quota as a hard cap, and any allocation
+  /// that would cause a quota breach results in exceptions.
   virtual int64_t getMemoryQuota() const = 0;
-  // Power users that want to explicitly modify the tree should get the root of
-  // the tree. Users opting to use this api needs to explicitly manage the life
-  // cycle of the memory pools by calling removeSelf() after use.
-  // TODO: perhaps the root pool should be a specialized pool that
-  //        * doesn't do allocation
-  //        * cannot be removed
+
+  /// Power users that want to explicitly modify the tree should get the root of
+  /// the tree.
+  ///
+  /// TODO: deprecate this API to disallow user to allocate from the root memory
+  /// pool directly.
   virtual MemoryPool& getRoot() const = 0;
 
-  // Adds a child pool to root for use. The actual return type is
-  // std::unique_ptr of a wrapper class that knows to remove itself.
-  virtual std::unique_ptr<ScopedMemoryPool> getScopedPool(
-      int64_t cap = kMaxMemory) = 0;
+  /// Adds a child pool to root for use.
+  virtual std::shared_ptr<MemoryPool> getChild(int64_t cap = kMaxMemory) = 0;
 
-  // Returns the current total memory usage under the MemoryManager.
+  /// Returns the current total memory usage under this memory manager.
   virtual int64_t getTotalBytes() const = 0;
-  // Reserves size for the allocation. Return a true if the total usage remains
-  // under quota after the reservation. Caller is responsible for releasing the
-  // offending reservation.
+
+  /// Reserves size for the allocation. Return a true if the total usage remains
+  /// under quota after the reservation. Caller is responsible for releasing the
+  /// offending reservation.
+  ///
+  /// TODO: deprecate this and enforce the memory usage quota by memory pool.
   virtual bool reserve(int64_t size) = 0;
-  // Subtracts from current total and regain memory quota.
+
+  /// Subtracts from current total and regain memory quota.
+  ///
+  /// TODO: deprecate this and enforce the memory usage quota by memory pool.
   virtual void release(int64_t size) = 0;
 };
 
-// For now, users wanting multiple different allocators would need to
-// instantiate different MemoryManager classes and manage them across
-// static boundaries.
-template <
-    typename Allocator = MemoryAllocator,
-    uint16_t ALIGNMENT = kNoAlignment>
+/// For now, users wanting multiple different allocators would need to
+/// instantiate different MemoryManager classes and manage them across static
+/// boundaries.
 class MemoryManager final : public IMemoryManager {
  public:
-  // Tries to get the process singleton manager. If not previously initialized,
-  // the process singleton manager will be initialized with the given quota.
-  FOLLY_EXPORT static MemoryManager<Allocator, ALIGNMENT>&
-  getProcessDefaultManager(
+  /// Tries to get the singleton memory manager. If not previously initialized,
+  /// the process singleton manager will be initialized with the given quota.
+  FOLLY_EXPORT static MemoryManager& getInstance(
       int64_t quota = kMaxMemory,
       bool ensureQuota = false) {
-    static MemoryManager<Allocator, ALIGNMENT> manager{
-        Allocator::createDefaultAllocator(), quota};
+    static MemoryManager manager{quota};
     auto actualQuota = manager.getMemoryQuota();
     VELOX_USER_CHECK(
         !ensureQuota || actualQuota == quota,
@@ -628,24 +458,25 @@ class MemoryManager final : public IMemoryManager {
     return manager;
   }
 
-  explicit MemoryManager(int64_t memoryQuota = kMaxMemory);
-
   explicit MemoryManager(
-      std::shared_ptr<Allocator> allocator,
-      int64_t memoryQuota = kMaxMemory);
+      int64_t memoryQuota = kMaxMemory,
+      MemoryAllocator* FOLLY_NONNULL allocator =
+          MemoryAllocator::getInstance());
+
   ~MemoryManager();
 
   int64_t getMemoryQuota() const final;
+
   MemoryPool& getRoot() const final;
 
-  std::unique_ptr<ScopedMemoryPool> getScopedPool(
-      int64_t cap = kMaxMemory) final;
+  std::shared_ptr<MemoryPool> getChild(int64_t cap = kMaxMemory) final;
 
   int64_t getTotalBytes() const final;
+
   bool reserve(int64_t size) final;
   void release(int64_t size) final;
 
-  Allocator& getAllocator();
+  MemoryAllocator& getAllocator();
 
  private:
   VELOX_FRIEND_TEST(MemoryPoolImplTest, CapSubtree);
@@ -655,353 +486,21 @@ class MemoryManager final : public IMemoryManager {
   VELOX_FRIEND_TEST(MultiThreadingUncappingTest, Flat);
   VELOX_FRIEND_TEST(MultiThreadingUncappingTest, SimpleTree);
 
-  std::shared_ptr<Allocator> allocator_;
+  MemoryAllocator* const FOLLY_NONNULL allocator_;
   const int64_t memoryQuota_;
+
   std::shared_ptr<MemoryPool> root_;
   mutable folly::SharedMutex mutex_;
   std::atomic_long totalBytes_{0};
 };
 
-template <typename Allocator, uint16_t ALIGNMENT>
-MemoryPoolImpl<Allocator, ALIGNMENT>::MemoryPoolImpl(
-    MemoryManager<Allocator, ALIGNMENT>& memoryManager,
-    const std::string& name,
-    std::weak_ptr<MemoryPool> parent,
-    int64_t cap)
-    : MemoryPoolBase{name, parent},
-      memoryManager_{memoryManager},
-      localMemoryUsage_{},
-      cap_{cap},
-      allocator_{memoryManager_.getAllocator()} {
-  VELOX_USER_CHECK_GT(cap, 0);
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-void* FOLLY_NULLABLE
-MemoryPoolImpl<Allocator, ALIGNMENT>::allocate(int64_t size) {
-    // 这是到达容量的意思吗
-  if (this->isMemoryCapped()) {
-    VELOX_MEM_MANUAL_CAP();
-  }
-  auto alignedSize = sizeAlign<ALIGNMENT>(ALIGNER<ALIGNMENT>{}, size);
-  reserve(alignedSize);
-  return allocAligned<ALIGNMENT>(ALIGNER<ALIGNMENT>{}, alignedSize);
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-void* FOLLY_NULLABLE MemoryPoolImpl<Allocator, ALIGNMENT>::allocateZeroFilled(
-    int64_t numMembers,
-    int64_t sizeEach) {
-  VELOX_USER_CHECK_EQ(sizeEach, 1);
-  auto alignedSize = sizeAlign<ALIGNMENT>(ALIGNER<ALIGNMENT>{}, numMembers);
-  if (this->isMemoryCapped()) {
-    VELOX_MEM_MANUAL_CAP();
-  }
-  reserve(alignedSize * sizeEach);
-  return allocator_.allocZeroFilled(alignedSize, sizeEach);
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-void* FOLLY_NULLABLE MemoryPoolImpl<Allocator, ALIGNMENT>::reallocate(
-    void* FOLLY_NULLABLE p,
-    int64_t size,
-    int64_t newSize) {
-  auto alignedSize = sizeAlign<ALIGNMENT>(ALIGNER<ALIGNMENT>{}, size);
-  auto alignedNewSize = sizeAlign<ALIGNMENT>(ALIGNER<ALIGNMENT>{}, newSize);
-  int64_t difference = alignedNewSize - alignedSize;
-  if (UNLIKELY(difference <= 0)) {
-    // Track and pretend the shrink took place for accounting purposes.
-    release(-difference, true);
-    return p;
-  }
-
-  reserve(difference);
-  void* newP = reallocAligned<ALIGNMENT>(
-      ALIGNER<ALIGNMENT>{}, p, alignedSize, alignedNewSize);
-  if (UNLIKELY(!newP)) {
-    free(p, alignedSize);
-    auto errorMessage = fmt::format(
-        MEM_CAP_EXCEEDED_ERROR_FORMAT,
-        succinctBytes(cap_),
-        succinctBytes(difference));
-    VELOX_MEM_CAP_EXCEEDED(errorMessage);
-  }
-
-  return newP;
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-void MemoryPoolImpl<Allocator, ALIGNMENT>::free(
-    void* FOLLY_NULLABLE p,
-    int64_t size) {
-  auto alignedSize = sizeAlign<ALIGNMENT>(ALIGNER<ALIGNMENT>{}, size);
-  allocator_.free(p, alignedSize);
-  release(alignedSize);
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-int64_t MemoryPoolImpl<Allocator, ALIGNMENT>::getCurrentBytes() const {
-  return getAggregateBytes();
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-int64_t MemoryPoolImpl<Allocator, ALIGNMENT>::getMaxBytes() const {
-    // 子树的最大还是自己的最大
-  return std::max(getSubtreeMaxBytes(), localMemoryUsage_.getMaxBytes());
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-void MemoryPoolImpl<Allocator, ALIGNMENT>::setMemoryUsageTracker(
-    const std::shared_ptr<MemoryUsageTracker>& tracker) {
-  const auto currentBytes = getCurrentBytes();
-  if (memoryUsageTracker_) {
-    memoryUsageTracker_->update(-currentBytes);
-  }
-  memoryUsageTracker_ = tracker;
-  memoryUsageTracker_->update(currentBytes);
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-const std::shared_ptr<MemoryUsageTracker>&
-MemoryPoolImpl<Allocator, ALIGNMENT>::getMemoryUsageTracker() const {
-  return memoryUsageTracker_;
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-void MemoryPoolImpl<Allocator, ALIGNMENT>::setSubtreeMemoryUsage(int64_t size) {
-  updateSubtreeMemoryUsage([size](MemoryUsage& subtreeUsage) {
-    subtreeUsage.setCurrentBytes(size);
-  });
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-int64_t MemoryPoolImpl<Allocator, ALIGNMENT>::updateSubtreeMemoryUsage(
-    int64_t size) {
-  int64_t aggregateBytes;
-  updateSubtreeMemoryUsage([&aggregateBytes, size](MemoryUsage& subtreeUsage) {
-    aggregateBytes = subtreeUsage.getCurrentBytes() + size;
-    subtreeUsage.setCurrentBytes(aggregateBytes);
-  });
-  return aggregateBytes;
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-int64_t MemoryPoolImpl<Allocator, ALIGNMENT>::getCap() const {
-  return cap_;
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-uint16_t MemoryPoolImpl<Allocator, ALIGNMENT>::getAlignment() const {
-  return ALIGNMENT;
-}
-// 冻结内存？
-template <typename Allocator, uint16_t ALIGNMENT>
-void MemoryPoolImpl<Allocator, ALIGNMENT>::capMemoryAllocation() {
-  capped_.store(true);
-  for (const auto& child : children_) {
-    child->capMemoryAllocation();
-  }
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-void MemoryPoolImpl<Allocator, ALIGNMENT>::uncapMemoryAllocation() {
-  // This means if we try to post-order traverse the tree like we do
-  // in MemoryManager, only parent has the right to lift the cap.
-  // This suffices because parent will then recursively lift the cap on the
-  // entire tree.
-  // 如果暂用的内存依然大于Cap，则不解冻
-  if (getAggregateBytes() > getCap()) {
-    return;
-  }
-  if (auto parentPtr = parent_.lock()) {
-    // 父节点还没有解冻，那么这里也直接返回
-    if (parentPtr->isMemoryCapped()) {
-      return;
-    }
-  }
-  capped_.store(false);
-  visitChildren([](MemoryPool* child) { child->uncapMemoryAllocation(); });
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-bool MemoryPoolImpl<Allocator, ALIGNMENT>::isMemoryCapped() const {
-  return capped_.load();
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-std::shared_ptr<MemoryPool> MemoryPoolImpl<Allocator, ALIGNMENT>::genChild(
-    std::weak_ptr<MemoryPool> parent,
-    const std::string& name,
-    int64_t cap) {
-  return std::make_shared<MemoryPoolImpl<Allocator, ALIGNMENT>>(
-      memoryManager_, name, parent, cap);
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-const MemoryUsage& MemoryPoolImpl<Allocator, ALIGNMENT>::getLocalMemoryUsage()
-    const {
-  return localMemoryUsage_;
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-int64_t MemoryPoolImpl<Allocator, ALIGNMENT>::getAggregateBytes() const {
-  int64_t aggregateBytes = localMemoryUsage_.getCurrentBytes();
-  accessSubtreeMemoryUsage([&aggregateBytes](const MemoryUsage& subtreeUsage) {
-    aggregateBytes += subtreeUsage.getCurrentBytes();
-  });
-  return aggregateBytes;
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-int64_t MemoryPoolImpl<Allocator, ALIGNMENT>::getSubtreeMaxBytes() const {
-  int64_t maxBytes;
-  accessSubtreeMemoryUsage([&maxBytes](const MemoryUsage& subtreeUsage) {
-    // TODO(lokax): 这个实现看起来不对?
-    maxBytes = subtreeUsage.getMaxBytes();
-  });
-  return maxBytes;
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-void MemoryPoolImpl<Allocator, ALIGNMENT>::accessSubtreeMemoryUsage(
-    std::function<void(const MemoryUsage&)> visitor) const {
-  folly::SharedMutex::ReadHolder readLock{subtreeUsageMutex_};
-  visitor(subtreeMemoryUsage_);
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-void MemoryPoolImpl<Allocator, ALIGNMENT>::updateSubtreeMemoryUsage(
-    std::function<void(MemoryUsage&)> visitor) {
-  folly::SharedMutex::WriteHolder writeLock{subtreeUsageMutex_};
-  visitor(subtreeMemoryUsage_);
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-void MemoryPoolImpl<Allocator, ALIGNMENT>::reserve(int64_t size) {
-  // 更新内存的使用情况统计数据
-  if (memoryUsageTracker_) {
-    memoryUsageTracker_->update(size);
-  }
-  localMemoryUsage_.incrementCurrentBytes(size);
-    // 如果没有超过内存配额
-  bool success = memoryManager_.reserve(size);
-  bool manualCap = isMemoryCapped();
-  int64_t aggregateBytes = getAggregateBytes();
-  if (UNLIKELY(!success || manualCap || aggregateBytes > cap_)) {
-    // NOTE: If we can make the reserve and release a single transaction we
-    // would have more accurate aggregates in intermediate states. However, this
-    // is low-pri because we can only have inflated aggregates, and be on the
-    // more conservative side.
-    release(size);
-    if (!success) {
-        // 超过配额
-      VELOX_MEM_MANAGER_CAP_EXCEEDED(memoryManager_.getMemoryQuota());
-    }
-    if (manualCap) {
-        // 手动冻结的情况
-      VELOX_MEM_MANUAL_CAP();
-    }
-    auto errorMessage = fmt::format(
-        MEM_CAP_EXCEEDED_ERROR_FORMAT,
-        succinctBytes(cap_),
-        succinctBytes(size));
-    VELOX_MEM_CAP_EXCEEDED(errorMessage);
-  }
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-void MemoryPoolImpl<Allocator, ALIGNMENT>::release(int64_t size, bool mock) {
-  memoryManager_.release(size);
-  localMemoryUsage_.incrementCurrentBytes(-size);
-  if (memoryUsageTracker_) {
-    memoryUsageTracker_->update(-size, mock);
-  }
-}
-
-namespace detail {
-static inline int64_t getTimeInUsec() {
-  return std::chrono::duration_cast<std::chrono::microseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
-}
-} // namespace detail
-
-template <typename Allocator, uint16_t ALIGNMENT>
-MemoryManager<Allocator, ALIGNMENT>::MemoryManager(int64_t memoryQuota)
-    : MemoryManager(Allocator::createDefaultAllocator(), memoryQuota) {}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-MemoryManager<Allocator, ALIGNMENT>::MemoryManager(
-    std::shared_ptr<Allocator> allocator,
-    int64_t memoryQuota)
-    : allocator_{std::move(allocator)},
-      memoryQuota_{memoryQuota},
-      root_{std::make_shared<MemoryPoolImpl<Allocator, ALIGNMENT>>(
-          *this,
-          kRootNodeName.str(),
-          std::weak_ptr<MemoryPool>(),
-          memoryQuota)} {
-  VELOX_USER_CHECK_GE(memoryQuota_, 0);
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-MemoryManager<Allocator, ALIGNMENT>::~MemoryManager() {
-  auto currentBytes = getTotalBytes();
-  if (currentBytes) {
-    LOG(INFO) << "Leaked total memory of " << currentBytes << " bytes.";
-  }
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-int64_t MemoryManager<Allocator, ALIGNMENT>::getMemoryQuota() const {
-  return memoryQuota_;
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-MemoryPool& MemoryManager<Allocator, ALIGNMENT>::getRoot() const {
-  return *root_;
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-std::unique_ptr<ScopedMemoryPool>
-MemoryManager<Allocator, ALIGNMENT>::getScopedPool(int64_t cap) {
-  auto& pool = root_->addChild(
-      fmt::format(
-          "default_usage_node_{}",
-          folly::to<std::string>(folly::Random::rand64())),
-      cap);
-  return std::make_unique<ScopedMemoryPool>(pool.getWeakPtr());
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-int64_t MemoryManager<Allocator, ALIGNMENT>::getTotalBytes() const {
-  return totalBytes_.load(std::memory_order_relaxed);
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-bool MemoryManager<Allocator, ALIGNMENT>::reserve(int64_t size) {
-  return totalBytes_.fetch_add(size, std::memory_order_relaxed) + size <=
-      memoryQuota_;
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-void MemoryManager<Allocator, ALIGNMENT>::release(int64_t size) {
-  totalBytes_.fetch_sub(size, std::memory_order_relaxed);
-}
-
-template <typename Allocator, uint16_t ALIGNMENT>
-Allocator& MemoryManager<Allocator, ALIGNMENT>::getAllocator() {
-  return *allocator_;
-}
-
 IMemoryManager& getProcessDefaultMemoryManager();
 
-// adds a new scoped child memory pool to the root
-// the new scoped child pool memory cap is set to the input value provided
-std::unique_ptr<ScopedMemoryPool> getDefaultScopedMemoryPool(
-    int64_t cap = kMaxMemory);
+/// Adds a new child memory pool to the root. The new child pool memory cap is
+/// set to the input value provided.
+std::shared_ptr<MemoryPool> getDefaultMemoryPool(int64_t cap = kMaxMemory);
 
-// Allocator that uses passed in memory pool to allocate memory.
+/// Allocator that uses passed in memory pool to allocate memory.
 template <typename T>
 class Allocator {
  public:

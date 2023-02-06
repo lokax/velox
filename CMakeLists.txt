@@ -20,6 +20,7 @@ project(velox)
 # Include our ThirdPartyToolchain dependencies macros
 include(ThirdpartyToolchain.cmake)
 
+set_with_default(VELOX_DEPENDENCY_SOURCE_DEFAULT VELOX_DEPENDENCY_SOURCE AUTO)
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 
 # Add all options below
@@ -31,7 +32,18 @@ option(
   VELOX_BUILD_MINIMAL
   "Build a minimal set of components only. This will override other build options."
   OFF)
-
+# option() always creats a BOOL variable so we have to use a normal cache
+# variable with STRING type for this option.
+#
+# * AUTO: Try SYSTEM first fall back to
+# * BUNDLED SYSTEM Use installed dependencies via find_package
+# * BUNDLED Build dependencies from source
+set(VELOX_DEPENDENCY_SOURCE
+    ${VELOX_DEPENDENCY_SOURCE_DEFAULT}
+    CACHE
+      STRING
+      "Default source for all dependencies with source builds enabled. AUTO SYSTEM BUNDLED"
+)
 option(VELOX_ENABLE_DUCKDB "Build duckDB to enable differential testing." ON)
 option(VELOX_ENABLE_EXEC "Build exec." ON)
 option(VELOX_ENABLE_AGGREGATES "Build aggregates." ON)
@@ -52,6 +64,7 @@ option(VELOX_ENABLE_HDFS "Build Hdfs Connector" OFF)
 option(VELOX_ENABLE_PARQUET "Enable Parquet support" OFF)
 option(VELOX_ENABLE_ARROW "Enable Arrow support" OFF)
 option(VELOX_BUILD_TEST_UTILS "Enable Velox test utilities" OFF)
+option(VELOX_BUILD_PYTHON_PACKAGE "Enable Velox Python bindings" OFF)
 
 if(${VELOX_BUILD_MINIMAL})
   # Enable and disable components for velox base build
@@ -95,6 +108,24 @@ if(${VELOX_ENABLE_BENCHMARKS} OR ${VELOX_ENABLE_BENCHMARKS_BASIC})
   set(VELOX_ENABLE_DUCKDB ON)
   set(VELOX_ENABLE_PARSE ON)
   set(VELOX_BUILD_TEST_UTILS ON)
+endif()
+
+if(${VELOX_BUILD_PYTHON_PACKAGE})
+  set(VELOX_BUILD_TESTING OFF)
+  set(VELOX_ENABLE_PRESTO_FUNCTIONS ON)
+  set(VELOX_ENABLE_DUCKDB OFF)
+  set(VELOX_ENABLE_EXPRESSION ON)
+  set(VELOX_ENABLE_PARSE OFF)
+  set(VELOX_ENABLE_EXEC OFF)
+  set(VELOX_ENABLE_AGGREGATES OFF)
+  set(VELOX_ENABLE_HIVE_CONNECTOR OFF)
+  set(VELOX_ENABLE_TPCH_CONNECTOR OFF)
+  set(VELOX_ENABLE_SPARK_FUNCTIONS OFF)
+  set(VELOX_ENABLE_EXAMPLES OFF)
+  set(VELOX_ENABLE_S3 OFF)
+  set(VELOX_ENABLE_SUBSTRAIT OFF)
+  set(VELOX_CODEGEN_SUPPORT OFF)
+  set(VELOX_ENABLE_BENCHMARKS_BASIC OFF)
 endif()
 
 if(VELOX_ENABLE_S3)
@@ -278,7 +309,14 @@ if(CMAKE_SYSTEM_NAME MATCHES "Darwin")
   link_directories("${ICU_INCLUDE_DIRS}/../lib")
 endif()
 
-set(folly_SOURCE AUTO)
+if(${VELOX_BUILD_PYTHON_PACKAGE})
+  set(pybind11_SOURCE AUTO)
+  resolve_dependency(pybind11 REQUIRED_VERSION 2.10.0)
+  add_subdirectory(pyvelox)
+endif()
+
+# Locate or build folly.
+set_source(folly)
 resolve_dependency(folly)
 
 set(FOLLY_WITH_DEPENDENCIES
@@ -306,7 +344,9 @@ endif()
 include_directories(SYSTEM ${FOLLY_INCLUDE_DIRS})
 
 if(NOT ${VELOX_BUILD_MINIMAL})
-  find_package(Protobuf 3.21.4 REQUIRED)
+  # Locate or build protobuf.
+  set_source(Protobuf)
+  resolve_dependency(Protobuf REQUIRED_VERSION 3.21.4)
 endif()
 
 # GCC needs to link a library to enable std::filesystem.

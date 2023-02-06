@@ -78,7 +78,7 @@ class HashTableTest : public testing::TestWithParam<bool> {
             buildType->childAt(channel), channel));
       }
       auto table = HashTable<true>::createForJoin(
-          std::move(keyHashers), dependentTypes, true, false, mappedMemory_);
+          std::move(keyHashers), dependentTypes, true, false, allocator_);
 
       makeRows(size, 1, sequence, buildType, batches);
       copyVectorsToTable(batches, startOffset, table.get());
@@ -152,7 +152,7 @@ class HashTableTest : public testing::TestWithParam<bool> {
     }
     static std::vector<std::unique_ptr<Aggregate>> empty;
     return HashTable<false>::createForAggregation(
-        std::move(keyHashers), empty, mappedMemory_);
+        std::move(keyHashers), empty, allocator_);
   }
 
   void insertGroups(
@@ -434,9 +434,8 @@ class HashTableTest : public testing::TestWithParam<bool> {
     topTable_->erase(folly::Range<char**>(toErase.data(), toErase.size()));
   }
 
-  std::unique_ptr<memory::MemoryPool> pool_{
-      memory::getDefaultScopedMemoryPool()};
-  memory::MappedMemory* mappedMemory_{memory::MappedMemory::getInstance()};
+  std::shared_ptr<memory::MemoryPool> pool_{memory::getDefaultMemoryPool()};
+  memory::MemoryAllocator* allocator_{memory::MemoryAllocator::getInstance()};
   std::unique_ptr<test::VectorMaker> vectorMaker_{
       std::make_unique<test::VectorMaker>(pool_.get())};
   // Bitmap of positions in batches_ that end up in the table.
@@ -518,7 +517,7 @@ TEST_P(HashTableTest, clear) {
       std::vector<TypePtr>{BIGINT()},
       BIGINT()));
   auto table = HashTable<true>::createForAggregation(
-      std::move(keyHashers), aggregates, mappedMemory_);
+      std::move(keyHashers), aggregates, allocator_);
   table->clear();
 }
 
@@ -585,6 +584,34 @@ TEST_P(HashTableTest, arrayProbeNormalizedKey) {
   }
 
   ASSERT_TRUE(table->hashMode() == BaseHashTable::HashMode::kNormalizedKey);
+}
+
+TEST_P(HashTableTest, regularHashingTableSize) {
+  keySpacing_ = 1000;
+  auto checkTableSize = [&](BaseHashTable::HashMode mode,
+                            const RowTypePtr& type) {
+    std::vector<std::unique_ptr<VectorHasher>> keyHashers;
+    for (auto channel = 0; channel < type->size(); ++channel) {
+      keyHashers.emplace_back(
+          std::make_unique<VectorHasher>(type->childAt(channel), channel));
+    }
+    auto table = HashTable<true>::createForJoin(
+        std::move(keyHashers), {}, true, false, allocator_);
+    std::vector<RowVectorPtr> batches;
+    makeRows(1 << 12, 1, 0, type, batches);
+    copyVectorsToTable(batches, 0, table.get());
+    table->prepareJoinTable({}, executor_.get());
+    ASSERT_EQ(table->hashMode(), mode);
+    EXPECT_GE(table->rehashSize(), table->numDistinct());
+  };
+  {
+    auto type = ROW({"key"}, {ROW({"k1"}, {BIGINT()})});
+    checkTableSize(BaseHashTable::HashMode::kHash, type);
+  }
+  {
+    auto type = ROW({"k1", "k2"}, {BIGINT(), BIGINT()});
+    checkTableSize(BaseHashTable::HashMode::kNormalizedKey, type);
+  }
 }
 
 VELOX_INSTANTIATE_TEST_SUITE_P(

@@ -17,6 +17,7 @@
 #include "velox/exec/Operator.h"
 
 namespace facebook::velox::exec {
+// Unnest算子实现
 class Unnest : public Operator {
  public:
   Unnest(
@@ -24,10 +25,12 @@ class Unnest : public Operator {
       DriverCtx* driverCtx,
       const std::shared_ptr<const core::UnnestNode>& unnestNode);
 
+    // 不阻塞
   BlockingReason isBlocked(ContinueFuture* /*future*/) override {
     return BlockingReason::kNotBlocked;
   }
 
+    // 需要输入
   bool needsInput() const override {
     return true;
   }

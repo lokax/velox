@@ -35,16 +35,16 @@ DriverCtx::DriverCtx(
       pipelineId(_pipelineId),
       splitGroupId(_splitGroupId),
       partitionId(_partitionId),
-      task(_task),
-      pool(task->addDriverPool(pipelineId, driverId)) {}
+      task(_task) {}
 
 const core::QueryConfig& DriverCtx::queryConfig() const {
   return task->queryCtx()->config();
 }
 
-velox::memory::MemoryPool* FOLLY_NONNULL
-DriverCtx::addOperatorPool(const std::string& operatorType) {
-  return task->addOperatorPool(pool, operatorType);
+velox::memory::MemoryPool* FOLLY_NONNULL DriverCtx::addOperatorPool(
+    const core::PlanNodeId& planNodeId,
+    const std::string& operatorType) {
+  return task->addOperatorPool(planNodeId, pipelineId, operatorType);
 }
 
 std::atomic_uint64_t BlockingState::numBlockedDrivers_{0};
@@ -196,8 +196,7 @@ void Driver::pushdownFilters(int operatorIndex) {
     return;
   }
     // 统计数据？
-  op->stats().addRuntimeStat(
-      "dynamicFiltersProduced", RuntimeCounter(filters.size()));
+  op->addRuntimeStat("dynamicFiltersProduced", RuntimeCounter(filters.size()));
 
   // Walk operator list upstream and find a place to install the filters.
   for (const auto& entry : filters) {
@@ -215,8 +214,7 @@ void Driver::pushdownFilters(int operatorIndex) {
             "Cannot push down dynamic filters produced by {}",
             op->toString());
         prevOp->addDynamicFilter(channel, entry.second);
-        prevOp->stats().addRuntimeStat(
-            "dynamicFiltersAccepted", RuntimeCounter(1));
+        prevOp->addRuntimeStat("dynamicFiltersAccepted", RuntimeCounter(1));
         break;
       }
 
@@ -229,8 +227,7 @@ void Driver::pushdownFilters(int operatorIndex) {
             "Cannot push down dynamic filters produced by {}",
             op->toString());
         prevOp->addDynamicFilter(channel, entry.second);
-        prevOp->stats().addRuntimeStat(
-            "dynamicFiltersAccepted", RuntimeCounter(1));
+        prevOp->addRuntimeStat("dynamicFiltersAccepted", RuntimeCounter(1));
         break;
       }
 
@@ -298,7 +295,7 @@ StopReason Driver::runInternal(
   // been deleted.
   if (curOpIndex_ < operators_.size()) {
     // 当前CurOpIndex算子是阻塞的？
-    operators_[curOpIndex_]->stats().addRuntimeStat(
+    operators_[curOpIndex_]->addRuntimeStat(
         "queuedWallNanos",
         RuntimeCounter(queuedTime, RuntimeCounter::Unit::kNanos));
   }
@@ -318,11 +315,6 @@ StopReason Driver::runInternal(
     }
     close();
   });
-
-  // Ensure we remove the writer we might have set when we exit this function in
-  // any way.
-  const auto statWriterGuard =
-      folly::makeGuard([]() { setRunTimeStatWriter(nullptr); });
 
   try {
     // 算子的数量
@@ -345,11 +337,8 @@ StopReason Driver::runInternal(
         // In case we are blocked, this index will point to the operator, whose
         // queuedTime we should update.
         curOpIndex_ = i;
-        // Set up the runtime stats writer with the current operator, whose
-        // runtime stats would be updated (for instance time taken to load lazy
-        // vectors).
-        setRunTimeStatWriter(std::make_unique<OperatorRuntimeStatWriter>(op));
-        // 检查当前算子阻塞原因
+        RuntimeStatWriterScopeGuard statsWriterGuard(op);
+
         blockingReason_ = op->isBlocked(&future);
         // 如果算子发生了阻塞
         if (blockingReason_ != BlockingReason::kNotBlocked) {
@@ -365,6 +354,7 @@ StopReason Driver::runInternal(
         if (i < operators_.size() - 1) {
             // 获取下一个算子
           nextOp = operators_[i + 1].get();
+          RuntimeStatWriterScopeGuard statsWriterGuard(nextOp);
           // 检查下一个算子的阻塞原因
           blockingReason_ = nextOp->isBlocked(&future);
           if (blockingReason_ != BlockingReason::kNotBlocked) {
@@ -379,26 +369,41 @@ StopReason Driver::runInternal(
             uint64_t resultBytes = 0;
             RowVectorPtr result;
             {
-              auto timer = cpuWallTimer(op->stats().getOutputTiming);
+              auto timer = createDeltaCpuWallTimer(
+                  [op](const CpuWallTiming& deltaTiming) {
+                    op->stats().wlock()->getOutputTiming.add(deltaTiming);
+                  });
+              RuntimeStatWriterScopeGuard statsWriterGuard(op);
               result = op->getOutput();
               if (result) {
                 VELOX_CHECK(
                     result->size() > 0,
-                    "Operator::getOutput() must return nullptr or a non-empty vector: {}",
-                    op->stats().operatorType);
-                op->stats().outputVectors += 1;
-                op->stats().outputPositions += result->size();
+                    "Operator::getOutput() must return nullptr or "
+                    "a non-empty vector: {}",
+                    op->operatorType());
                 resultBytes = result->estimateFlatSize();
-                op->stats().outputBytes += resultBytes;
+                {
+                  auto lockedStats = op->stats().wlock();
+                  lockedStats->outputVectors += 1;
+                  lockedStats->outputPositions += result->size();
+                  lockedStats->outputBytes += resultBytes;
+                }
               }
             }
             pushdownFilters(i);
             // 如果当前算子有输出
             if (result) {
-              auto timer = cpuWallTimer(op->stats().addInputTiming);
-              nextOp->stats().inputVectors += 1;
-              nextOp->stats().inputPositions += result->size();
-              nextOp->stats().inputBytes += resultBytes;
+              auto timer = createDeltaCpuWallTimer(
+                  [nextOp](const CpuWallTiming& timing) {
+                    nextOp->stats().wlock()->addInputTiming.add(timing);
+                  });
+              {
+                auto lockedStats = nextOp->stats().wlock();
+                lockedStats->inputVectors += 1;
+                lockedStats->inputPositions += result->size();
+                lockedStats->inputBytes += resultBytes;
+              }
+              RuntimeStatWriterScopeGuard statsWriterGuard(nextOp);
               // 把输出结果添加到下一个算子上的输入上
               nextOp->addInput(result);
               // The next iteration will see if operators_[i + 1] has
@@ -427,8 +432,13 @@ StopReason Driver::runInternal(
                 guard.notThrown();
                 return StopReason::kBlock;
               }
+              RuntimeStatWriterScopeGuard statsWriterGuard(op);
               if (op->isFinished()) {
-                auto timer = cpuWallTimer(op->stats().finishTiming);
+                auto timer =
+                    createDeltaCpuWallTimer([op](const CpuWallTiming& timing) {
+                      op->stats().wlock()->finishTiming.add(timing);
+                    });
+                RuntimeStatWriterScopeGuard statsWriterGuard(nextOp);
                 nextOp->noMoreInput();
                 break;
               }
@@ -440,13 +450,23 @@ StopReason Driver::runInternal(
           // this will be detected when trying to add input, and we
           // will come back here after this is again on thread.
           {
-            auto timer = cpuWallTimer(op->stats().getOutputTiming);
+            auto timer =
+                createDeltaCpuWallTimer([op](const CpuWallTiming& timing) {
+                  op->stats().wlock()->getOutputTiming.add(timing);
+                });
             result = op->getOutput();
             if (result) {
               VELOX_CHECK(
                   result->size() > 0,
-                  "Operator::getOutput() must return nullptr or a non-empty vector: {}",
-                  op->stats().operatorType);
+                  "Operator::getOutput() must return nullptr or "
+                  "a non-empty vector: {}",
+                  op->operatorType());
+              {
+                auto lockedStats = op->stats().wlock();
+                lockedStats->outputVectors += 1;
+                lockedStats->outputPositions += result->size();
+                lockedStats->outputBytes += result->estimateFlatSize();
+              }
 
               // This code path is used only in single-threaded execution.
               blockingReason_ = BlockingReason::kWaitForConsumer;
@@ -520,21 +540,21 @@ void Driver::run(std::shared_ptr<Driver> self) {
 
 void Driver::initializeOperatorStats(std::vector<OperatorStats>& stats) {
   stats.resize(operators_.size(), OperatorStats(0, 0, "", ""));
-  // initialize the place in stats given by the operatorId. Use the
+  // Initialize the place in stats given by the operatorId. Use the
   // operatorId instead of i as the index to document the usage. The
   // operators are sequentially numbered but they could be reordered
   // in the pipeline later, so the ordinal position of the Operator is
   // not always the index into the stats.
   for (auto& op : operators_) {
-    auto id = op->stats().operatorId;
+    auto id = op->operatorId();
     assert(id < stats.size());
-    stats[id] = op->stats();
+    stats[id] = op->stats(false);
   }
 }
 
 void Driver::addStatsToTask() {
   for (auto& op : operators_) {
-    auto& stats = op->stats();
+    auto stats = op->stats(true);
     stats.memoryStats.update(op->pool()->getMemoryUsageTracker());
     stats.numDrivers = 1;
     task()->addOperatorStats(stats);

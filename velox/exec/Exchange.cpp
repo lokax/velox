@@ -171,6 +171,7 @@ class LocalExchangeSource : public ExchangeSource {
   static constexpr uint64_t kMaxBytes = 32 * 1024 * 1024; // 32 MB
 };
 
+// 创建本地ExchangeSource
 std::unique_ptr<ExchangeSource> createLocalExchangeSource(
     const std::string& taskId,
     int destination,
@@ -185,6 +186,7 @@ std::unique_ptr<ExchangeSource> createLocalExchangeSource(
 
 } // namespace
 
+// 设置内存池
 void ExchangeClient::initialize(memory::MemoryPool* FOLLY_NONNULL pool) {
   pool_ = pool;
 }
@@ -201,9 +203,11 @@ void ExchangeClient::addRemoteTaskId(const std::string& taskId) {
       // and the task updates have no guarantees of arriving in order.
       return;
     }
+    // 创建source
     auto source = ExchangeSource::create(taskId, destination_, queue_, pool_);
 
     if (closed_) {
+        // 如果已经关闭，移动给toCloses?
       toClose = std::move(source);
     } else {
       sources_.push_back(source);
@@ -312,12 +316,13 @@ bool Exchange::getSplits(ContinueFuture* FOLLY_NONNULL future) {
             split.connectorSplit);
         VELOX_CHECK(remoteSplit, "Wrong type of split");
         exchangeClient_->addRemoteTaskId(remoteSplit->taskId);
-        ++stats_.numSplits;
+        ++stats_.wlock()->numSplits;
       } else {
         exchangeClient_->noMoreRemoteTasks();
         noMoreSplits_ = true;
         if (atEnd_) {
-          operatorCtx_->task()->multipleSplitsFinished(stats_.numSplits);
+          operatorCtx_->task()->multipleSplitsFinished(
+              stats_.rlock()->numSplits);
         }
         return false;
       }
@@ -343,7 +348,8 @@ BlockingReason Exchange::isBlocked(ContinueFuture* FOLLY_NONNULL future) {
   currentPage_ = exchangeClient_->next(&atEnd_, &dataFuture);
   if (currentPage_ || atEnd_) {
     if (atEnd_ && noMoreSplits_) {
-      operatorCtx_->task()->multipleSplitsFinished(stats_.numSplits);
+      const auto numSplits = stats_.rlock()->numSplits;
+      operatorCtx_->task()->multipleSplitsFinished(numSplits);
     }
     return BlockingReason::kNotBlocked;
   }
@@ -361,8 +367,8 @@ BlockingReason Exchange::isBlocked(ContinueFuture* FOLLY_NONNULL future) {
     // Block until data becomes available.
     *future = std::move(dataFuture);
   }
-  return stats_.numSplits == 0 ? BlockingReason::kWaitForSplit
-                               : BlockingReason::kWaitForExchange;
+  return stats_.rlock()->numSplits == 0 ? BlockingReason::kWaitForSplit
+                                        : BlockingReason::kWaitForExchange;
 }
 
 bool Exchange::isFinished() {
@@ -374,17 +380,22 @@ RowVectorPtr Exchange::getOutput() {
     return nullptr;
   }
 
+  uint64_t rawInputBytes{0};
   if (!inputStream_) {
     inputStream_ = std::make_unique<ByteStream>();
-    stats_.rawInputBytes += currentPage_->size();
+    rawInputBytes += currentPage_->size();
     currentPage_->prepareStreamForDeserialize(inputStream_.get());
   }
 
   VectorStreamGroup::read(
       inputStream_.get(), operatorCtx_->pool(), outputType_, &result_);
 
-  stats_.inputPositions += result_->size();
-  stats_.inputBytes += result_->retainedSize();
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->rawInputBytes += rawInputBytes;
+    lockedStats->inputPositions += result_->size();
+    lockedStats->inputBytes += result_->retainedSize();
+  }
 
   if (inputStream_->atEnd()) {
     currentPage_ = nullptr;

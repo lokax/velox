@@ -26,6 +26,7 @@ BlockingReason Destination::advance(
     PartitionedOutputBufferManager& bufferManager,
     bool* atEnd,
     ContinueFuture* future) {
+        // 结束了
   if (row_ >= rows_.size()) {
     *atEnd = true;
     return BlockingReason::kNotBlocked;
@@ -63,7 +64,7 @@ void Destination::serialize(
     vector_size_t begin,
     vector_size_t end) {
   if (!current_) {
-    current_ = std::make_unique<VectorStreamGroup>(memory_);
+    current_ = std::make_unique<VectorStreamGroup>(allocator_);
     auto rowType = std::dynamic_pointer_cast<const RowType>(output->type());
     vector_size_t numRows = 0;
     for (vector_size_t i = begin; i < end; i++) {
@@ -84,7 +85,7 @@ BlockingReason Destination::flush(
   constexpr int32_t kMinMessageSize = 128;
   auto listener = bufferManager.newListener();
   IOBufOutputStream stream(
-      *current_->mappedMemory(),
+      *current_->allocator(),
       listener.get(),
       std::max<int64_t>(kMinMessageSize, current_->size()));
   current_->flush(&stream);
@@ -100,8 +101,10 @@ BlockingReason Destination::flush(
 }
 
 void PartitionedOutput::initializeInput(RowVectorPtr input) {
+    // 移动
   input_ = std::move(input);
   if (outputChannels_.empty()) {
+    // 直接设置输出
     output_ = input_;
   } else {
     std::vector<VectorPtr> outputColumns;
@@ -109,7 +112,7 @@ void PartitionedOutput::initializeInput(RowVectorPtr input) {
     for (auto& i : outputChannels_) {
       outputColumns.push_back(input_->childAt(i));
     }
-
+    // 创建
     output_ = std::make_shared<RowVector>(
         input_->pool(),
         outputType_,
@@ -125,7 +128,7 @@ void PartitionedOutput::initializeDestinations() {
     auto taskId = operatorCtx_->taskId();
     for (int i = 0; i < numDestinations_; ++i) {
       destinations_.push_back(
-          std::make_unique<Destination>(taskId, i, mappedMemory_));
+          std::make_unique<Destination>(taskId, i, allocator_));
     }
   }
 }
@@ -160,8 +163,11 @@ void PartitionedOutput::estimateRowSizes() {
 
 void PartitionedOutput::addInput(RowVectorPtr input) {
   // TODO Report outputBytes as bytes after serialization
-  stats_.outputBytes += input->retainedSize();
-  stats_.outputPositions += input->size();
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->outputBytes += input->retainedSize();
+    lockedStats->outputPositions += input->size();
+  }
 
   initializeInput(std::move(input));
 
@@ -179,13 +185,16 @@ void PartitionedOutput::addInput(RowVectorPtr input) {
   if (numDestinations_ == 1) {
     destinations_[0]->addRows(IndexRange{0, numInput});
   } else {
+    // 分区
     partitionFunction_->partition(*input_, partitions_);
     if (replicateNullsAndAny_) {
+        // 收集null行
       collectNullRows();
 
       vector_size_t start = 0;
       if (!replicatedAny_) {
         for (auto& destination : destinations_) {
+            // 这是？
           destination->addRow(0);
         }
         replicatedAny_ = true;
@@ -194,6 +203,7 @@ void PartitionedOutput::addInput(RowVectorPtr input) {
       }
       for (auto i = start; i < numInput; ++i) {
         if (nullRows_.isValid(i)) {
+            // 每个目标都添加
           for (auto& destination : destinations_) {
             destination->addRow(i);
           }
@@ -222,6 +232,7 @@ void PartitionedOutput::collectNullRows() {
   for (auto i : keyChannels_) {
     auto& keyVector = input_->childAt(i);
     if (keyVector->mayHaveNulls()) {
+        // 解码
       decodedVectors_[i].decode(*keyVector, rows_);
       if (auto* rawNulls = decodedVectors_[i].nulls()) {
         bits::orWithNegatedBits(
@@ -239,6 +250,7 @@ RowVectorPtr PartitionedOutput::getOutput() {
 
   blockingReason_ = BlockingReason::kNotBlocked;
   Destination* blockedDestination = nullptr;
+  // 获取
   auto bufferManager = bufferManager_.lock();
   VELOX_CHECK_NOT_NULL(
       bufferManager, "PartitionedOutputBufferManager was already destructed");
@@ -246,6 +258,7 @@ RowVectorPtr PartitionedOutput::getOutput() {
   bool workLeft;
   do {
     workLeft = false;
+    // 遍历每个目的地
     for (auto& destination : destinations_) {
       bool atEnd = false;
       blockingReason_ = destination->advance(

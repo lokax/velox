@@ -39,7 +39,7 @@ Values::Values(
     }
   }
 }
-
+// 返回行向量
 RowVectorPtr Values::getOutput() {
   TestValue::adjust("facebook::velox::exec::Values::getOutput", &current_);
   if (current_ >= values_.size()) {

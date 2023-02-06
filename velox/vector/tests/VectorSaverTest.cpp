@@ -15,6 +15,7 @@
  */
 #include "velox/vector/VectorSaver.h"
 #include <fstream>
+#include "velox/common/base/Fs.h"
 #include "velox/exec/tests/utils/TempDirectoryPath.h"
 #include "velox/exec/tests/utils/TempFilePath.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
@@ -94,7 +95,9 @@ class VectorSaverTest : public testing::Test, public VectorTestBase {
     testRoundTrip(fuzzer.fuzzFlat(type));
   }
 
-  void testRoundTrip(const VectorPtr& vector) {
+  // Writes the passed vector to file and reads it back, returns the read
+  // vector.
+  VectorPtr takeRoundTrip(const VectorPtr& vector) {
     auto path = exec::test::TempFilePath::create();
 
     std::ofstream outputFile(path->path, std::ofstream::binary);
@@ -104,7 +107,11 @@ class VectorSaverTest : public testing::Test, public VectorTestBase {
     std::ifstream inputFile(path->path, std::ifstream::binary);
     auto copy = restoreVector(inputFile, pool());
     inputFile.close();
+    return copy;
+  }
 
+  void testRoundTrip(const VectorPtr& vector) {
+    auto copy = takeRoundTrip(vector);
     // Verify encodings and data recursively.
     assertEqualEncodings(vector, copy);
   }
@@ -144,6 +151,46 @@ class VectorSaverTest : public testing::Test, public VectorTestBase {
         10'000, [](auto row) { return row; }, nullEvery(17)));
   }
 
+  // Verifies that the lazy vectors have the right internal state and loaded
+  // vector (if already loaded).
+  void assertEqualLazyVectors(
+      const VectorPtr& expected,
+      const VectorPtr& actual,
+      const SelectivityVector& rows) {
+    // Verify encoding of Lazy.
+    ASSERT_EQ(expected->encoding(), actual->encoding());
+    ASSERT_EQ(*expected->type(), *actual->type());
+    ASSERT_EQ(expected->size(), actual->size());
+
+    // Verify whether the loaded vector is present.
+    ASSERT_EQ(isLazyNotLoaded(*expected), isLazyNotLoaded(*actual));
+    if (!isLazyNotLoaded(*actual)) {
+      // Check only the rows loaded.
+      assertEqualVectors(expected, actual, rows);
+    }
+  }
+
+  // Test round trip of lazy vector both with and without loading. The vector
+  // gets loaded with a randomly generated selectivity vector.
+  void testRoundTripOfLazy(VectorPtr vector, VectorFuzzer& fuzzer) {
+    SelectivityVector rows(vector->size());
+    auto copy = takeRoundTrip(vector);
+    assertEqualLazyVectors(vector, copy, rows);
+
+    // Verify loaded lazy vector makes the round trip by loading it for a
+    // random set of rows.
+    for (int i = 0; i < vector->size(); ++i) {
+      if (fuzzer.coinToss(0.3)) {
+        rows.setValid(i, false);
+      }
+    }
+    rows.updateBounds();
+    LazyVector::ensureLoadedRows(vector, rows);
+    copy = takeRoundTrip(vector);
+    LazyVector::ensureLoadedRows(copy, rows);
+    assertEqualLazyVectors(vector, copy, rows);
+  }
+
   const uint32_t seed_{folly::Random::rand32()};
 };
 
@@ -163,6 +210,7 @@ TEST_F(VectorSaverTest, types) {
 
   testTypeRoundTrip(TIMESTAMP());
   testTypeRoundTrip(DATE());
+  testTypeRoundTrip(INTERVAL_DAY_TIME());
 
   testTypeRoundTrip(ARRAY(BIGINT()));
   testTypeRoundTrip(ARRAY(ARRAY(VARCHAR())));
@@ -233,6 +281,11 @@ TEST_F(VectorSaverTest, flatVarchar) {
   opts.stringLength = 6;
   opts.vectorSize = 1024;
   testRoundTrip(opts, VARCHAR());
+}
+
+TEST_F(VectorSaverTest, flatIntervalDayTime) {
+  VectorFuzzer::Options opts = fuzzerOptions();
+  testRoundTrip(opts, INTERVAL_DAY_TIME());
 }
 
 TEST_F(VectorSaverTest, row) {
@@ -454,6 +507,37 @@ TEST_F(VectorSaverTest, dictionaryRow) {
   testRoundTrip(fuzzer.fuzzDictionary(fuzzer.fuzzDictionary(flatVector)));
 }
 
+TEST_F(VectorSaverTest, LazyVector) {
+  auto opts = fuzzerOptions();
+  opts.nullRatio = 0.5;
+  SCOPED_TRACE(fmt::format("seed: {}", seed_));
+
+  VectorFuzzer fuzzer(opts, pool(), seed_);
+  auto flatVector =
+      fuzzer.fuzzFlat(ROW({"a", "b", "c"}, {INTEGER(), REAL(), BOOLEAN()}));
+
+  testRoundTripOfLazy(
+      fuzzer.wrapInLazyVector(fuzzer.fuzzDictionary(flatVector)), fuzzer);
+  testRoundTripOfLazy(
+      fuzzer.wrapInLazyVector(fuzzer.fuzzDictionary(flatVector, 64)), fuzzer);
+  testRoundTripOfLazy(
+      fuzzer.wrapInLazyVector(fuzzer.fuzzDictionary(flatVector, 512)), fuzzer);
+
+  // 2 levels of dictionary.
+  testRoundTripOfLazy(
+      fuzzer.wrapInLazyVector(
+          fuzzer.fuzzDictionary(fuzzer.fuzzDictionary(flatVector))),
+      fuzzer);
+}
+
+TEST_F(VectorSaverTest, stdVector) {
+  std::vector<column_index_t> intVector = {1, 2, 3, 4, 5};
+  auto path = exec::test::TempFilePath::create();
+  saveStdVectorToFile<column_index_t>(intVector, path->path.c_str());
+  auto copy = restoreStdVectorFromFile<column_index_t>(path->path.c_str());
+  ASSERT_EQ(intVector, copy);
+}
+
 namespace {
 struct VectorSaverInfo {
   // Path to directory where to store the vector.
@@ -472,7 +556,7 @@ TEST_F(VectorSaverTest, exceptionContext) {
   auto messageFunction = [](VeloxException::Type /*exceptionType*/,
                             auto* arg) -> std::string {
     auto* info = static_cast<VectorSaverInfo*>(arg);
-    auto filePath = generateFilePath(info->path, "vector");
+    auto filePath = common::generateTempFilePath(info->path, "vector");
     if (!filePath.has_value()) {
       return "Cannot generate file path to store the vector.";
     }

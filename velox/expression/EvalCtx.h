@@ -41,16 +41,18 @@ class EvalCtx {
   /// For testing only.
   explicit EvalCtx(core::ExecCtx* FOLLY_NONNULL execCtx);
 
+    // 返回rowVector
   const RowVector* FOLLY_NONNULL row() const {
     return row_;
   }
 
+    // 如果rowVector中的所有输入向量都是flat或者constant，且没有NULL值
   /// Returns true if all input vectors in 'row' are flat or constant and have
   /// no nulls.
   bool inputFlatNoNulls() const {
     return inputFlatNoNulls_;
   }
-
+    // 返回内存池，和execCtx的内存池一样
   memory::MemoryPool* FOLLY_NONNULL pool() const {
     return execCtx_->pool();
   }
@@ -62,6 +64,7 @@ class EvalCtx {
 
   VectorPtr ensureFieldLoaded(int32_t index, const SelectivityVector& rows);
 
+    // 设置被剥离的向量？
   void setPeeled(int32_t index, const VectorPtr& vector) {
     if (peeledFields_.size() <= index) {
       peeledFields_.resize(index + 1);
@@ -96,6 +99,7 @@ class EvalCtx {
       try {
         func(row);
       } catch (const std::exception& e) {
+        // 不抛异常，设置错误
         setError(row, std::current_exception());
       }
     });
@@ -115,6 +119,22 @@ class EvalCtx {
       vector_size_t index,
       const std::exception_ptr& exceptionPtr,
       ErrorVectorPtr& errorsPtr) const;
+
+  /// Copy std::exception_ptr in fromErrors at rows to the corresponding rows in
+  /// toErrors. If there are existing exceptions in toErrors, these exceptions
+  /// are preserved and those at the corresponding rows in fromErrors are
+  /// ignored.
+  void addErrors(
+      const SelectivityVector& rows,
+      const ErrorVectorPtr& fromErrors,
+      ErrorVectorPtr& toErrors) const;
+
+  // Given a mapping from element rows to top-level rows, add element-level
+  // errors in errors_ to topLevelErrors.
+  void addElementErrorsToTopLevel(
+      const SelectivityVector& elementRows,
+      const BufferPtr& elementToTopLevelRows,
+      ErrorVectorPtr& topLevelErrors);
 
   // Returns the vector of errors or nullptr if no errors. This is
   // intentionally a raw pointer to signify that the caller may not
@@ -184,11 +204,12 @@ class EvalCtx {
     return wrapEncoding_;
   }
 
+    // 设置常量包装？
   void setConstantWrap(vector_size_t wrapIndex) {
     wrapEncoding_ = VectorEncoding::Simple::CONSTANT;
     constantWrapIndex_ = wrapIndex;
   }
-
+    // 设置字典包装
   void setDictionaryWrap(BufferPtr wrap, BufferPtr wrapNulls) {
     wrapEncoding_ = VectorEncoding::Simple::DICTIONARY;
     wrap_ = std::move(wrap);
@@ -215,11 +236,12 @@ class EvalCtx {
   VectorPool& vectorPool() const {
     return execCtx_->vectorPool();
   }
-
+    // 从向量池中获取某个向量
   VectorPtr getVector(const TypePtr& type, vector_size_t size) {
     return execCtx_->getVector(type, size);
   }
 
+    // 释放向量
   bool releaseVector(VectorPtr& vector) {
     return execCtx_->releaseVector(vector);
   }

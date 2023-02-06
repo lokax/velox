@@ -14,10 +14,14 @@
 
 add_library(
   velox_dwio_native_parquet_reader
+  NestedStructureDecoder.cpp
   ParquetReader.cpp
+  ParquetTypeWithId.cpp
   PageReader.cpp
-  ParquetData.cpp
   ParquetColumnReader.cpp
+  ParquetData.cpp
+  RepeatedColumnReader.cpp
+  RleBpDecoder.cpp
   Statistics.cpp
   StructColumnReader.cpp
   StringColumnReader.cpp)
@@ -28,5 +32,6 @@ target_link_libraries(
   velox_type
   velox_dwio_common
   arrow
+  parquet
   thrift
   ${FMT})

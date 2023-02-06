@@ -18,13 +18,13 @@
 #include "velox/expression/FunctionSignature.h"
 #include "velox/vector/FlatVector.h"
 
-namespace facebook::velox::window {
+namespace facebook::velox::window::prestosql {
 
 namespace {
 
 class CumeDistFunction : public exec::WindowFunction {
  public:
-  explicit CumeDistFunction() : WindowFunction(DOUBLE(), nullptr) {}
+  explicit CumeDistFunction() : WindowFunction(DOUBLE(), nullptr, nullptr) {}
 
   void resetPartition(const exec::WindowPartition* partition) override {
     runningTotal_ = 0;
@@ -76,9 +76,10 @@ void registerCumeDist(const std::string& name) {
       [name](
           const std::vector<exec::WindowFunctionArg>& /*args*/,
           const TypePtr& /*resultType*/,
-          velox::memory::MemoryPool* /*pool*/)
+          velox::memory::MemoryPool* /*pool*/,
+          HashStringAllocator* /*stringAllocator*/)
           -> std::unique_ptr<exec::WindowFunction> {
         return std::make_unique<CumeDistFunction>();
       });
 }
-} // namespace facebook::velox::window
+} // namespace facebook::velox::window::prestosql

@@ -41,7 +41,7 @@ class AbstractInputStreamHolder {
 };
 
 // Function type for making copies of InputStream for running
-// parammel loads. We cannot pass the one non-owned InputStream to
+// parallel loads. We cannot pass the one non-owned InputStream to
 // other threads because the BufferedInput and its owner could be
 // destroyed out of sequence and the streams are owned via
 // unique_ptr. TODO: Make all streams owned via shared_ptr.
@@ -118,7 +118,11 @@ class CachedBufferedInput : public BufferedInput {
   std::unique_ptr<SeekableInputStream>
   read(uint64_t offset, uint64_t length, LogType logType) const override;
 
-  bool shouldPreload() override;
+  /// Schedules load of 'region' on 'executor_'. Fails silently if no memory or
+  /// if shouldPreload() is false.
+  bool prefetch(Region region);
+
+  bool shouldPreload(int32_t numPages = 0) override;
 
   bool shouldPrefetchStripes() const override {
     return true;

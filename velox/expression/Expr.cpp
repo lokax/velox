@@ -19,6 +19,7 @@
 #include <fstream>
 
 #include "velox/common/base/Exceptions.h"
+#include "velox/common/base/Fs.h"
 #include "velox/common/base/SuccinctPrinter.h"
 #include "velox/core/Expressions.h"
 #include "velox/expression/ConstantExpr.h"
@@ -178,11 +179,11 @@ bool Expr::allSupportFlatNoNullsFastPath(
 }
 // 计算元数据
 void Expr::computeMetadata() {
-  // Sets propagatesNulls if all subtrees propagate nulls.
-  // Sets isDeterministic to false if some subtree is non-deterministic.
-  // Sets 'distinctFields_' to be the union of 'distinctFields_' of inputs.
-  // If one of the inputs has the identical set of distinct fields, then
-  // the input's distinct fields are set to empty.
+  // Sets propagatesNulls if all subtrees that depend on at least one input
+  // field propagate nulls. Sets isDeterministic to false if some subtree is
+  // non-deterministic. Sets 'distinctFields_' to be the union of
+  // 'distinctFields_' of inputs. If one of the inputs has the identical set of
+  // distinct fields, then the input's distinct fields are set to empty.
   if (isSpecialForm()) {
     // 'propagatesNulls_' will be adjusted after inputs are processed.
     propagatesNulls_ = true;
@@ -197,7 +198,9 @@ void Expr::computeMetadata() {
     // 递归计算输入的meta data
     input->computeMetadata();
     deterministic_ &= input->deterministic_;
-    propagatesNulls_ &= input->propagatesNulls_;
+    if (!input->distinctFields_.empty()) {
+      propagatesNulls_ &= input->propagatesNulls_;
+    }
     mergeFields(
         distinctFields_, multiplyReferencedFields_, input->distinctFields_);
   }
@@ -267,6 +270,7 @@ void Expr::evalSimplified(
 }
 // 从向量池中释放掉向量
 void Expr::releaseInputValues(EvalCtx& evalCtx) {
+    // 释放回池内
   evalCtx.releaseVectors(inputValues_);
   inputValues_.clear();
 }
@@ -293,7 +297,11 @@ void Expr::evalSimplifiedImpl(
     inputs_[i]->evalSimplified(remainingRows, context, inputValue);
     // 碾平输入向量
     BaseVector::flattenVector(inputValue, rows.end());
-    VELOX_CHECK_EQ(VectorEncoding::Simple::FLAT, inputValue->encoding());
+    VELOX_CHECK(
+        inputValue->encoding() == VectorEncoding::Simple::FLAT ||
+        inputValue->encoding() == VectorEncoding::Simple::ARRAY ||
+        inputValue->encoding() == VectorEncoding::Simple::MAP ||
+        inputValue->encoding() == VectorEncoding::Simple::ROW);
 
     // If the resulting vector has nulls, merge them into our current remaining
     // rows bitmap.
@@ -349,7 +357,7 @@ class ExprExceptionContext {
 
     // Persist vector to disk
     try {
-      auto dataPathOpt = generateFilePath(basePath, "vector");
+      auto dataPathOpt = common::generateTempFilePath(basePath, "vector");
       if (!dataPathOpt.has_value()) {
         dataPath_ = "Failed to create file for saving input vector.";
         return;
@@ -364,7 +372,7 @@ class ExprExceptionContext {
     // Persist sql to disk
     auto sql = expr_->toSql();
     try {
-      auto sqlPathOpt = generateFilePath(basePath, "sql");
+      auto sqlPathOpt = common::generateTempFilePath(basePath, "sql");
       if (!sqlPathOpt.has_value()) {
         sqlPath_ = "Failed to create file for saving SQL.";
         return;
@@ -460,6 +468,7 @@ std::string onException(VeloxException::Type /*exceptionType*/, void* arg) {
 }
 } // namespace
 
+// 比较直接简单
 void Expr::evalFlatNoNulls(
     const SelectivityVector& rows,
     EvalCtx& context,
@@ -469,13 +478,14 @@ void Expr::evalFlatNoNulls(
   ExceptionContextSetter exceptionContext(
       {topLevel ? onTopLevelException : onException,
        topLevel ? (void*)&exprExceptionContext : this});
-
+    // 评估
   if (isSpecialForm()) {
     evalSpecialFormWithStats(rows, context, result);
     return;
   }
 
   inputValues_.resize(inputs_.size());
+  // 遍历每一个输入表达式
   for (int32_t i = 0; i < inputs_.size(); ++i) {
     if (constantInputs_[i]) {
       // No need to re-evaluate constant expression. Simply move constant values
@@ -649,6 +659,7 @@ inline void setPeeled(
     int32_t fieldIndex,
     EvalCtx& context,
     std::vector<VectorPtr>& peeled) {
+        // resize一下并保存到数组中
   if (peeled.size() <= fieldIndex) {
     peeled.resize(context.row()->childrenSize());
   }
@@ -698,7 +709,7 @@ SelectivityVector* singleRow(
   rows->updateBounds();
   return rows;
 }
-
+// 剥离编码
 Expr::PeelEncodingsResult Expr::peelEncodings(
     EvalCtx& context,
     ScopedContextSaver& saver,
@@ -715,42 +726,54 @@ Expr::PeelEncodingsResult Expr::peelEncodings(
   int numLevels = 0;
   bool peeled;
   bool nonConstant = false;
+  // 行有几列
   auto numFields = context.row()->childrenSize();
   int32_t firstPeeled = -1;
   do {
     peeled = true;
     BufferPtr firstIndices;
     BufferPtr firstLengths;
+    // 遍历每一个distinctField
     for (const auto& field : distinctFields_) {
+        // 拿出index
       auto fieldIndex = field->index(context);
       assert(fieldIndex >= 0 && fieldIndex < numFields);
       auto leaf = peeledVectors.empty() ? context.getField(fieldIndex)
                                         : peeledVectors[fieldIndex];
+
       if (!constantFields.empty() && constantFields[fieldIndex]) {
         setPeeled(leaf, fieldIndex, context, maybePeeled);
         continue;
       }
+      // 如果是第0层，并且是leaf里面是常量
       if (numLevels == 0 && leaf->isConstant(rows)) {
+        // ConstantVector内部可以包裹一个LazyVector
+        // 所以这里就是让LazyVector成功加载？
         leaf = context.ensureFieldLoaded(fieldIndex, rows);
         setPeeled(leaf, fieldIndex, context, maybePeeled);
+        // 设置一下constantField为true
         constantFields.resize(numFields);
         constantFields.at(fieldIndex) = true;
         continue;
       }
       nonConstant = true;
       auto encoding = leaf->encoding();
+      // 检查向量编码类型
       if (encoding == VectorEncoding::Simple::DICTIONARY) {
         if (firstLengths) {
           // having a mix of dictionary and sequence encoded fields
           peeled = false;
           break;
         }
+        // 如果当前表达式对NULL值参数的结果不为NULL，那么就不能剥离
+        // 我猜应该是因为剥离后直接使用字典来做计算，之后再使用字典编码进行包装，这时候NULL值就还是NULL值，所以这里面不能进行剥离
         if (!propagatesNulls_ && leaf->rawNulls()) {
           // A dictionary that adds nulls over an Expr that is not null for a
           // null argument cannot be peeled.
           peeled = false;
           break;
         }
+        // 索引
         BufferPtr indices = leaf->wrapInfo();
         if (!firstIndices) {
           firstIndices = std::move(indices);
@@ -760,8 +783,10 @@ Expr::PeelEncodingsResult Expr::peelEncodings(
           break;
         }
         if (firstPeeled == -1) {
+            // 第一个剥离的
           firstPeeled = fieldIndex;
         }
+        // 设置剥离向量为内部的字典
         setPeeled(leaf->valueVector(), fieldIndex, context, maybePeeled);
       } else if (encoding == VectorEncoding::Simple::SEQUENCE) {
         if (firstIndices) {
@@ -780,15 +805,19 @@ Expr::PeelEncodingsResult Expr::peelEncodings(
         if (firstPeeled == -1) {
           firstPeeled = fieldIndex;
         }
+        // 设置
         setPeeled(leaf->valueVector(), fieldIndex, context, maybePeeled);
       } else {
+        // 任何一个field没有编码就没有剥离并跳出循环了
         // Non-peelable encoding.
         peeled = false;
         break;
       }
     }
+    // 如果剥离了
     if (peeled) {
       ++numLevels;
+      // 保存下来
       peeledVectors = std::move(maybePeeled);
     }
   } while (peeled && nonConstant);
@@ -803,28 +832,34 @@ Expr::PeelEncodingsResult Expr::peelEncodings(
   if (firstPeeled == -1) {
     // All the fields are constant across the rows of interest.
     newRows = singleRow(newRowsHolder, rows.begin());
+    // 把context里面的一些状态先保存到saver上？
     context.saveAndReset(saver, rows);
+    // 设置常量包装
     context.setConstantWrap(rows.begin());
   } else {
     auto decoded = localDecoded.get();
+    // 获取第一个包装向量，比如字典编码的向量等
     auto firstWrapper = context.getField(firstPeeled).get();
+    // 需要进行解码的行
     const auto& rowsToDecode =
         context.isFinalSelection() ? rows : *context.finalSelection();
+        // 创建索引？
     decoded->makeIndices(*firstWrapper, rowsToDecode, numLevels);
 
     newRows = translateToInnerRows(rows, *decoded, newRowsHolder);
-
+    // 这个暂时不看
     if (!context.isFinalSelection()) {
       newFinalSelection = translateToInnerRows(
           *context.finalSelection(), *decoded, finalRowsHolder);
     }
-
+    // 保存状态
     context.saveAndReset(saver, rows);
 
     if (!context.isFinalSelection()) {
       *context.mutableFinalSelection() = newFinalSelection;
     }
-
+    // 设置为字典包装？为什么不能是RLE？
+    // RLE也被DecodeVector解码出了索引
     setDictionaryWrapping(*decoded, rowsToDecode, *firstWrapper, context);
   }
   int numPeeled = 0;
@@ -834,10 +869,15 @@ Expr::PeelEncodingsResult Expr::peelEncodings(
       continue;
     }
     if (!constantFields.empty() && constantFields[i]) {
+        // 这个地方的values难度不是已经是constant向量了吗？
+        // 为什么还要在包装一层
+        // 看wrapInConstant的实现感觉
+        // 像是要重新将consttantIndex设置为row.begin()，已经重新设置大小？
       context.setPeeled(
           i, BaseVector::wrapInConstant(rows.size(), rows.begin(), values));
     } else {
       context.setPeeled(i, values);
+      // 增加剥离次数
       ++numPeeled;
     }
   }
@@ -850,6 +890,7 @@ void Expr::evalEncodings(
     const SelectivityVector& rows,
     EvalCtx& context,
     VectorPtr& result) {
+        // 如果是确定性的，并且当前表达式的distinctFields不为空
   if (deterministic_ && !distinctFields_.empty()) {
     bool hasNonFlat = false;
     // 检查是否有非flat的向量
@@ -859,11 +900,12 @@ void Expr::evalEncodings(
         break;
       }
     }
-
+    // 存在非平坦向量
     if (hasNonFlat) {
       VectorPtr wrappedResult;
       // Attempt peeling and bound the scope of the context used for it.
       {
+        // 保存context？
         ScopedContextSaver saveContext;
         LocalSelectivityVector newRowsHolder(context);
         LocalSelectivityVector finalRowsHolder(context);
@@ -875,12 +917,15 @@ void Expr::evalEncodings(
             decodedHolder,
             newRowsHolder,
             finalRowsHolder);
+            // newRows?
         auto* newRows = peelEncodingsResult.newRows;
+        // 如果存在newRows
         if (newRows) {
           VectorPtr peeledResult;
           // peelEncodings() can potentially produce an empty selectivity vector
           // if all selected values we are waiting for are nulls. So, here we
           // check for such a case.
+          // 如果存在selection
           if (newRows->hasSelections()) {
             if (peelEncodingsResult.mayCache) {
               evalWithMemo(*newRows, context, peeledResult);
@@ -906,14 +951,16 @@ bool Expr::removeSureNulls(
     EvalCtx& context,
     LocalSelectivityVector& nullHolder) {
   SelectivityVector* result = nullptr;
+    // 遍历每一个distinctField
   for (auto* field : distinctFields_) {
     VectorPtr values;
+    // 评估field，将结果保存到values上
     field->evalSpecialForm(rows, context, values);
-    // 还没加载的的，暂时不处理？
+    // 还没加载的的lazyVector，暂时不处理？
     if (isLazyNotLoaded(*values)) {
       continue;
     }
-
+    // 如果可能存在NULL值
     if (values->mayHaveNulls()) {
       LocalDecodedVector decoded(context, *values, rows);
       if (auto* rawNulls = decoded->nulls()) {
@@ -926,6 +973,7 @@ bool Expr::removeSureNulls(
       }
     }
   }
+  // result是一个选择向量，只有所有字段上非NULL值的部分选择
   if (result) {
     result->updateBounds();
     return true;
@@ -933,26 +981,36 @@ bool Expr::removeSureNulls(
   return false;
 }
 
+// static
 void Expr::addNulls(
     const SelectivityVector& rows,
     const uint64_t* rawNulls,
     EvalCtx& context,
+    const TypePtr& type,
     VectorPtr& result) {
   // If there's no `result` yet, return a NULL ContantVector.
   if (!result) {
-    result =
-        BaseVector::createNullConstant(type(), rows.size(), context.pool());
+    result = BaseVector::createNullConstant(type, rows.end(), context.pool());
     return;
   }
 
-  // If result is already a NULL ConstantVector, do nothing.
-  if (result->isConstantEncoding() && result->mayHaveNulls()) {
+  // If result is already a NULL ConstantVector, resize the vector if necessary,
+  // or do nothing otherwise.
+  if (result->isConstantEncoding() && result->isNullAt(0)) {
+    if (result->size() < rows.end()) {
+      if (result.unique()) {
+        result->resize(rows.end());
+      } else {
+        result =
+            BaseVector::createNullConstant(type, rows.end(), context.pool());
+      }
+    }
     return;
   }
 
   if (!result.unique() || !result->isNullsWritable()) {
     BaseVector::ensureWritable(
-        SelectivityVector::empty(), type(), context.pool(), result);
+        SelectivityVector::empty(), type, context.pool(), result);
   }
 
   if (result->size() < rows.end()) {
@@ -962,10 +1020,19 @@ void Expr::addNulls(
   result->addNulls(rawNulls, rows);
 }
 
+void Expr::addNulls(
+    const SelectivityVector& rows,
+    const uint64_t* FOLLY_NULLABLE rawNulls,
+    EvalCtx& context,
+    VectorPtr& result) {
+  addNulls(rows, rawNulls, context, type(), result);
+}
+
 void Expr::evalWithNulls(
     const SelectivityVector& rows,
     EvalCtx& context,
     VectorPtr& result) {
+        // 如果没有selection，则直接返回空向量
   if (!rows.hasSelections()) {
     // empty input, return an empty vector of the right type
     result = BaseVector::createNullConstant(type(), 0, context.pool());
@@ -977,9 +1044,10 @@ void Expr::evalWithNulls(
     for (const auto& field : distinctFields_) {
       const auto& vector = context.getField(field->index(context));
       if (isLazyNotLoaded(*vector)) {
+        // 惰性向量且没有加载过的，直接跳过
         continue;
       }
-
+        // 设置可能存在NULL值
       if (vector->mayHaveNulls()) {
         mayHaveNulls = true;
         break;
@@ -993,6 +1061,9 @@ void Expr::evalWithNulls(
         ScopedVarSetter noMoreNulls(context.mutableNullsPruned(), true);
         if (nonNullHolder.get()->hasSelections()) {
             // 只对非null值进行计算
+            // 这样的话，比如函数add(a, b)
+            // a和b是distinctField，nonNullHolder上只包括那些a和b同时都不是null的选择
+            // evalAll有时也会移除NULL值，但是只会
           evalAll(*nonNullHolder.get(), context, result);
         }
         auto rawNonNulls = nonNullHolder.get()->asRange().bits();
@@ -1000,14 +1071,17 @@ void Expr::evalWithNulls(
         addNulls(rows, rawNonNulls, context, result);
         return;
       }
+      // 没法移除成功就调用evalAll()
     }
   }
+  // 如果不传播NULL值，则直接调用evalAll()
   evalAll(rows, context, result);
 }
 
 namespace {
 void deselectErrors(EvalCtx& context, SelectivityVector& rows) {
   auto errors = context.errors();
+  // 没有错误，直接返回
   if (!errors) {
     return;
   }
@@ -1022,17 +1096,24 @@ void Expr::evalWithMemo(
     EvalCtx& context,
     VectorPtr& result) {
   VectorPtr base;
+  // 只有一个distinctField需要，原因在peelEncodings()函数中似乎有所体现
+  // 计算distinct表达式, 把结果保存到base向量中
   distinctFields_[0]->evalSpecialForm(rows, context, base);
   ++numCachableInput_;
+  // 如果base向量和缓存下来的一样
   if (baseDictionary_ == base) {
     ++numCacheableRepeats_;
     if (cachedDictionaryIndices_) {
       LocalSelectivityVector cachedHolder(context, rows);
       auto cached = cachedHolder.get();
       VELOX_DCHECK(cached != nullptr);
+      // 将当前rows和之前缓存的rows求交集？
       cached->intersect(*cachedDictionaryIndices_);
+      // 如果有selection
       if (cached->hasSelections()) {
+        // 确保result向量可写
         context.ensureWritable(rows, type(), result);
+        // 将结果拷贝过去
         result->copy(dictionaryCache_.get(), *cached, nullptr);
       }
     }
@@ -1042,15 +1123,17 @@ void Expr::evalWithMemo(
     if (cachedDictionaryIndices_) {
       uncached->deselect(*cachedDictionaryIndices_);
     }
+    // 如果存在没有被缓存下来的行
     if (uncached->hasSelections()) {
       // Fix finalSelection at "rows" if uncached rows is a strict subset to
       // avoid losing values not in uncached rows that were copied earlier into
       // "result" from the cached rows.
       ScopedFinalSelectionSetter scopedFinalSelectionSetter(
           context, &rows, uncached->countSelected() < rows.countSelected());
-
+        // 计算当前表达式，并且把结果保存到result上
       evalWithNulls(*uncached, context, result);
       deselectErrors(context, *uncached);
+      // 这里为什么要addToMemo?
       context.exprSet()->addToMemo(this);
       auto newCacheSize = uncached->end();
 
@@ -1065,32 +1148,44 @@ void Expr::evalWithMemo(
       allUncached.get()->deselect(*cachedDictionaryIndices_);
       context.ensureWritable(*allUncached.get(), type(), dictionaryCache_);
 
+        // 扩容一下
       if (cachedDictionaryIndices_->size() < newCacheSize) {
         cachedDictionaryIndices_->resize(newCacheSize, false);
       }
-
+        // 合并一下
       cachedDictionaryIndices_->select(*uncached);
 
+        // 进行扩容
       // Resize the dictionaryCache_ to accommodate all the necessary rows.
       if (dictionaryCache_->size() < uncached->end()) {
         dictionaryCache_->resize(uncached->end());
       }
+      // 将result上的结果拷贝到cache_上
       dictionaryCache_->copy(result.get(), *uncached, nullptr);
     }
+    // 释放
     context.releaseVector(base);
     return;
   }
+  // 这里为什么不调用addToMemo?
+  // 释放掉baseDict
   context.releaseVector(baseDictionary_);
+  // 设置
   baseDictionary_ = base;
+  // 计算当前表达式，把结果保存到result上
   evalWithNulls(rows, context, result);
-
+    // 释放
   context.releaseVector(dictionaryCache_);
+  // 缓存下来
   dictionaryCache_ = result;
   if (!cachedDictionaryIndices_) {
+    // 从池中获取一个选择向量
     cachedDictionaryIndices_ =
         context.execCtx()->getSelectivityVector(rows.end());
   }
+  // 把当前选择向量缓存下来
   *cachedDictionaryIndices_ = rows;
+  // 这个暂时不看
   deselectErrors(context, *cachedDictionaryIndices_);
 }
 
@@ -1131,6 +1226,7 @@ void computeIsAsciiForInputs(
     // type is string.
     if (index < inputValues.size() &&
         inputValues[index]->type()->kind() == TypeKind::VARCHAR) {
+            // 如果是VARCHAR类型,转成字符串向量
       auto* vector =
           inputValues[index]->template as<SimpleVector<StringView>>();
       vector->computeAndSetIsAscii(rows);
@@ -1193,15 +1289,18 @@ void Expr::evalAll(
     const SelectivityVector& rows,
     EvalCtx& context,
     VectorPtr& result) {
+        // 如果没有selection，则直接返回空向量
   if (!rows.hasSelections()) {
     // empty input, return an empty vector of the right type
     result = BaseVector::createNullConstant(type(), 0, context.pool());
     return;
   }
+  // 特殊形式表达式，直接执行，这种应该是没有输入的，叶子节点吧
   if (isSpecialForm()) {
     evalSpecialFormWithStats(rows, context, result);
     return;
   }
+  // 确定性的表达式才能尝试剥离参数？
   bool tryPeelArgs = deterministic_ ? true : false;
   bool defaultNulls = vectorFunction_->isDefaultNullBehavior();
 
@@ -1213,19 +1312,23 @@ void Expr::evalAll(
   // mutableRemainingRowsHolder only if needed.
   SelectivityVector* mutableRemainingRows = nullptr;
   LocalSelectivityVector mutableRemainingRowsHolder(context);
-    // 预留
+    // 预留给输入
   inputValues_.resize(inputs_.size());
   // 遍历每一个输入表达式
   for (int32_t i = 0; i < inputs_.size(); ++i) {
-    // 对输入进行评估
+    // 对输入表达式进行评估，将结果保存到inputValues上
+    // 这里没有先剥离掉NULL值，而是直接计算
     inputs_[i]->eval(*remainingRows, context, inputValues_[i]);
-    // 常量，字典，RLE可以剥离
+    // 常量，字典，RLE可以剥离,因为这些都是有特殊编码的
+    // 像FlatVector这种没有特殊编码的就不行
     tryPeelArgs = tryPeelArgs && isPeelable(inputValues_[i]->encoding());
     // 如果对NULL值是默认行为
     // Avoid subsequent computation on rows with known null output.
+    // 如果输入向量可能有空值
     if (defaultNulls && inputValues_[i]->mayHaveNulls()) {
+        // 解码
       LocalDecodedVector decoded(context, *inputValues_[i], *remainingRows);
-
+        // 这个地方检查输入是否有NULL值
       if (auto* rawNulls = decoded->nulls()) {
         // Allocate remainingRows before the first time writing to it.
         if (mutableRemainingRows == nullptr) {
@@ -1242,6 +1345,7 @@ void Expr::evalAll(
           return;
         }
       }
+      // 没有NULL值的话，什么都不用做
     }
   }
 
@@ -1275,7 +1379,7 @@ void Expr::evalAll(
   // Write non-selected rows in remainingRows as nulls in the result if some
   // rows have been skipped.
   if (mutableRemainingRows != nullptr) {
-    // 添加null值
+    // 最后在这里添加null值
     addNulls(rows, mutableRemainingRows->asRange().bits(), context, result);
   }
   // 释放NULL值
@@ -1283,6 +1387,7 @@ void Expr::evalAll(
 }
 
 namespace {
+    // 设置被剥离的参数
 void setPeeledArg(
     VectorPtr arg,
     int32_t index,
@@ -1308,6 +1413,7 @@ bool Expr::applyFunctionWithPeeling(
   int numLevels = 0;
   bool peeled;
   int32_t numConstant = 0;
+  // 几个参数
   auto numArgs = inputValues_.size();
   // Holds the outermost wrapper. This may be the last reference after
   // peeling for a temporary dictionary, hence use a shared_ptr.
@@ -1318,8 +1424,9 @@ bool Expr::applyFunctionWithPeeling(
     BufferPtr firstIndices;
     BufferPtr firstLengths;
     std::vector<VectorPtr> maybePeeled;
-    // 遍历每一个输入
+    // 遍历每一个输入向量
     for (auto i = 0; i < inputValues_.size(); ++i) {
+      // 获取输入向量
       auto leaf = inputValues_[i];
     
       if (!constantArgs.empty() && constantArgs[i]) {
@@ -1327,24 +1434,27 @@ bool Expr::applyFunctionWithPeeling(
         continue;
       }
       // numLevel不为0，代表有inputValue做了peeled
+      // 这里的rows选择向量对第0层才有用吧
       if ((numLevels == 0 && leaf->isConstant(rows)) ||
           leaf->isConstantEncoding()) {
         if (leaf->isConstantEncoding()) {
           setPeeledArg(leaf, i, numArgs, maybePeeled);
         } else {
+            // 这里WrapInConstant
           setPeeledArg(
               BaseVector::wrapInConstant(leaf->size(), rows.begin(), leaf),
               i,
               numArgs,
               maybePeeled);
         }
-        // 每次resize都会清空数据阿？搞毛线
         constantArgs.resize(numArgs);
         constantArgs.at(i) = true;
         ++numConstant;
         continue;
       }
+      // 检查向量编码类型
       auto encoding = leaf->encoding();
+      // 所有输入只能是同种编码类型？
       if (encoding == VectorEncoding::Simple::DICTIONARY) {
         if (firstLengths) {
           // having a mix of dictionary and sequence encoded fields
@@ -1361,6 +1471,7 @@ bool Expr::applyFunctionWithPeeling(
         if (!firstIndices) {
           firstIndices = std::move(indices);
         } else if (indices != firstIndices) {
+            // 不同字段使用不同字典
           // different fields use different dictionaries
           peeled = false;
           break;
@@ -1398,6 +1509,7 @@ bool Expr::applyFunctionWithPeeling(
       ++numLevels;
       inputValues_ = std::move(maybePeeled);
     }
+    // 如果所有参数都是常量也会跳出，不然就死循环了
   } while (peeled && numConstant != numArgs);
   if (!numLevels) {
     return false;
@@ -1412,13 +1524,15 @@ bool Expr::applyFunctionWithPeeling(
     newRows = singleRow(newRowsHolder, rows.begin());
 
     context.saveAndReset(saver, rows);
+    // 设置常量编码
     context.setConstantWrap(rows.begin());
   } else {
     auto decoded = localDecoded.get();
+    // 创建索引
     decoded->makeIndices(*firstWrapper, rows, numLevels);
     newRows = translateToInnerRows(applyRows, *decoded, newRowsHolder);
     context.saveAndReset(saver, rows);
-    // 这个是为什么
+    // 设置字典编码
     setDictionaryWrapping(*decoded, rows, *firstWrapper, context);
 
     // 'newRows' comes from the set of row numbers in the base vector. These
@@ -1427,6 +1541,7 @@ bool Expr::applyFunctionWithPeeling(
     if (newRows->end() > rows.end() && numConstant) {
       for (int i = 0; i < constantArgs.size(); ++i) {
         if (!constantArgs.empty() && constantArgs[i]) {
+            // 扩容常量向量
           inputValues_[i] =
               BaseVector::wrapInConstant(newRows->end(), 0, inputValues_[i]);
         }
@@ -1435,7 +1550,9 @@ bool Expr::applyFunctionWithPeeling(
   }
 
   VectorPtr peeledResult;
+  // 应用函数
   applyFunction(*newRows, context, peeledResult);
+  // 包装编码
   VectorPtr wrappedResult =
       context.applyWrapToPeeledResult(this->type(), peeledResult, applyRows);
   context.moveOrCopyResult(wrappedResult, rows, result);
@@ -1456,8 +1573,33 @@ void Expr::applyFunction(
       ? computeIsAsciiForResult(vectorFunction_.get(), inputValues_, rows)
       : std::nullopt;
 
+    // 计算函数表达式
   vectorFunction_->apply(rows, inputValues_, type(), context, result);
 
+  if (!result) {
+    LocalSelectivityVector mutableRemainingRowsHolder(context);
+    auto mutableRemainingRows = mutableRemainingRowsHolder.get(rows);
+    deselectErrors(context, *mutableRemainingRows);
+
+    // If there are rows with no result and no exception this is a bug in the
+    // function implementation.
+    if (mutableRemainingRows->hasSelections()) {
+      try {
+        // This isn't performant, but it gives us the relevant context and
+        // should only apply when the UDF is buggy (hopefully rarely).
+        VELOX_USER_FAIL(
+            "Function neither returned results nor threw exception.");
+      } catch (const std::exception& e) {
+        context.setErrors(*mutableRemainingRows, std::current_exception());
+      }
+    }
+
+    // Since result was empty, and either the function set errors for every row
+    // or we did above, set it to be all NULL.
+    result = BaseVector::createNullConstant(type(), rows.end(), context.pool());
+  }
+
+    // 设置结果向量是否为Ascii
   if (isAscii.has_value()) {
     result->asUnchecked<SimpleVector<StringView>>()->setIsAscii(
         isAscii.value(), rows);
@@ -1521,10 +1663,10 @@ std::string Expr::toString(bool recursive) const {
   return name_;
 }
 
-std::string Expr::toSql() const {
+std::string Expr::toSql(std::vector<VectorPtr>* complexConstants) const {
   std::stringstream out;
   out << "\"" << name_ << "\"";
-  appendInputsSql(out);
+  appendInputsSql(out, complexConstants);
   return out.str();
 }
 
@@ -1541,16 +1683,21 @@ void Expr::appendInputs(std::stringstream& stream) const {
   }
 }
 
-void Expr::appendInputsSql(std::stringstream& stream) const {
+void Expr::appendInputsSql(
+    std::stringstream& stream,
+    std::vector<VectorPtr>* complexConstants) const {
   if (!inputs_.empty()) {
     stream << "(";
     for (auto i = 0; i < inputs_.size(); ++i) {
       if (i > 0) {
         stream << ", ";
       }
-      stream << inputs_[i]->toSql();
+      stream << inputs_[i]->toSql(complexConstants);
     }
     stream << ")";
+  } else if (vectorFunction_ != nullptr) {
+    // Function with no inputs.
+    stream << "()";
   }
 }
 

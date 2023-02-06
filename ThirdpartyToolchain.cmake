@@ -27,22 +27,22 @@
 # EXAMPLE USAGE: # Download and setup or use already installed dependency.
 # include(ThirdpartyToolchain) resolve_dependency(folly)
 #
-# ========================================================================================
+# ==============================================================================
 
 include(FetchContent)
 include(CheckCXXCompilerFlag)
 
-# =====================================FOLLY==============================================
+# ================================ FOLLY =======================================
 
 if(DEFINED ENV{VELOX_FOLLY_URL})
   set(FOLLY_SOURCE_URL "$ENV{VELOX_FOLLY_URL}")
 else()
-  set(VELOX_FOLLY_BUILD_VERSION v2022.07.11.00)
+  set(VELOX_FOLLY_BUILD_VERSION v2022.11.14.00)
   set(FOLLY_SOURCE_URL
       "https://github.com/facebook/folly/archive/${VELOX_FOLLY_BUILD_VERSION}.tar.gz"
   )
   set(VELOX_FOLLY_BUILD_SHA256_CHECKSUM
-      b6cc4082afd1530fdb8d759bc3878c1ea8588f6d5bc9eddf8e1e8abe63f41735)
+      b249436cb61b6dfd5288093565438d8da642b07ae021191a4042b221bc1bdc0e)
 endif()
 
 macro(build_folly)
@@ -81,11 +81,114 @@ macro(build_folly)
       ${folly_BINARY_DIR}/folly/libfollybenchmark${CMAKE_STATIC_LIBRARY_SUFFIX})
   set(FOLLY_LIBRARIES folly)
 endmacro()
-# ===============================END FOLLY================================
+# ================================= END FOLLY ==================================
+
+# ================================== PROTOBUF ==================================
+
+if(DEFINED ENV{VELOX_PROTOBUF_URL})
+  set(PROTOBUF_SOURCE_URL "$ENV{VELOX_PROTOBUF_URL}")
+else()
+  set(VELOX_PROTOBUF_BUILD_VERSION 21.4)
+  string(
+    CONCAT
+      PROTOBUF_SOURCE_URL
+      "https://github.com/protocolbuffers/protobuf/releases/download/"
+      "v${VELOX_PROTOBUF_BUILD_VERSION}/protobuf-all-${VELOX_PROTOBUF_BUILD_VERSION}.tar.gz"
+  )
+  set(VELOX_PROTOBUF_BUILD_SHA256_CHECKSUM
+      6c5e1b0788afba4569aeebb2cfe205cb154aa01deacaba0cd26442f3b761a836)
+endif()
+
+macro(build_protobuf)
+  message(STATUS "Building Protobuf from source")
+
+  FetchContent_Declare(
+    protobuf
+    URL ${PROTOBUF_SOURCE_URL}
+    URL_HASH SHA256=${VELOX_PROTOBUF_BUILD_SHA256_CHECKSUM})
+
+  if(NOT protobuf_POPULATED)
+    # We don't want to build tests.
+    set(protobuf_BUILD_TESTS
+        OFF
+        CACHE BOOL "Disable protobuf tests" FORCE)
+    set(CMAKE_CXX_FLAGS_BKP "${CMAKE_CXX_FLAGS}")
+
+    # Disable warnings that would fail protobuf compilation.
+    string(APPEND CMAKE_CXX_FLAGS " -Wno-missing-field-initializers")
+
+    check_cxx_compiler_flag("-Wstringop-overflow"
+                            COMPILER_HAS_W_STRINGOP_OVERFLOW)
+    if(COMPILER_HAS_W_STRINGOP_OVERFLOW)
+      string(APPEND CMAKE_CXX_FLAGS " -Wno-stringop-overflow")
+    endif()
+
+    check_cxx_compiler_flag("-Winvalid-noreturn"
+                            COMPILER_HAS_W_INVALID_NORETURN)
+
+    if(COMPILER_HAS_W_INVALID_NORETURN)
+      string(APPEND CMAKE_CXX_FLAGS " -Wno-invalid-noreturn")
+    else()
+      # Currently reproduced on Ubuntu 22.04 with clang 14
+      string(APPEND CMAKE_CXX_FLAGS " -Wno-error")
+    endif()
+
+    # Fetch the content using previously declared details
+    FetchContent_Populate(protobuf)
+
+    # Set right path to libprotobuf-dev include files.
+    set(Protobuf_INCLUDE_DIR "${protobuf_SOURCE_DIR}/src/")
+    set(Protobuf_PROTOC_EXECUTABLE "${protobuf_BINARY_DIR}/protoc")
+    if(CMAKE_BUILD_TYPE MATCHES Debug)
+      set(Protobuf_LIBRARIES "${protobuf_BINARY_DIR}/libprotobufd.a")
+    else()
+      set(Protobuf_LIBRARIES "${protobuf_BINARY_DIR}/libprotobuf.a")
+    endif()
+    include_directories("${protobuf_SOURCE_DIR}/src/")
+    add_subdirectory(${protobuf_SOURCE_DIR} ${protobuf_BINARY_DIR})
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS_BKP}")
+  endif()
+endmacro()
+# ================================ END PROTOBUF ================================
+
+# ================================== PYBIND11 ==================================
+if(DEFINED ENV{VELOX_PYBIND11_URL})
+  set(PYBIND11_SOURCE_URL "$ENV{VELOX_PYBIND11_URL}")
+else()
+  set(VELOX_PYBIND11_BUILD_VERSION 2.10.0)
+  string(CONCAT PYBIND11_SOURCE_URL
+                "https://github.com/pybind/pybind11/archive/refs/tags/"
+                "v${VELOX_PYBIND11_BUILD_VERSION}.tar.gz")
+  set(VELOX_PYBIND11_BUILD_SHA256_CHECKSUM
+      eacf582fa8f696227988d08cfc46121770823839fe9e301a20fbce67e7cd70ec)
+endif()
+
+macro(build_pybind11)
+  message(STATUS "Building Pybind11 from source")
+
+  FetchContent_Declare(
+    pybind11
+    URL ${PYBIND11_SOURCE_URL}
+    URL_HASH SHA256=${VELOX_PYBIND11_BUILD_SHA256_CHECKSUM})
+
+  if(NOT pybind11_POPULATED)
+
+    # Fetch the content using previously declared details
+    FetchContent_Populate(pybind11)
+
+    add_subdirectory(${pybind11_SOURCE_DIR})
+  endif()
+endmacro()
+
+# ================================ END PYBIND11 ================================
 
 macro(build_dependency DEPENDENCY_NAME)
   if("${DEPENDENCY_NAME}" STREQUAL "folly")
     build_folly()
+  elseif("${DEPENDENCY_NAME}" STREQUAL "Protobuf")
+    build_protobuf()
+  elseif("${DEPENDENCY_NAME}" STREQUAL "pybind11")
+    build_pybind11()
   else()
     message(
       FATAL_ERROR "Unknown thirdparty dependency to build: ${DEPENDENCY_NAME}")
@@ -141,5 +244,32 @@ macro(resolve_dependency DEPENDENCY_NAME)
     find_package(${FIND_PACKAGE_ARGUMENTS} REQUIRED)
   elseif(${DEPENDENCY_NAME}_SOURCE STREQUAL "BUNDLED")
     build_dependency(${DEPENDENCY_NAME})
+  else()
+    message(
+      FATAL_ERROR
+        "Invalid source for ${DEPENDENCY_NAME}: ${${DEPENDENCY_NAME}_SOURCE}")
   endif()
 endmacro()
+
+# By using a macro we don't need to propagate the value into the parent scope.
+macro(set_source DEPENDENCY_NAME)
+  set_with_default(${DEPENDENCY_NAME}_SOURCE ${DEPENDENCY_NAME}_SOURCE
+                   ${VELOX_DEPENDENCY_SOURCE})
+  message(
+    STATUS "Setting ${DEPENDENCY_NAME} source to ${${DEPENDENCY_NAME}_SOURCE}")
+endmacro()
+
+# Set a variable to the value of $ENV{envvar_name} if defined, set to ${DEFAULT}
+# if not defined. If called from within a nested scope the variable will not
+# propagate into outer scopes automatically! Use PARENT_SCOPE.
+function(set_with_default var_name envvar_name default)
+  if(DEFINED ENV{${envvar_name}})
+    set(${var_name}
+        $ENV{${envvar_name}}
+        PARENT_SCOPE)
+  else()
+    set(${var_name}
+        ${default}
+        PARENT_SCOPE)
+  endif()
+endfunction()

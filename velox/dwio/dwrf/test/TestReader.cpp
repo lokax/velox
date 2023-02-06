@@ -1043,11 +1043,9 @@ TEST(TestReader, testUpcastFloat) {
 }
 
 TEST(TestReader, testEmptyFile) {
-  std::unique_ptr<memory::ScopedMemoryPool> scopedPool =
-      memory::getDefaultScopedMemoryPool();
-  auto pool = *scopedPool;
-  MemorySink sink{pool, 1024};
-  DataBufferHolder holder{pool, 1024, 0, DEFAULT_PAGE_GROW_RATIO, &sink};
+  auto pool = memory::getDefaultMemoryPool();
+  MemorySink sink{*pool, 1024};
+  DataBufferHolder holder{*pool, 1024, 0, DEFAULT_PAGE_GROW_RATIO, &sink};
   BufferedOutputStream output{holder};
 
   proto::Footer footer;
@@ -1067,7 +1065,7 @@ TEST(TestReader, testEmptyFile) {
   output.flush();
   auto psLen = static_cast<uint8_t>(sink.size() - footerLen);
 
-  DataBuffer<char> buf{pool, 1};
+  DataBuffer<char> buf{*pool, 1};
   buf.data()[0] = psLen;
   sink.write(std::move(buf));
   auto input = std::make_unique<MemoryInputStream>(sink.getData(), sink.size());
@@ -1155,18 +1153,17 @@ void testBufferLifeCycle(
     std::mt19937& rng,
     size_t batchSize,
     bool hasNull) {
-  auto scopedPool = memory::getDefaultScopedMemoryPool();
-  auto& pool = *scopedPool;
+  auto pool = memory::getDefaultMemoryPool();
   std::vector<VectorPtr> batches;
   std::function<bool(vector_size_t)> isNullAt = nullptr;
   if (hasNull) {
     isNullAt = [](vector_size_t i) { return i % 2 == 0; };
   }
   auto vector =
-      BatchMaker::createBatch(schema, batchSize * 2, pool, rng, isNullAt);
+      BatchMaker::createBatch(schema, batchSize * 2, *pool, rng, isNullAt);
   batches.push_back(vector);
 
-  auto sink = std::make_unique<MemorySink>(pool, 1024 * 1024);
+  auto sink = std::make_unique<MemorySink>(*pool, 1024 * 1024);
   auto sinkPtr = sink.get();
   auto writer =
       E2EWriterTestUtil::writeData(std::move(sink), schema, batches, config);
@@ -1212,18 +1209,17 @@ void testFlatmapAsMapFieldLifeCycle(
     std::mt19937& rng,
     size_t batchSize,
     bool hasNull) {
-  auto scopedPool = memory::getDefaultScopedMemoryPool();
-  auto& pool = *scopedPool;
+  auto pool = memory::getDefaultMemoryPool();
   std::vector<VectorPtr> batches;
   std::function<bool(vector_size_t)> isNullAt = nullptr;
   if (hasNull) {
     isNullAt = [](vector_size_t i) { return i % 2 == 0; };
   }
   auto vector =
-      BatchMaker::createBatch(schema, batchSize * 5, pool, rng, isNullAt);
+      BatchMaker::createBatch(schema, batchSize * 5, *pool, rng, isNullAt);
   batches.push_back(vector);
 
-  auto sink = std::make_unique<MemorySink>(pool, 1024 * 1024);
+  auto sink = std::make_unique<MemorySink>(*pool, 1024 * 1024);
   auto sinkPtr = sink.get();
   auto writer =
       E2EWriterTestUtil::writeData(std::move(sink), schema, batches, config);
@@ -1261,7 +1257,7 @@ void testFlatmapAsMapFieldLifeCycle(
   EXPECT_EQ(keysPtr, child->mapKeys().get());
   // there is a TODO in FlatMapColumnReader next() (result is not reused)
   // should be EQ; fix: https://fburl.com/code/wtrq8r5q
-  EXPECT_NE(childPtr, child.get());
+  // EXPECT_EQ(childPtr, child.get());
   EXPECT_EQ(rowPtr, result.get());
 
   auto mapKeys = child->mapKeys();
@@ -1278,7 +1274,7 @@ void testFlatmapAsMapFieldLifeCycle(
   EXPECT_NE(mapKeys, child->mapKeys());
   // there is a TODO in FlatMapColumnReader next() (result is not reused)
   // should be EQ; fix: https://fburl.com/code/wtrq8r5q
-  EXPECT_NE(childPtr, child.get());
+  // EXPECT_EQ(childPtr, child.get());
   EXPECT_EQ(rowPtr, result.get());
 
   EXPECT_TRUE(rowReader->next(batchSize, result));
@@ -1290,7 +1286,7 @@ void testFlatmapAsMapFieldLifeCycle(
   EXPECT_NE(rawSizes, childCurr->sizes().get());
   EXPECT_NE(rawOffsets, childCurr->offsets().get());
   EXPECT_NE(keysPtr, childCurr->mapKeys().get());
-  EXPECT_NE(childPtr, childCurr.get());
+  // EXPECT_EQ(childPtr, childCurr.get());
   EXPECT_EQ(rowPtr, result.get());
 }
 

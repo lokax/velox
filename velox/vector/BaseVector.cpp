@@ -67,10 +67,18 @@ BaseVector::BaseVector(
 void BaseVector::ensureNullsCapacity(vector_size_t size, bool setNotNull) {
   auto fill = setNotNull ? bits::kNotNull : bits::kNull;
   if (nulls_ && nulls_->isMutable()) {
-    if (nulls_->capacity() >= bits::nbytes(size)) {
-      return;
+    if (nulls_->capacity() < bits::nbytes(size)) {
+      AlignedBuffer::reallocate<bool>(&nulls_, size, fill);
     }
-    AlignedBuffer::reallocate<bool>(&nulls_, size, fill);
+    // ensure that the newly added positions have the right initial value for
+    // the case where changes in size don't result in change in the size of
+    // the underlying buffer.
+    // TODO: move this inside reallocate.
+    rawNulls_ = nulls_->as<uint64_t>();
+    if (setNotNull && length_ < size) {
+      bits::fillBits(
+          const_cast<uint64_t*>(rawNulls_), length_, size, bits::kNotNull);
+    }
   } else {
     auto newNulls = AlignedBuffer::allocate<bool>(size, pool_, fill);
     if (nulls_) {
@@ -80,8 +88,8 @@ void BaseVector::ensureNullsCapacity(vector_size_t size, bool setNotNull) {
           byteSize<bool>(std::min(length_, size)));
     }
     nulls_ = std::move(newNulls);
+    rawNulls_ = nulls_->as<uint64_t>();
   }
-  rawNulls_ = nulls_->as<uint64_t>();
 }
 
 template <>
@@ -92,15 +100,8 @@ uint64_t BaseVector::byteSize<bool>(vector_size_t count) {
 void BaseVector::resize(vector_size_t size, bool setNotNull) {
   if (nulls_) {
     auto bytes = byteSize<bool>(size);
-    if (length_ < size) {
-      if (nulls_->size() < bytes) {
-        AlignedBuffer::reallocate<char>(&nulls_, bytes);
-        rawNulls_ = nulls_->as<uint64_t>();
-      }
-      if (setNotNull && size > length_) {
-        bits::fillBits(
-            const_cast<uint64_t*>(rawNulls_), length_, size, bits::kNotNull);
-      }
+    if (length_ < size || !nulls_->isMutable()) {
+      ensureNullsCapacity(size, setNotNull);
     }
     nulls_->setSize(bytes);
   }
@@ -128,6 +129,7 @@ VectorPtr BaseVector::wrapInDictionary(
   // Dictionary that doesn't add nulls over constant is same as constant. Just
   // make sure to adjust the size.
   if (vector->encoding() == VectorEncoding::Simple::CONSTANT && !nulls) {
+    // 这里只调整大小
     if (size == vector->size()) {
       return vector;
     }
@@ -176,7 +178,7 @@ template <TypeKind kind>
 static VectorPtr
 addConstant(vector_size_t size, vector_size_t index, VectorPtr vector) {
   using T = typename KindToFlatVector<kind>::WrapperType;
-
+    // 内存池
   auto pool = vector->pool();
 
   if (vector->isNullAt(index)) {
@@ -192,8 +194,11 @@ addConstant(vector_size_t size, vector_size_t index, VectorPtr vector) {
   }
 
   for (;;) {
+    // 如果向量本身就是常量编码
     if (vector->isConstantEncoding()) {
+        // 类型转换为常量向量
       auto constVector = vector->as<ConstantVector<T>>();
+      // 如果不是复杂类型
       if constexpr (!std::is_same_v<T, ComplexType>) {
         if (!vector->valueVector()) {
           T value = constVector->valueAt(0);
@@ -201,7 +206,7 @@ addConstant(vector_size_t size, vector_size_t index, VectorPtr vector) {
               pool, size, false, vector->type(), std::move(value));
         }
       }
-
+        // 重新设置index
       index = constVector->index();
       vector = vector->valueVector();
     } else if (vector->encoding() == VectorEncoding::Simple::DICTIONARY) {
@@ -445,7 +450,8 @@ void BaseVector::resizeIndices(
     BufferPtr* indices,
     const vector_size_t** raw) {
   if (indices->get() && indices->get()->isMutable()) {
-    if (indices->get()->size() < size * sizeof(vector_size_t)) {
+    auto newByteSize = byteSize<vector_size_t>(size);
+    if (indices->get()->size() < newByteSize) {
       AlignedBuffer::reallocate<vector_size_t>(indices, size, initialValue);
     }
   } else {
@@ -710,11 +716,14 @@ VectorPtr BaseVector::transpose(BufferPtr indices, VectorPtr&& source) {
 }
 
 bool isLazyNotLoaded(const BaseVector& vector) {
+    // 检查向量编码
   switch (vector.encoding()) {
     case VectorEncoding::Simple::LAZY:
+        // 是否未加载
       return !vector.as<LazyVector>()->isLoaded();
     case VectorEncoding::Simple::DICTIONARY:
     case VectorEncoding::Simple::SEQUENCE:
+        // 递归调用
       return isLazyNotLoaded(*vector.valueVector());
     case VectorEncoding::Simple::CONSTANT:
       return vector.valueVector() ? isLazyNotLoaded(*vector.valueVector())

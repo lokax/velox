@@ -15,6 +15,7 @@
  */
 
 #include "velox/dwio/parquet/reader/StructColumnReader.h"
+#include "velox/dwio/parquet/reader/RepeatedColumnReader.h"
 
 namespace facebook::velox::parquet {
 
@@ -22,11 +23,7 @@ StructColumnReader::StructColumnReader(
     const std::shared_ptr<const dwio::common::TypeWithId>& dataType,
     ParquetParams& params,
     common::ScanSpec& scanSpec)
-    : dwio::common::SelectiveStructColumnReader(
-          dataType,
-          dataType,
-          params,
-          scanSpec) {
+    : SelectiveStructColumnReader(dataType, dataType, params, scanSpec) {
   auto& childSpecs = scanSpec_->children();
   for (auto i = 0; i < childSpecs.size(); ++i) {
     if (childSpecs[i]->isConstant()) {
@@ -34,8 +31,7 @@ StructColumnReader::StructColumnReader(
     }
     auto childDataType = nodeType_->childByName(childSpecs[i]->fieldName());
 
-    children_.push_back(
-        ParquetColumnReader::build(childDataType, params, *childSpecs[i]));
+    addChild(ParquetColumnReader::build(childDataType, params, *childSpecs[i]));
     childSpecs[i]->setSubscript(children_.size() - 1);
   }
 }
@@ -44,8 +40,10 @@ void StructColumnReader::enqueueRowGroup(
     uint32_t index,
     dwio::common::BufferedInput& input) {
   for (auto& child : children_) {
-    if (auto structChild = dynamic_cast<StructColumnReader*>(child.get())) {
+    if (auto structChild = dynamic_cast<StructColumnReader*>(child)) {
       structChild->enqueueRowGroup(index, input);
+    } else if (auto listChild = dynamic_cast<ListColumnReader*>(child)) {
+      listChild->enqueueRowGroup(index, input);
     } else {
       child->formatData().as<ParquetData>().enqueueRowGroup(index, input);
     }

@@ -29,11 +29,12 @@
 
 namespace facebook::velox::exec::test {
 
-class RowContainerTestBase : public testing::Test {
+class RowContainerTestBase : public testing::Test,
+                             public velox::test::VectorTestBase {
  protected:
   void SetUp() override {
-    pool_ = memory::getDefaultScopedMemoryPool();
-    mappedMemory_ = memory::MappedMemory::getInstance();
+    pool_ = memory::getDefaultMemoryPool();
+    allocator_ = memory::MemoryAllocator::getInstance();
     if (!isRegisteredVectorSerde()) {
       facebook::velox::serializer::presto::PrestoVectorSerde::
           registerVectorSerde();
@@ -67,11 +68,11 @@ class RowContainerTestBase : public testing::Test {
         isJoinBuild,
         true,
         true,
-        mappedMemory_,
+        allocator_,
         ContainerRowSerde::instance());
   }
 
-  std::unique_ptr<memory::MemoryPool> pool_;
-  memory::MappedMemory* mappedMemory_;
+  std::shared_ptr<memory::MemoryPool> pool_;
+  memory::MemoryAllocator* allocator_;
 };
 } // namespace facebook::velox::exec::test

@@ -57,6 +57,7 @@ namespace facebook::velox::exec {
   }()
 
 namespace {
+    // 对一行数据进行哈希
 template <TypeKind Kind>
 uint64_t hashOne(DecodedVector& decoded, vector_size_t index) {
   if (Kind == TypeKind::ROW || Kind == TypeKind::ARRAY ||
@@ -539,7 +540,9 @@ void VectorHasher::hashPrecomputed(
 }
 
 void VectorHasher::precompute(const BaseVector& value) {
+    // 如果是NULL值，直接设置哈希值就行了
   if (value.isNullAt(0)) {
+    // 预计算哈希
     precomputedHash_ = kNullHash;
     return;
   }

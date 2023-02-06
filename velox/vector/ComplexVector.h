@@ -123,18 +123,14 @@ class RowVector : public BaseVector {
       vector_size_t sourceIndex,
       vector_size_t count) override;
 
-  void copyRanges(
-      const BaseVector* source,
-      const folly::Range<const CopyRange*>& ranges) override {
-    for (auto& range : ranges) {
-      copy(source, range.targetIndex, range.sourceIndex, range.count);
-    }
-  }
-
   void copy(
       const BaseVector* source,
       const SelectivityVector& rows,
       const vector_size_t* toSourceRow) override;
+
+  void copyRanges(
+      const BaseVector* source,
+      const folly::Range<const CopyRange*>& ranges) override;
 
   uint64_t retainedSize() const override {
     auto size = BaseVector::retainedSize();
@@ -255,6 +251,10 @@ struct ArrayVectorBase : BaseVector {
     sizes_->asMutable<vector_size_t>()[i] = size;
   }
 
+  /// Verify that an ArrayVector/MapVector does not contain overlapping [offset,
+  /// size] ranges. Throws in case overlaps are found.
+  void checkRanges() const;
+
  protected:
   ArrayVectorBase(
       velox::memory::MemoryPool* pool,
@@ -276,7 +276,12 @@ struct ArrayVectorBase : BaseVector {
         offsets_(std::move(offsets)),
         rawOffsets_(offsets_->as<vector_size_t>()),
         sizes_(std::move(lengths)),
-        rawSizes_(sizes_->as<vector_size_t>()) {}
+        rawSizes_(sizes_->as<vector_size_t>()) {
+    VELOX_CHECK_GE(
+        offsets_->capacity(), BaseVector::length_ * sizeof(vector_size_t));
+    VELOX_CHECK_GE(
+        sizes_->capacity(), BaseVector::length_ * sizeof(vector_size_t));
+  }
 
   void copyRangesImpl(
       const BaseVector* source,
@@ -535,8 +540,6 @@ class MapVector : public ArrayVectorBase {
   bool hasSortedKeys() const {
     return sortedKeys_;
   }
-
-  vector_size_t reserveMap(vector_size_t offset, vector_size_t size);
 
   void setKeysAndValues(VectorPtr keys, VectorPtr values) {
     keys_ = BaseVector::getOrCreateEmpty(

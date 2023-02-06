@@ -15,6 +15,8 @@
  */
 
 #include <folly/Benchmark.h>
+#include <folly/init/Init.h>
+
 #include <gflags/gflags.h>
 
 #include "velox/vector/fuzzer/VectorFuzzer.h"
@@ -28,7 +30,7 @@ namespace {
 constexpr int kVectorSize = 16 << 10;
 
 struct BenchmarkData {
-  BenchmarkData() : pool_(memory::getDefaultScopedMemoryPool()) {
+  BenchmarkData() : pool_(memory::getDefaultMemoryPool()) {
     VectorFuzzer::Options opts;
     opts.nullRatio = 0.01;
     opts.vectorSize = kVectorSize;
@@ -40,7 +42,7 @@ struct BenchmarkData {
   }
 
  private:
-  std::unique_ptr<memory::MemoryPool> pool_;
+  std::shared_ptr<memory::MemoryPool> pool_;
 
  public:
   VectorPtr flatVector;
@@ -93,6 +95,7 @@ DEFINE_BENCHMARKS(row)
 } // namespace facebook::velox
 
 int main(int argc, char* argv[]) {
+  folly::init(&argc, &argv);
   using namespace facebook::velox;
   gflags::ParseCommandLineFlags(&argc, &argv, true);
   VELOX_CHECK_LE(FLAGS_slice_size, kVectorSize);

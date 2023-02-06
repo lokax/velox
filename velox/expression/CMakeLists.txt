@@ -31,14 +31,16 @@ add_library(
   ExprCompiler.cpp
   ExprToSubfieldFilter.cpp
   FieldReference.cpp
+  FunctionCallToSpecialForm.cpp
   LambdaExpr.cpp
   VectorFunction.cpp
   SimpleFunctionRegistry.cpp
   SwitchExpr.cpp
   TryExpr.cpp)
 
-target_link_libraries(velox_expression velox_core velox_vector
-                      velox_common_base velox_expression_functions)
+target_link_libraries(
+  velox_expression velox_core velox_vector velox_common_base
+  velox_expression_functions velox_functions_util)
 
 add_subdirectory(type_calculation)
 

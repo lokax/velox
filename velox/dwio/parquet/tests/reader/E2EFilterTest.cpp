@@ -35,6 +35,25 @@ class E2EFilterTest : public E2EFilterTestBase {
     writerProperties_ = ::parquet::WriterProperties::Builder().build();
   }
 
+  void testWithTypes(
+      const std::string& columns,
+      std::function<void()> customize,
+      bool wrapInStruct,
+      const std::vector<std::string>& filterable,
+      int32_t numCombinations) {
+    testSenario(columns, customize, wrapInStruct, filterable, numCombinations);
+
+    // Always test no null case.
+    auto newCustomize = [&]() {
+      if (customize) {
+        customize();
+      }
+      makeNotNull(0);
+    };
+    testSenario(
+        columns, newCustomize, wrapInStruct, filterable, numCombinations);
+  }
+
   void writeToMemory(
       const TypePtr&,
       const std::vector<RowVectorPtr>& batches,
@@ -63,9 +82,10 @@ class E2EFilterTest : public E2EFilterTestBase {
 
 TEST_F(E2EFilterTest, writerMagic) {
   rowType_ = ROW({INTEGER()});
-  batches_.push_back(std::static_pointer_cast<RowVector>(
+  std::vector<RowVectorPtr> batches;
+  batches.push_back(std::static_pointer_cast<RowVector>(
       test::BatchMaker::createBatch(rowType_, 20000, *pool_, nullptr, 0)));
-  writeToMemory(rowType_, batches_, false);
+  writeToMemory(rowType_, batches, false);
   auto data = sinkPtr_->getData();
   auto size = sinkPtr_->size();
   EXPECT_EQ("PAR1", std::string(data, 4));
@@ -85,8 +105,7 @@ TEST_F(E2EFilterTest, integerDirect) {
       [&]() { makeAllNulls("long_null"); },
       false,
       {"short_val", "int_val", "long_val"},
-      20,
-      true);
+      20);
 }
 
 TEST_F(E2EFilterTest, integerDictionary) {
@@ -110,7 +129,7 @@ TEST_F(E2EFilterTest, integerDictionary) {
         "long_val:bigint",
         [&]() {
           makeIntDistribution<int64_t>(
-              Subfield("long_val"),
+              "long_val",
               10, // min
               100, // max
               22, // repeats
@@ -120,7 +139,7 @@ TEST_F(E2EFilterTest, integerDictionary) {
               true); // keepNulls
 
           makeIntDistribution<int32_t>(
-              Subfield("int_val"),
+              "int_val",
               10, // min
               100, // max
               22, // repeats
@@ -130,7 +149,7 @@ TEST_F(E2EFilterTest, integerDictionary) {
               false); // keepNulls
 
           makeIntDistribution<int16_t>(
-              Subfield("short_val"),
+              "short_val",
               10, // min
               100, // max
               22, // repeats
@@ -141,8 +160,7 @@ TEST_F(E2EFilterTest, integerDictionary) {
         },
         false,
         {"short_val", "int_val", "long_val"},
-        20,
-        true);
+        20);
   }
 }
 
@@ -161,14 +179,12 @@ TEST_F(E2EFilterTest, floatAndDoubleDirect) {
       "float_null:float",
       [&]() {
         makeAllNulls("float_null");
-        makeQuantizedFloat<float>(Subfield("float_val2"), 200, true);
-        makeQuantizedFloat<double>(Subfield("double_val2"), 522, true);
+        makeQuantizedFloat<float>("float_val2", 200, true);
+        makeQuantizedFloat<double>("double_val2", 522, true);
       },
       false,
       {"float_val", "double_val", "float_val2", "double_val2", "float_null"},
-      20,
-      true,
-      false);
+      20);
 }
 
 TEST_F(E2EFilterTest, floatAndDouble) {
@@ -185,36 +201,29 @@ TEST_F(E2EFilterTest, floatAndDouble) {
       "float_null:float",
       [&]() {
         makeAllNulls("float_null");
-        makeQuantizedFloat<float>(Subfield("float_val2"), 200, true);
-        makeQuantizedFloat<double>(Subfield("double_val2"), 522, true);
+        makeQuantizedFloat<float>("float_val2", 200, true);
+        makeQuantizedFloat<double>("double_val2", 522, true);
         // Make sure there are RLE's.
-        auto floats = batches_[0]->childAt(2)->as<FlatVector<float>>();
-        auto doubles = batches_[0]->childAt(3)->as<FlatVector<double>>();
-        for (auto i = 100; i < 200; ++i) {
-          // This makes a RLE even if some nulls along the way.
-          floats->set(i, 0.66);
-          doubles->set(i, 0.66);
-        }
+        makeReapeatingValues<float>("float_val2", 0, 100, 200, 10.1);
+        makeReapeatingValues<double>("double_val2", 0, 100, 200, 100.8);
       },
       false,
       {"float_val", "double_val", "float_val2", "double_val2", "float_null"},
-      20,
-      true,
-      false);
+      20);
 }
 
 TEST_F(E2EFilterTest, shortDecimalDictionary) {
   // decimal(10, 5) maps to 5 bytes FLBA in Parquet.
   // decimal(17, 5) maps to 8 bytes FLBA in Parquet.
   for (const auto& type : {
-           "shortdecimal_val:short_decimal(10, 5)",
-           "shortdecimal_val:short_decimal(17, 5)",
+           "shortdecimal_val:decimal(10, 5)",
+           "shortdecimal_val:decimal(17, 5)",
        }) {
     testWithTypes(
         type,
         [&]() {
           makeIntDistribution<UnscaledShortDecimal>(
-              Subfield("shortdecimal_val"),
+              "shortdecimal_val",
               UnscaledShortDecimal(10), // min
               UnscaledShortDecimal(100), // max
               22, // repeats
@@ -225,9 +234,7 @@ TEST_F(E2EFilterTest, shortDecimalDictionary) {
         },
         false,
         {"shortdecimal_val"},
-        20,
-        true,
-        false);
+        20);
   }
 }
 
@@ -239,14 +246,14 @@ TEST_F(E2EFilterTest, shortDecimalDirect) {
   // decimal(10, 5) maps to 5 bytes FLBA in Parquet.
   // decimal(17, 5) maps to 8 bytes FLBA in Parquet.
   for (const auto& type : {
-           "shortdecimal_val:short_decimal(10, 5)",
-           "shortdecimal_val:short_decimal(17, 5)",
+           "shortdecimal_val:decimal(10, 5)",
+           "shortdecimal_val:decimal(17, 5)",
        }) {
     testWithTypes(
         type,
         [&]() {
           makeIntDistribution<UnscaledShortDecimal>(
-              Subfield("shortdecimal_val"),
+              "shortdecimal_val",
               UnscaledShortDecimal(10), // min
               UnscaledShortDecimal(100), // max
               22, // repeats
@@ -257,24 +264,34 @@ TEST_F(E2EFilterTest, shortDecimalDirect) {
         },
         false,
         {"shortdecimal_val"},
-        20,
-        true,
-        false);
+        20);
   }
+
+  testWithTypes(
+      "shortdecimal_val:decimal(10, 5)",
+      [&]() {
+        useSuppliedValues<UnscaledShortDecimal>(
+            "shortdecimal_val",
+            0,
+            {UnscaledShortDecimal(-479), UnscaledShortDecimal(40000000)});
+      },
+      false,
+      {"shortdecimal_val"},
+      20);
 }
 
 TEST_F(E2EFilterTest, longDecimalDictionary) {
   // decimal(30, 10) maps to 13 bytes FLBA in Parquet.
   // decimal(37, 15) maps to 16 bytes FLBA in Parquet.
   for (const auto& type : {
-           "longdecimal_val:long_decimal(30, 10)",
-           "longdecimal_val:long_decimal(37, 15)",
+           "longdecimal_val:decimal(30, 10)",
+           "longdecimal_val:decimal(37, 15)",
        }) {
     testWithTypes(
         type,
         [&]() {
           makeIntDistribution<UnscaledLongDecimal>(
-              Subfield("longdecimal_val"),
+              "longdecimal_val",
               UnscaledLongDecimal(10), // min
               UnscaledLongDecimal(100), // max
               22, // repeats
@@ -285,9 +302,7 @@ TEST_F(E2EFilterTest, longDecimalDictionary) {
         },
         false,
         {},
-        20,
-        true,
-        false);
+        20);
   }
 }
 
@@ -299,14 +314,14 @@ TEST_F(E2EFilterTest, longDecimalDirect) {
   // decimal(30, 10) maps to 13 bytes FLBA in Parquet.
   // decimal(37, 15) maps to 16 bytes FLBA in Parquet.
   for (const auto& type : {
-           "longdecimal_val:long_decimal(30, 10)",
-           "longdecimal_val:long_decimal(37, 15)",
+           "longdecimal_val:decimal(30, 10)",
+           "longdecimal_val:decimal(37, 15)",
        }) {
     testWithTypes(
         type,
         [&]() {
           makeIntDistribution<UnscaledLongDecimal>(
-              Subfield("longdecimal_val"),
+              "longdecimal_val",
               UnscaledLongDecimal(10), // min
               UnscaledLongDecimal(100), // max
               22, // repeats
@@ -317,10 +332,21 @@ TEST_F(E2EFilterTest, longDecimalDirect) {
         },
         false,
         {},
-        20,
-        true,
-        false);
+        20);
   }
+
+  testWithTypes(
+      "longdecimal_val:decimal(30, 10)",
+      [&]() {
+        useSuppliedValues<UnscaledLongDecimal>(
+            "longdecimal_val",
+            0,
+            {UnscaledLongDecimal(-479),
+             UnscaledLongDecimal(buildInt128(1546093991, 4054979645))});
+      },
+      false,
+      {},
+      20);
 }
 
 TEST_F(E2EFilterTest, stringDirect) {
@@ -333,27 +359,27 @@ TEST_F(E2EFilterTest, stringDirect) {
       "string_val:string,"
       "string_val_2:string",
       [&]() {
-        makeStringUnique(Subfield("string_val"));
-        makeStringUnique(Subfield("string_val_2"));
+        makeStringUnique("string_val");
+        makeStringUnique("string_val_2");
       },
       false,
       {"string_val", "string_val_2"},
-      20,
-      true);
+      20);
 }
 
 TEST_F(E2EFilterTest, stringDictionary) {
   testWithTypes(
       "string_val:string,"
-      "string_val_2:string",
+      "string_val_2:string,"
+      "string_const: string",
       [&]() {
-        makeStringDistribution(Subfield("string_val"), 100, true, false);
-        makeStringDistribution(Subfield("string_val_2"), 170, false, true);
+        makeStringDistribution("string_val", 100, true, false);
+        makeStringDistribution("string_val_2", 170, false, true);
+        makeStringDistribution("string_const", 1, true, false);
       },
       false,
       {"string_val", "string_val_2"},
-      20,
-      true);
+      20);
 }
 
 TEST_F(E2EFilterTest, dedictionarize) {
@@ -367,13 +393,24 @@ TEST_F(E2EFilterTest, dedictionarize) {
       "string_val:string,"
       "string_val_2:string",
       [&]() {
-        makeStringDistribution(Subfield("string_val"), 10000000, true, false);
-        makeStringDistribution(Subfield("string_val_2"), 1700000, false, true);
+        makeStringDistribution("string_val", 10000000, true, false);
+        makeStringDistribution("string_val_2", 1700000, false, true);
       },
       false,
       {"long_val", "string_val", "string_val_2"},
-      20,
-      true);
+      20);
+}
+
+TEST_F(E2EFilterTest, scalarList) {
+  // Break up the leaf data in small pages to cover coalescing repdefs.
+  writerProperties_ =
+      ::parquet::WriterProperties::Builder().data_pagesize(4 * 1024)->build();
+  testWithTypes(
+      "long_val:bigint, array_val:array<int>",
+      nullptr,
+      false,
+      {"long_val"},
+      10);
 }
 
 // Define main so that gflags get processed.

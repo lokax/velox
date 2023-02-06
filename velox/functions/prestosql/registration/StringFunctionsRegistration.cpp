@@ -55,6 +55,7 @@ void registerSimpleFunctions() {
   registerFunction<RPadFunction, Varchar, Varchar, int64_t, Varchar>({"rpad"});
 
   // Register hash functions.
+  registerFunction<CRC32Function, int64_t, Varbinary>({"crc32"});
   registerFunction<XxHash64Function, Varbinary, Varbinary>({"xxhash64"});
   registerFunction<Md5Function, Varbinary, Varbinary>({"md5"});
   registerFunction<Sha256Function, Varbinary, Varbinary>({"sha256"});
@@ -82,7 +83,6 @@ void registerStringFunctions() {
   VELOX_REGISTER_VECTOR_FUNCTION(udf_upper, "upper");
   VELOX_REGISTER_VECTOR_FUNCTION(udf_split, "split");
   VELOX_REGISTER_VECTOR_FUNCTION(udf_concat, "concat");
-  VELOX_REGISTER_VECTOR_FUNCTION(udf_strpos, "strpos");
   VELOX_REGISTER_VECTOR_FUNCTION(udf_replace, "replace");
   VELOX_REGISTER_VECTOR_FUNCTION(udf_reverse, "reverse");
   VELOX_REGISTER_VECTOR_FUNCTION(udf_to_utf8, "to_utf8");
@@ -95,6 +95,11 @@ void registerStringFunctions() {
   exec::registerStatefulVectorFunction(
       "regexp_like", re2SearchSignatures(), makeRe2Search);
 
-  registerType("json", std::make_unique<const JsonTypeFactories>());
+  registerFunction<StrLPosFunction, int64_t, Varchar, Varchar>({"strpos"});
+  registerFunction<StrLPosFunction, int64_t, Varchar, Varchar, int64_t>(
+      {"strpos"});
+  registerFunction<StrRPosFunction, int64_t, Varchar, Varchar>({"strrpos"});
+  registerFunction<StrRPosFunction, int64_t, Varchar, Varchar, int64_t>(
+      {"strrpos"});
 }
 } // namespace facebook::velox::functions

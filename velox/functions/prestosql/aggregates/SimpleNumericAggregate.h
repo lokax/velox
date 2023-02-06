@@ -53,24 +53,41 @@ class SimpleNumericAggregate : public exec::Aggregate {
         (*result)->type()->toString());
     VELOX_CHECK_EQ(vector->elementSize(), sizeof(TData));
     vector->resize(numGroups);
-    TData* rawValues = vector->mutableRawValues();
     uint64_t* rawNulls = getRawNulls(vector);
-    for (int32_t i = 0; i < numGroups; ++i) {
-      char* group = groups[i];
-      if (isNull(group)) {
-        vector->setNull(i, true);
-      } else {
-        clearNull(rawNulls, i);
-        rawValues[i] = extractOneValue(group);
+    if constexpr (std::is_same_v<TData, bool>) {
+      uint64_t* rawValues = vector->template mutableRawValues<uint64_t>();
+      for (int32_t i = 0; i < numGroups; ++i) {
+        char* group = groups[i];
+        if (isNull(group)) {
+          vector->setNull(i, true);
+        } else {
+          clearNull(rawNulls, i);
+          bits::setBit(rawValues, i, extractOneValue(group));
+        }
+      }
+    } else {
+      TData* rawValues = vector->mutableRawValues();
+      for (int32_t i = 0; i < numGroups; ++i) {
+        char* group = groups[i];
+        if (isNull(group)) {
+          vector->setNull(i, true);
+        } else {
+          clearNull(rawNulls, i);
+          rawValues[i] = extractOneValue(group);
+        }
       }
     }
   }
 
-  // TData is either TAccumulator or TResult, which in most cases are the same,
+  // TData is used to store the updated group states. It can be either
+  // TAccumulator or TResult, which in most cases are the same, but for
+  // sum(real) can differ. TValue is used to decode the update input 'args'.
+  // It can be either TAccumulator or TInput, which is most cases are the same
   // but for sum(real) can differ.
   template <
       bool tableHasNulls,
       typename TData = TResult,
+      typename TValue = TInput,
       typename UpdateSingleValue>
   void updateGroups(
       char** groups,
@@ -81,7 +98,7 @@ class SimpleNumericAggregate : public exec::Aggregate {
     DecodedVector decoded(*arg, rows, !mayPushdown);
     auto encoding = decoded.base()->encoding();
     if (encoding == VectorEncoding::Simple::LAZY) {
-      SimpleCallableHook<TInput, TData, UpdateSingleValue> hook(
+      SimpleCallableHook<TValue, TData, UpdateSingleValue> hook(
           exec::Aggregate::offset_,
           exec::Aggregate::nullByte_,
           exec::Aggregate::nullMask_,
@@ -95,24 +112,28 @@ class SimpleNumericAggregate : public exec::Aggregate {
       return;
     }
 
+    // 常量编码
     if (decoded.isConstantMapping()) {
       if (!decoded.isNullAt(0)) {
-        auto value = decoded.valueAt<TInput>(0);
+        // 不是NULL值，拿出第一个值
+        auto value = decoded.valueAt<TValue>(0);
         rows.applyToSelected([&](vector_size_t i) {
           updateNonNullValue<tableHasNulls, TData>(
               groups[i], TData(value), updateSingleValue);
         });
       }
     } else if (decoded.mayHaveNulls()) {
+        // 如果有NULL值的话，则忽略NULL值
       rows.applyToSelected([&](vector_size_t i) {
         if (decoded.isNullAt(i)) {
           return;
         }
+        // 更新非NULL值
         updateNonNullValue<tableHasNulls, TData>(
-            groups[i], TData(decoded.valueAt<TInput>(i)), updateSingleValue);
+            groups[i], TData(decoded.valueAt<TValue>(i)), updateSingleValue);
       });
-    } else if (decoded.isIdentityMapping() && !std::is_same_v<TInput, bool>) {
-      auto data = decoded.data<TInput>();
+    } else if (decoded.isIdentityMapping() && !std::is_same_v<TValue, bool>) {
+      auto data = decoded.data<TValue>();
       rows.applyToSelected([&](vector_size_t i) {
         updateNonNullValue<tableHasNulls, TData>(
             groups[i], TData(data[i]), updateSingleValue);
@@ -120,15 +141,19 @@ class SimpleNumericAggregate : public exec::Aggregate {
     } else {
       rows.applyToSelected([&](vector_size_t i) {
         updateNonNullValue<tableHasNulls, TData>(
-            groups[i], TData(decoded.valueAt<TInput>(i)), updateSingleValue);
+            groups[i], TData(decoded.valueAt<TValue>(i)), updateSingleValue);
       });
     }
   }
 
-  // TData is either TAccumulator or TResult, which in most cases are the same,
+  // TData is used to store the updated group state. It can be either
+  // TAccumulator or TResult, which in most cases are the same, but for
+  // sum(real) can differ. TValue is used to decode the update input 'args'.
+  // It can be either TAccumulator or TInput, which is most cases are the same
   // but for sum(real) can differ.
   template <
       typename TData = TResult,
+      typename TValue = TInput,
       typename UpdateSingle,
       typename UpdateDuplicate>
   void updateOneGroup(
@@ -146,7 +171,7 @@ class SimpleNumericAggregate : public exec::Aggregate {
       if (!decoded.isNullAt(0)) {
         updateDuplicateValues(
             initialValue,
-            TData(decoded.valueAt<TInput>(0)),
+            TData(decoded.valueAt<TValue>(0)),
             rows.countSelected());
         updateNonNullValue<true, TData>(group, initialValue, updateSingleValue);
       }
@@ -156,10 +181,10 @@ class SimpleNumericAggregate : public exec::Aggregate {
           return;
         }
         updateNonNullValue<true, TData>(
-            group, TData(decoded.valueAt<TInput>(i)), updateSingleValue);
+            group, TData(decoded.valueAt<TValue>(i)), updateSingleValue);
       });
-    } else if (decoded.isIdentityMapping() && !std::is_same_v<TInput, bool>) {
-      auto data = decoded.data<TInput>();
+    } else if (decoded.isIdentityMapping() && !std::is_same_v<TValue, bool>) {
+      auto data = decoded.data<TValue>();
       rows.applyToSelected([&](vector_size_t i) {
         updateNonNullValue<true, TData>(
             group, TData(data[i]), updateSingleValue);
@@ -167,7 +192,7 @@ class SimpleNumericAggregate : public exec::Aggregate {
     } else {
       rows.applyToSelected([&](vector_size_t i) {
         updateNonNullValue<true, TData>(
-            group, TData(decoded.valueAt<TInput>(i)), updateSingleValue);
+            group, TData(decoded.valueAt<TValue>(i)), updateSingleValue);
       });
     }
   }
@@ -216,8 +241,11 @@ class SimpleNumericAggregate : public exec::Aggregate {
   inline void
   updateNonNullValue(char* group, TDataType value, Update updateValue) {
     if constexpr (tableHasNulls) {
+        // 清除NULL比特值
       exec::Aggregate::clearNull(group);
     }
+    // updateValue是子类传进来的函数指针
+    // 更新聚合函数状态
     updateValue(*exec::Aggregate::value<TDataType>(group), value);
   }
 };

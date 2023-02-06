@@ -15,6 +15,8 @@
  */
 
 #include <folly/Benchmark.h>
+#include <folly/init/Init.h>
+
 #include <gflags/gflags.h>
 
 #include "velox/common/memory/Memory.h"
@@ -26,7 +28,7 @@ namespace {
 
 using namespace facebook::velox;
 
-std::unique_ptr<memory::MemoryPool> pool{memory::getDefaultScopedMemoryPool()};
+std::shared_ptr<memory::MemoryPool> pool{memory::getDefaultMemoryPool()};
 
 VectorFuzzer::Options getOpts(size_t n, double nullRatio = 0) {
   VectorFuzzer::Options opts;
@@ -126,6 +128,7 @@ BENCHMARK_RELATIVE_MULTI(flatMapArrayNested, n) {
 } // namespace
 
 int main(int argc, char* argv[]) {
+  folly::init(&argc, &argv);
   gflags::ParseCommandLineFlags(&argc, &argv, true);
   folly::runBenchmarks();
   return 0;

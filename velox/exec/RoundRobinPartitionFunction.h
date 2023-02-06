@@ -20,6 +20,7 @@
 
 namespace facebook::velox::exec {
 
+// 这个简单
 class RoundRobinPartitionFunction : public core::PartitionFunction {
  public:
   explicit RoundRobinPartitionFunction(int numPartitions)

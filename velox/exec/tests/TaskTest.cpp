@@ -17,6 +17,7 @@
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/connectors/hive/HiveConnector.h"
+#include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/Cursor.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
@@ -45,6 +46,7 @@ class TaskTest : public HiveConnectorTestBase {
 
     VELOX_CHECK(task->supportsSingleThreadedExecution());
 
+    vector_size_t numRows = 0;
     std::vector<RowVectorPtr> results;
     for (;;) {
       auto result = task->next();
@@ -56,9 +58,16 @@ class TaskTest : public HiveConnectorTestBase {
         child->loadedVector();
       }
       results.push_back(result);
+      numRows += result->size();
     }
 
     VELOX_CHECK(waitForTaskCompletion(task.get()));
+
+    auto planNodeStats = toPlanStats(task->taskStats());
+    VELOX_CHECK(planNodeStats.count(plan.planNode->id()));
+    VELOX_CHECK_EQ(numRows, planNodeStats.at(plan.planNode->id()).outputRows);
+    VELOX_CHECK_EQ(
+        results.size(), planNodeStats.at(plan.planNode->id()).outputVectors);
 
     return {task, results};
   }
@@ -78,7 +87,10 @@ TEST_F(TaskTest, wrongPlanNodeForSplit) {
                   .planFragment();
 
   exec::Task task(
-      "task-1", std::move(plan), 0, core::QueryCtx::createForTest());
+      "task-1",
+      std::move(plan),
+      0,
+      std::make_shared<core::QueryCtx>(driverExecutor_.get()));
 
   // Add split for the source node.
   task.addSplit("0", exec::Split(folly::copy(connectorSplit)));
@@ -127,7 +139,10 @@ TEST_F(TaskTest, wrongPlanNodeForSplit) {
           .planFragment();
 
   exec::Task valuesTask(
-      "task-2", std::move(plan), 0, core::QueryCtx::createForTest());
+      "task-2",
+      std::move(plan),
+      0,
+      std::make_shared<core::QueryCtx>(driverExecutor_.get()));
   errorMessage =
       "Splits can be associated only with leaf plan nodes which require splits. Plan node ID 0 doesn't refer to such plan node.";
   VELOX_ASSERT_THROW(
@@ -149,7 +164,11 @@ TEST_F(TaskTest, duplicatePlanNodeIds) {
                   .planFragment();
 
   VELOX_ASSERT_THROW(
-      exec::Task("task-1", std::move(plan), 0, core::QueryCtx::createForTest()),
+      exec::Task(
+          "task-1",
+          std::move(plan),
+          0,
+          std::make_shared<core::QueryCtx>(driverExecutor_.get())),
       "Plan node IDs must be unique. Found duplicate ID: 0.")
 }
 
@@ -447,7 +466,8 @@ TEST_F(TaskTest, singleThreadedExecution) {
   uint64_t numDeletedTasks = Task::numDeletedTasks();
   {
     auto [task, results] = executeSingleThreaded(plan);
-    assertEqualResults({expectedResult, expectedResult}, results);
+    assertEqualResults(
+        std::vector<RowVectorPtr>{expectedResult, expectedResult}, results);
   }
   ASSERT_EQ(numCreatedTasks + 1, Task::numCreatedTasks());
   ASSERT_EQ(numDeletedTasks + 1, Task::numDeletedTasks());
@@ -626,7 +646,7 @@ DEBUG_ONLY_TEST_F(TaskTest, outputDriverFinishEarly) {
           .limit(0, 1, false)
           .planNode();
 
-  // Setup the test value to generate the race condition that the output
+  // Set up the test value to generate the race condition that the output
   // pipeline finishes early and terminate the task while the input pipeline
   // driver is running on thread.
   ContinuePromise mergePromise("mergePromise");
@@ -667,14 +687,80 @@ DEBUG_ONLY_TEST_F(TaskTest, outputDriverFinishEarly) {
 
   CursorParameters params;
   params.planNode = plan;
-  params.queryCtx = core::QueryCtx::createForTest();
+  params.queryCtx = std::make_shared<core::QueryCtx>(driverExecutor_.get());
   params.queryCtx->setConfigOverridesUnsafe(
       {{core::QueryConfig::kPreferredOutputBatchSize, "1"}});
   auto task = assertQueryOrdered(params, "VALUES (0)", {0});
-  waitForTaskCompletion(task.get(), 1'000'000);
+  ASSERT_TRUE(waitForTaskCompletion(task.get(), 1'000'000));
   task.reset();
   valuePromise.setValue();
   // Wait for Values driver to complete.
   driverFuture.wait();
 }
+
+/// Test that we export operator stats for unfinished (running) operators.
+DEBUG_ONLY_TEST_F(TaskTest, liveStats) {
+  constexpr int32_t numBatches = 10;
+  std::vector<RowVectorPtr> dataBatches;
+  dataBatches.reserve(numBatches);
+  for (int32_t i = 0; i < numBatches; ++i) {
+    dataBatches.push_back(makeRowVector({makeFlatVector<int64_t>({0, 1, 10})}));
+  }
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan = PlanBuilder(planNodeIdGenerator).values(dataBatches).planNode();
+
+  Task* task = nullptr;
+  std::array<TaskStats, numBatches + 1> liveStats; // [0, 10].
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::exec::Values::getOutput",
+      std::function<void(const int32_t*)>(([&](const int32_t* outputIdx) {
+        liveStats[*outputIdx] = task->taskStats();
+      })));
+
+  CursorParameters params;
+  params.planNode = plan;
+  params.queryCtx = std::make_shared<core::QueryCtx>(executor_.get());
+  params.queryCtx->setConfigOverridesUnsafe(
+      {{core::QueryConfig::kPreferredOutputBatchSize, "1"}});
+
+  auto cursor = std::make_unique<TaskCursor>(params);
+  std::vector<RowVectorPtr> result;
+  task = cursor->task().get();
+  while (cursor->moveNext()) {
+    result.push_back(cursor->current());
+  }
+  EXPECT_TRUE(waitForTaskCompletion(task)) << task->taskId();
+
+  TaskStats finishStats = task->taskStats();
+
+  for (auto i = 0; i < numBatches; ++i) {
+    const auto& operatorStats = liveStats[i].pipelineStats[0].operatorStats[0];
+    EXPECT_EQ(i, operatorStats.getOutputTiming.count);
+    EXPECT_EQ(32 * i, operatorStats.outputBytes);
+    EXPECT_EQ(3 * i, operatorStats.outputPositions);
+    EXPECT_EQ(i, operatorStats.outputVectors);
+    EXPECT_EQ(0, operatorStats.finishTiming.count);
+
+    EXPECT_EQ(1, liveStats[i].numTotalDrivers);
+    EXPECT_EQ(0, liveStats[i].numCompletedDrivers);
+    EXPECT_EQ(0, liveStats[i].numTerminatedDrivers);
+    EXPECT_EQ(1, liveStats[i].numRunningDrivers);
+    EXPECT_EQ(0, liveStats[i].numBlockedDrivers.size());
+  }
+
+  EXPECT_EQ(1, finishStats.numTotalDrivers);
+  EXPECT_EQ(1, finishStats.numCompletedDrivers);
+  EXPECT_EQ(0, finishStats.numTerminatedDrivers);
+  EXPECT_EQ(0, finishStats.numRunningDrivers);
+  EXPECT_EQ(0, finishStats.numBlockedDrivers.size());
+
+  const auto& operatorStats = finishStats.pipelineStats[0].operatorStats[0];
+  EXPECT_EQ(numBatches + 1, operatorStats.getOutputTiming.count);
+  EXPECT_EQ(32 * numBatches, operatorStats.outputBytes);
+  EXPECT_EQ(3 * numBatches, operatorStats.outputPositions);
+  EXPECT_EQ(numBatches, operatorStats.outputVectors);
+  EXPECT_EQ(1, operatorStats.finishTiming.count);
+}
+
 } // namespace facebook::velox::exec::test

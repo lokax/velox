@@ -16,6 +16,7 @@
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/memory/ByteStream.h"
 #include "velox/serializers/PrestoSerializer.h"
 #include "velox/vector/BaseVector.h"
@@ -95,7 +96,7 @@ int NonPOD::alive = 0;
 class VectorTest : public testing::Test, public test::VectorTestBase {
  protected:
   void SetUp() override {
-    mappedMemory_ = memory::MappedMemory::getInstance();
+    allocator_ = memory::MemoryAllocator::getInstance();
     if (!isRegisteredVectorSerde()) {
       facebook::velox::serializer::presto::PrestoVectorSerde::
           registerVectorSerde();
@@ -324,6 +325,15 @@ class VectorTest : public testing::Test, public test::VectorTestBase {
       EXPECT_FALSE(flat->isNullAt(size * 2 - 1));
     }
 
+    // Check that new StringView elements are initialized as empty after
+    // downsize and upsize which does not involve a capacity change.
+    if constexpr (std::is_same_v<T, StringView>) {
+      flat->mutableRawValues()[size * 2 - 1] = StringView("a");
+      flat->resize(size * 2 - 1);
+      flat->resize(size * 2);
+      EXPECT_EQ(flat->valueAt(size * 2 - 1).size(), 0);
+    }
+
     // Fill, the values at size * 2 - 1 gets assigned a second time.
     for (int32_t i = 0; i < flat->size(); ++i) {
       if (withNulls && i % 3 == 0) {
@@ -496,6 +506,16 @@ class VectorTest : public testing::Test, public test::VectorTestBase {
       EXPECT_TRUE(source->equalValueAt(target.get(), i, sourceSize + i));
     }
 
+    std::vector<BaseVector::CopyRange> ranges = {
+        {0, 0, sourceSize},
+        {0, sourceSize, sourceSize},
+    };
+    target->copyRanges(source.get(), ranges);
+    for (int32_t i = 0; i < sourceSize; ++i) {
+      EXPECT_TRUE(source->equalValueAt(target.get(), i, i));
+      EXPECT_TRUE(source->equalValueAt(target.get(), i, sourceSize + i));
+    }
+
     // Check that uninitialized is copyable.
     target->resize(target->size() + 100);
     target->copy(target.get(), target->size() - 50, target->size() - 100, 50);
@@ -658,6 +678,14 @@ class VectorTest : public testing::Test, public test::VectorTestBase {
           std::make_unique<TestingLoader>(slice));
       testSlices(wrapped, level - 1);
     }
+    {
+      // Test that resize works even when the underlying buffers are
+      // immutable. This is true for a slice since it creates buffer views over
+      // the buffers of the original vector that it sliced.
+      auto newSize = slice->size() * 2;
+      slice->resize(newSize);
+      EXPECT_EQ(slice->size(), newSize);
+    }
   }
 
   static void testSlices(const VectorPtr& slice, int level = 2) {
@@ -729,10 +757,10 @@ class VectorTest : public testing::Test, public test::VectorTestBase {
     auto sourceRow = makeRowVector({"c"}, {source});
     auto sourceRowType = asRowType(sourceRow->type());
 
-    VectorStreamGroup even(mappedMemory_);
+    VectorStreamGroup even(allocator_);
     even.createStreamTree(sourceRowType, source->size() / 4);
 
-    VectorStreamGroup odd(mappedMemory_);
+    VectorStreamGroup odd(allocator_);
     odd.createStreamTree(sourceRowType, source->size() / 3);
 
     std::vector<IndexRange> evenIndices;
@@ -839,7 +867,7 @@ class VectorTest : public testing::Test, public test::VectorTestBase {
     EXPECT_NE(slice->rawSizes(), sizes);
   }
 
-  memory::MappedMemory* mappedMemory_;
+  memory::MemoryAllocator* allocator_;
 
   size_t vectorSize_{100};
   size_t numIterations_{3};
@@ -1049,6 +1077,7 @@ TEST_F(VectorTest, map) {
 }
 
 TEST_F(VectorTest, unknown) {
+  // Creates a const UNKNOWN vector.
   auto constUnknownVector =
       BaseVector::createConstant(variant(TypeKind::UNKNOWN), 123, pool_.get());
   ASSERT_FALSE(constUnknownVector->isScalar());
@@ -1058,6 +1087,7 @@ TEST_F(VectorTest, unknown) {
     ASSERT_TRUE(constUnknownVector->isNullAt(i));
   }
 
+  // Create an int vector and copy UNKNOWN const vector into it.
   auto intVector = BaseVector::create(BIGINT(), 10, pool_.get());
   ASSERT_FALSE(intVector->isNullAt(0));
   ASSERT_FALSE(intVector->mayHaveNulls());
@@ -1087,6 +1117,17 @@ TEST_F(VectorTest, unknown) {
   }
   // Can't copy to UNKNOWN vector.
   EXPECT_ANY_THROW(unknownVector->copy(intVector.get(), rows, nullptr));
+
+  // Copying flat UNKNOWN into integer vector nulls out all the copied element.
+  ASSERT_FALSE(intVector->isNullAt(3));
+  intVector->copy(unknownVector.get(), 3, 3, 1);
+  ASSERT_TRUE(intVector->isNullAt(3));
+
+  rows.resize(intVector->size());
+  intVector->copy(unknownVector.get(), rows, nullptr);
+  for (int i = 0; i < intVector->size(); ++i) {
+    ASSERT_TRUE(intVector->isNullAt(i));
+  }
 
   // It is okay to copy to a non-constant UNKNOWN vector.
   unknownVector->copy(constUnknownVector.get(), rows, nullptr);
@@ -1874,6 +1915,42 @@ TEST_F(VectorTest, selectiveLoadingOfLazyDictionaryNested) {
   ASSERT_EQ(loaderPtr->rowCount(), 1 + size / 4);
 }
 
+TEST_F(VectorTest, nestedLazy) {
+  // Verify that explicit checks are triggered that ensure lazy vectors cannot
+  // be nested within two different top level vectors.
+  vector_size_t size = 10;
+  auto indexAt = [](vector_size_t) { return 0; };
+  auto makeLazy = [&]() {
+    return std::make_shared<LazyVector>(
+        pool_.get(),
+        INTEGER(),
+        size,
+        std::make_unique<TestingLoader>(
+            makeFlatVector<int64_t>(size, [](auto row) { return row; })));
+  };
+  auto lazy = makeLazy();
+  auto dict = BaseVector::wrapInDictionary(
+      nullptr, makeIndices(size, indexAt), size, lazy);
+
+  VELOX_ASSERT_THROW(
+      BaseVector::wrapInDictionary(
+          nullptr, makeIndices(size, indexAt), size, lazy),
+      "An unloaded lazy vector cannot be wrapped by two different top level"
+      " vectors.");
+
+  // Verify that the unloaded dictionary can be nested as long as it has one top
+  // level vector.
+  EXPECT_NO_THROW(BaseVector::wrapInDictionary(
+      nullptr, makeIndices(size, indexAt), size, dict));
+
+  // Limitation: Current checks cannot prevent existing references of the lazy
+  // vector to load rows. For example, the following would succeed even though
+  // it was wrapped under 2 layer of dictionary above:
+  EXPECT_FALSE(lazy->isLoaded());
+  EXPECT_NO_THROW(lazy->loadedVector());
+  EXPECT_TRUE(lazy->isLoaded());
+}
+
 TEST_F(VectorTest, dictionaryResize) {
   auto vectorMaker = std::make_unique<test::VectorMaker>(pool_.get());
   vector_size_t size = 10;
@@ -1972,6 +2049,31 @@ TEST_F(VectorTest, acquireSharedStringBuffers) {
   EXPECT_EQ(2, flatVector->stringBuffers().size());
 }
 
+/// Test MapVector::canonicalize for a MapVector with 'values' vector shorter
+/// than 'keys' vector.
+TEST_F(VectorTest, mapCanonicalizeValuesShorterThenKeys) {
+  auto mapVector = std::make_shared<MapVector>(
+      pool(),
+      MAP(BIGINT(), BIGINT()),
+      nullptr,
+      2,
+      makeIndices({0, 2}),
+      makeIndices({2, 2}),
+      makeFlatVector<int64_t>({7, 6, 5, 4, 3, 2, 1}),
+      makeFlatVector<int64_t>({6, 5, 4, 3, 2, 1}));
+  EXPECT_FALSE(mapVector->hasSortedKeys());
+
+  MapVector::canonicalize(mapVector);
+  EXPECT_TRUE(mapVector->hasSortedKeys());
+
+  // Verify that keys and values referenced from the map are sorted. Keys and
+  // values not referenced from the map are not sorted.
+  test::assertEqualVectors(
+      makeFlatVector<int64_t>({6, 7, 4, 5, 3, 2}), mapVector->mapKeys());
+  test::assertEqualVectors(
+      makeFlatVector<int64_t>({5, 6, 3, 4, 2, 1}), mapVector->mapValues());
+}
+
 TEST_F(VectorTest, mapCanonicalize) {
   auto mapVector = makeMapVector<int64_t, int64_t>({
       {{4, 40}, {3, 30}, {2, 20}, {5, 50}, {1, 10}},
@@ -2051,24 +2153,18 @@ TEST_F(VectorTest, mapSliceMutability) {
       std::dynamic_pointer_cast<MapVector>(createMap(vectorSize_, false)));
 }
 
-// TODO(xiaoxmeng): Inconsistency discovered by following check when
-// running with Prestissmo. Re-enable this check after the issue gets fixed.
-//
-// // Demonstrates incorrect usage of the memory pool. The pool is destroyed
-// while
-// // the vector allocated from it is still alive.
-// TEST_F(VectorTest, lifetime) {
-//   ASSERT_DEATH(
-//       {
-//         auto childPool = pool_->addScopedChild("test");
-//         auto v = BaseVector::create(INTEGER(), 10, childPool.get());
+// Demonstrates incorrect usage of the memory pool. The pool is destroyed
+// while the vector allocated from it is still alive.
+TEST_F(VectorTest, lifetime) {
+  ASSERT_DEATH(
+      {
+        auto childPool = pool_->addChild("test");
+        auto v = BaseVector::create(INTEGER(), 10, childPool.get());
 
-//         // BUG: Memory pool needs to stay alive until all memory allocated
-//         from
-//         // it is freed.
-//         childPool.reset();
-//         v.reset();
-//       },
-//       "Memory pool should be destroyed only after all allocated memory has
-//       been freed.");
-// }
+        // BUG: Memory pool needs to stay alive until all memory allocated from
+        // it is freed.
+        childPool.reset();
+        v.reset();
+      },
+      "Memory pool should be destroyed only after all allocated memory has been freed.");
+}

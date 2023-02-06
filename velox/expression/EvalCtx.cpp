@@ -15,6 +15,7 @@
  */
 
 #include "velox/expression/EvalCtx.h"
+#include <exception>
 #include "velox/common/base/RawVector.h"
 #include "velox/expression/Expr.h"
 
@@ -35,6 +36,7 @@ EvalCtx::EvalCtx(core::ExecCtx* execCtx, ExprSet* exprSet, const RowVector* row)
   VELOX_CHECK_NOT_NULL(row);
 
   inputFlatNoNulls_ = true;
+  // 遍历每一列，检查一下是否平坦向量以及没有NULL值
   for (const auto& child : row->children()) {
     VELOX_CHECK_NOT_NULL(child);
     if ((!child->isFlatEncoding() && !child->isConstantEncoding()) ||
@@ -48,12 +50,13 @@ EvalCtx::EvalCtx(core::ExecCtx* execCtx)
     : execCtx_(execCtx), exprSet_(nullptr), row_(nullptr) {
   VELOX_CHECK_NOT_NULL(execCtx);
 }
-
+// 应用包装编码
 VectorPtr EvalCtx::applyWrapToPeeledResult(
     const TypePtr& outputType,
     VectorPtr peeledResult,
     const SelectivityVector& rows) {
   VectorPtr wrappedResult;
+  // 如果是字典编码
   if (wrapEncoding_ == VectorEncoding::Simple::DICTIONARY) {
     if (!peeledResult) {
       // If all rows are null, make a constant null vector of the right type.
@@ -68,6 +71,7 @@ VectorPtr EvalCtx::applyWrapToPeeledResult(
         // corresponding to non-selected rows may point past the end of the base
         // vector. Disable these by setting corresponding positions to null.
         nulls = AlignedBuffer::allocate<bool>(rows.size(), pool(), bits::kNull);
+        // 把没有被选择的那些设置为NULL
         // Set the active rows to non-null.
         rows.clearNulls(nulls);
         if (wrapNulls_) {
@@ -86,10 +90,12 @@ VectorPtr EvalCtx::applyWrapToPeeledResult(
       } else {
         nulls = wrapNulls_;
       }
+      // 记住Wrap_是索引，peeledResult是实际的字典
       wrappedResult = BaseVector::wrapInDictionary(
           std::move(nulls), wrap_, rows.end(), std::move(peeledResult));
     }
   } else if (wrapEncoding_ == VectorEncoding::Simple::CONSTANT) {
+    // 如果是常量编码
     wrappedResult = BaseVector::wrapInConstant(
         rows.size(), constantWrapIndex_, std::move(peeledResult));
   } else {
@@ -119,6 +125,7 @@ void EvalCtx::saveAndReset(
   }
 }
 
+// 错误向量是上面东西？
 void EvalCtx::ensureErrorsVectorSize(ErrorVectorPtr& vector, vector_size_t size)
     const {
   auto oldSize = vector ? vector->size() : 0;
@@ -144,6 +151,7 @@ void EvalCtx::ensureErrorsVectorSize(ErrorVectorPtr& vector, vector_size_t size)
   }
 }
 
+// 上面东西？
 void EvalCtx::addError(
     vector_size_t index,
     const std::exception_ptr& exceptionPtr,
@@ -153,6 +161,29 @@ void EvalCtx::addError(
     errorsPtr->setNull(index, false);
     errorsPtr->set(index, std::make_shared<std::exception_ptr>(exceptionPtr));
   }
+}
+
+void EvalCtx::addErrors(
+    const SelectivityVector& rows,
+    const ErrorVectorPtr& fromErrors,
+    ErrorVectorPtr& toErrors) const {
+  if (!fromErrors) {
+    return;
+  }
+
+  ensureErrorsVectorSize(toErrors, fromErrors->size());
+  rows.testSelected([&](auto row) {
+    if (!fromErrors->isIndexInRange(row)) {
+      return false;
+    }
+    if (!fromErrors->isNullAt(row) && toErrors->isNullAt(row)) {
+      toErrors->set(
+          row,
+          std::static_pointer_cast<std::exception_ptr>(
+              fromErrors->valueAt(row)));
+    }
+    return true;
+  });
 }
 
 void EvalCtx::restore(ScopedContextSaver& saver) {
@@ -185,32 +216,84 @@ void EvalCtx::restore(ScopedContextSaver& saver) {
   finalSelection_ = saver.finalSelection;
 }
 
+namespace {
+/// If exceptionPtr represents an std::exception, convert it to VeloxUserError
+/// to add useful context for debugging.
+std::exception_ptr toVeloxException(const std::exception_ptr& exceptionPtr) {
+  try {
+    std::rethrow_exception(exceptionPtr);
+  } catch (const VeloxException& e) {
+    return exceptionPtr;
+  } catch (const std::exception& e) {
+    return std::make_exception_ptr(
+        VeloxUserError(std::current_exception(), e.what(), false));
+  }
+}
+
+auto throwError(const std::exception_ptr& exceptionPtr) {
+  std::rethrow_exception(toVeloxException(exceptionPtr));
+}
+} // namespace
+
 void EvalCtx::setError(
     vector_size_t index,
     const std::exception_ptr& exceptionPtr) {
   if (throwOnError_) {
-    std::rethrow_exception(exceptionPtr);
+    throwError(exceptionPtr);
   }
-  addError(index, exceptionPtr, errors_);
+
+  addError(index, toVeloxException(exceptionPtr), errors_);
 }
 
 void EvalCtx::setErrors(
     const SelectivityVector& rows,
     const std::exception_ptr& exceptionPtr) {
-  rows.applyToSelected([&](auto row) { setError(row, exceptionPtr); });
+  if (throwOnError_) {
+    throwError(exceptionPtr);
+  }
+
+  auto veloxException = toVeloxException(exceptionPtr);
+  rows.applyToSelected(
+      [&](auto row) { addError(row, veloxException, errors_); });
+}
+
+void EvalCtx::addElementErrorsToTopLevel(
+    const SelectivityVector& elementRows,
+    const BufferPtr& elementToTopLevelRows,
+    ErrorVectorPtr& topLevelErrors) {
+  if (!errors_) {
+    return;
+  }
+
+  const auto* rawElementToTopLevelRows =
+      elementToTopLevelRows->as<vector_size_t>();
+  elementRows.applyToSelected([&](auto row) {
+    if (errors_->isIndexInRange(row) && !errors_->isNullAt(row)) {
+      addError(
+          rawElementToTopLevelRows[row],
+          *std::static_pointer_cast<std::exception_ptr>(errors_->valueAt(row)),
+          topLevelErrors);
+    }
+  });
 }
 
 const VectorPtr& EvalCtx::getField(int32_t index) const {
   const VectorPtr* field;
+  // 剥离字段不是空
   if (!peeledFields_.empty()) {
+    // 从这里面拿
+    // 获取剥离编码后的内部向量
     field = &peeledFields_[index];
   } else {
+    // 从rows中拿
     field = &row_->childAt(index);
   }
+  // 返回已经加载的向量？
   if ((*field)->isLazy() && (*field)->asUnchecked<LazyVector>()->isLoaded()) {
     auto lazy = (*field)->asUnchecked<LazyVector>();
     return lazy->loadedVectorShared();
   }
+  // 直接返回这个向量
   return *field;
 }
 

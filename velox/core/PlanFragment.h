@@ -40,6 +40,7 @@ struct PlanFragment {
   ExecutionStrategy executionStrategy{ExecutionStrategy::kUngrouped};
   int numSplitGroups{0};
 
+    // 是否分组执行？
   inline bool isGroupedExecution() const {
     return executionStrategy == ExecutionStrategy::kGrouped;
   }

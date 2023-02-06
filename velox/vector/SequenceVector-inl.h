@@ -70,8 +70,10 @@ void SequenceVector<T>::setInternalState() {
 
 template <typename T>
 bool SequenceVector<T>::isNullAtFast(vector_size_t idx) const {
+    // 获取偏移量
   size_t offset = offsetOfIndex(idx);
   DCHECK(offset >= 0) << "Invalid index";
+  // 检查是否有NULL
   return sequenceValues_->isNullAt(offset);
 }
 

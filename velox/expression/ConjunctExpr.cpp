@@ -123,17 +123,21 @@ void ConjunctExpr::evalSpecialForm(
   auto activeRows = activeRowsHolder.get();
   VELOX_DCHECK(activeRows != nullptr);
   int32_t numActive = activeRows->countSelected();
+  // 遍历每一个输入
   for (int32_t i = 0; i < inputs_.size(); ++i) {
     VectorPtr inputResult;
+    // 池？
     VectorRecycler inputResultRecycler(inputResult, context.vectorPool());
     EvalCtx::ErrorVectorPtr errors;
     if (handleErrors) {
       context.swapErrors(errors);
     }
-
+    // numActive: 几行是有效的
     SelectivityTimer timer(selectivity_[inputOrder_[i]], numActive);
+    // 评估输入表达式
     inputs_[inputOrder_[i]]->eval(*activeRows, context, inputResult);
     if (context.errors()) {
+        // 发生错误
       handleErrors = true;
     }
     uint64_t* extraActive = nullptr;
@@ -143,13 +147,16 @@ void ConjunctExpr::evalSpecialForm(
       extraActive =
           rowsWithError(rows, *activeRows, context, errors, errorRows);
     }
+    // 更新结果
     updateResult(inputResult.get(), context, flatResult, activeRows);
     if (extraActive) {
       uint64_t* activeBits = activeRows->asMutableRange().bits();
       bits::orBits(activeBits, extraActive, rows.begin(), rows.end());
       activeRows->updateBounds();
     }
+    // 重新计算几行有效
     numActive = activeRows->countSelected();
+    // 添加输出
     selectivity_[inputOrder_[i]].addOutput(numActive);
 
     if (!numActive) {
@@ -166,10 +173,11 @@ void ConjunctExpr::evalSpecialForm(
     reorderEnabledChecked_ = true;
   }
   if (reorderEnabled_) {
+    // 重排输入
     maybeReorderInputs();
   }
 }
-
+// 根据运行时间进行重排
 void ConjunctExpr::maybeReorderInputs() {
   bool reorder = false;
   for (auto i = 1; i < inputs_.size(); ++i) {
@@ -208,6 +216,7 @@ void ConjunctExpr::updateResult(
       &values,
       &nulls)) {
     case BooleanMix::kAllNull:
+        // 设置为NULL值
       result->addNulls(nullptr, *activeRows);
       return;
     case BooleanMix::kAllFalse:
@@ -216,29 +225,33 @@ void ConjunctExpr::updateResult(
         if (result->mayHaveNulls()) {
           activeRows->clearNulls(result->mutableRawNulls());
         }
+        // 清理掉
         bits::andWithNegatedBits(
             result->mutableRawValues<uint64_t>(),
             activeRows->asRange().bits(),
             activeRows->begin(),
             activeRows->end());
+            // 清理
         activeRows->clearAll();
       }
       return;
     case BooleanMix::kAllTrue:
       if (!isAnd_) {
         if (result->mayHaveNulls()) {
+            // 把NULL设置为非NULL
           bits::orBits(
               result->mutableRawNulls(),
               activeRows->asRange().bits(),
               activeRows->begin(),
               activeRows->end());
         }
+        // 这里需要或一下，因为之前的话可能这里面被设置成false
         bits::orBits(
             result->mutableRawValues<uint64_t>(),
             activeRows->asRange().bits(),
             activeRows->begin(),
             activeRows->end());
-
+        // 清理掉所有
         activeRows->clearAll();
       }
       return;
@@ -249,13 +262,16 @@ void ConjunctExpr::updateResult(
           activeRows->end(),
           [&](int32_t row) {
             if (nulls && bits::isBitNull(nulls, row)) {
+                // 设置为NULL值
               result->setNull(row, true);
             } else {
               bool isTrue = bits::isBitSet(values, row);
               if (isAnd_ && !isTrue) {
+                // 设置为false
                 result->set(row, false);
                 activeRows->setValid(row, false);
               } else if (!isAnd_ && isTrue) {
+                // 设置为true
                 result->set(row, true);
                 activeRows->setValid(row, false);
               }
@@ -266,13 +282,52 @@ void ConjunctExpr::updateResult(
   }
 }
 
-std::string ConjunctExpr::toSql() const {
+std::string ConjunctExpr::toSql(
+    std::vector<VectorPtr>* complexConstants) const {
   std::stringstream out;
-  out << "(" << inputs_[0]->toSql() << ")";
+  out << "(" << inputs_[0]->toSql(complexConstants) << ")";
   for (auto i = 1; i < inputs_.size(); ++i) {
     out << " " << name_ << " "
-        << "(" << inputs_[i]->toSql() << ")";
+        << "(" << inputs_[i]->toSql(complexConstants) << ")";
   }
   return out.str();
+}
+
+// static
+TypePtr ConjunctExpr::resolveType(const std::vector<TypePtr>& argTypes) {
+  VELOX_CHECK_GT(
+      argTypes.size(),
+      0,
+      "Conjunct expressions expect at least one argument, received: {}",
+      argTypes.size());
+
+  for (const auto& argType : argTypes) {
+    VELOX_CHECK(
+        argType->kind() == TypeKind::BOOLEAN ||
+            argType->kind() == TypeKind::UNKNOWN,
+        "Conjunct expressions expect BOOLEAN or UNKNOWN arguments, received: {}",
+        argType->toString());
+  }
+
+  return BOOLEAN();
+}
+
+TypePtr ConjunctCallToSpecialForm::resolveType(
+    const std::vector<TypePtr>& argTypes) {
+  return ConjunctExpr::resolveType(argTypes);
+}
+
+ExprPtr ConjunctCallToSpecialForm::constructSpecialForm(
+    const TypePtr& type,
+    std::vector<ExprPtr>&& compiledChildren,
+    bool /* trackCpuUsage */) {
+  bool inputsSupportFlatNoNullsFastPath =
+      Expr::allSupportFlatNoNullsFastPath(compiledChildren);
+
+  return std::make_shared<ConjunctExpr>(
+      type,
+      std::move(compiledChildren),
+      isAnd_,
+      inputsSupportFlatNoNullsFastPath);
 }
 } // namespace facebook::velox::exec

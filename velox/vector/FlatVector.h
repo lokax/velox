@@ -266,7 +266,7 @@ class FlatVector final : public SimpleVector<T> {
     }
   }
 
-  void resize(vector_size_t size, bool setNotNull = true) override;
+  void resize(vector_size_t newSize, bool setNotNull = true) override;
 
   VectorPtr slice(vector_size_t offset, vector_size_t length) const override;
 
@@ -449,6 +449,13 @@ class FlatVector final : public SimpleVector<T> {
       vector_size_t targetIndex,
       vector_size_t sourceIndex,
       vector_size_t count);
+
+  // Ensures that the values buffer has space for 'newSize' elements and is
+  // mutable. Sets elements between the old and new sizes to 'initialValue' if
+  // the new size > old size.
+  void resizeValues(
+      vector_size_t newSize,
+      const std::optional<T>& initialValue);
 
   // Contiguous values.
   // If strings, these are velox::StringViews into memory held by

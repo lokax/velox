@@ -23,7 +23,6 @@
 #include "velox/exec/tests/utils/QueryAssertions.h"
 #include "velox/exec/tests/utils/TempDirectoryPath.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
-#include "velox/vector/tests/utils/VectorMaker.h"
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -40,6 +39,7 @@ Spiller::Stats spilledStats(const exec::Task& task) {
       spilledStats.spilledBytes += op.spilledBytes;
       spilledStats.spilledRows += op.spilledRows;
       spilledStats.spilledPartitions += op.spilledPartitions;
+      spilledStats.spilledFiles += op.spilledFiles;
     }
   }
   return spilledStats;
@@ -165,7 +165,7 @@ class OrderByTest : public OperatorTestBase {
     {
       SCOPED_TRACE("run with spilling");
       auto spillDirectory = exec::test::TempDirectoryPath::create();
-      auto queryCtx = core::QueryCtx::createForTest();
+      auto queryCtx = std::make_shared<core::QueryCtx>(executor_.get());
       queryCtx->setConfigOverridesUnsafe({
           {core::QueryConfig::kTestingSpillPct, "100"},
           {core::QueryConfig::kSpillEnabled, "true"},
@@ -180,6 +180,7 @@ class OrderByTest : public OperatorTestBase {
       if (inputRows > 0) {
         EXPECT_LT(0, spilledStats(*task).spilledBytes);
         EXPECT_EQ(1, spilledStats(*task).spilledPartitions);
+        EXPECT_LT(0, spilledStats(*task).spilledFiles);
         // NOTE: the last input batch won't go spilling.
         EXPECT_GT(inputRows, spilledStats(*task).spilledRows);
       } else {
@@ -391,7 +392,7 @@ TEST_F(OrderByTest, outputBatchSize) {
                     .orderBy({fmt::format("{} ASC NULLS LAST", "c0")}, false)
                     .capturePlanNodeId(orderById)
                     .planNode();
-    auto queryCtx = core::QueryCtx::createForTest();
+    auto queryCtx = std::make_shared<core::QueryCtx>(executor_.get());
     queryCtx->setConfigOverridesUnsafe(
         {{core::QueryConfig::kPreferredOutputBatchSize,
           std::to_string(testData.preferredOutBatchSize)}});
@@ -424,7 +425,7 @@ TEST_F(OrderByTest, spill) {
                   .orderBy({fmt::format("{} ASC NULLS LAST", "c0")}, false)
                   .planNode();
   auto spillDirectory = exec::test::TempDirectoryPath::create();
-  auto queryCtx = core::QueryCtx::createForTest();
+  auto queryCtx = std::make_shared<core::QueryCtx>(executor_.get());
   constexpr int64_t kMaxBytes = 20LL << 20; // 20 MB
   queryCtx->pool()->setMemoryUsageTracker(
       memory::MemoryUsageTracker::create(kMaxBytes, 0, kMaxBytes));
@@ -446,6 +447,7 @@ TEST_F(OrderByTest, spill) {
   EXPECT_GT(kNumBatches * kNumRows, stats[0].operatorStats[1].spilledRows);
   EXPECT_LT(0, stats[0].operatorStats[1].spilledBytes);
   EXPECT_EQ(1, stats[0].operatorStats[1].spilledPartitions);
+  EXPECT_EQ(2, stats[0].operatorStats[1].spilledFiles);
 }
 
 TEST_F(OrderByTest, spillWithMemoryLimit) {
@@ -476,7 +478,7 @@ TEST_F(OrderByTest, spillWithMemoryLimit) {
     SCOPED_TRACE(testData.debugString());
 
     auto tempDirectory = exec::test::TempDirectoryPath::create();
-    auto queryCtx = core::QueryCtx::createForTest();
+    auto queryCtx = std::make_shared<core::QueryCtx>(executor_.get());
     queryCtx->pool()->setMemoryUsageTracker(
         memory::MemoryUsageTracker::create(kMaxBytes, 0, kMaxBytes));
     auto results =

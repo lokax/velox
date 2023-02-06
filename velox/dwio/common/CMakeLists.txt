@@ -24,25 +24,28 @@ endif()
 add_library(
   velox_dwio_common
   BitConcatenation.cpp
+  BitPackDecoder.cpp
   BufferedInput.cpp
   CachedBufferedInput.cpp
   CacheInputStream.cpp
   ColumnSelector.cpp
   Common.cpp
-  DataBuffer.cpp
   DataSink.cpp
   DecoderUtil.cpp
   DirectDecoder.cpp
   DwioMetricsLog.cpp
+  FlatMapHelper.cpp
   InputStream.cpp
   IntDecoder.cpp
   IoStatistics.cpp
   MemoryInputStream.cpp
   Options.cpp
+  Range.cpp
   ReaderFactory.cpp
   ScanSpec.cpp
   ColumnLoader.cpp
   SelectiveColumnReader.cpp
+  SelectiveRepeatedColumnReader.cpp
   SelectiveStructColumnReader.cpp
   SeekableInputStream.cpp
   TypeWithId.cpp)

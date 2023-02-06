@@ -45,11 +45,14 @@ BooleanMix getFlatBool(
     const uint64_t** nullsOut) {
   VELOX_CHECK_EQ(vector->typeKind(), TypeKind::BOOLEAN);
   const auto size = activeRows.end();
+  // 检查向量类型
   switch (vector->encoding()) {
+    // 平坦向量
     case VectorEncoding::Simple::FLAT: {
       auto values =
           vector->asUnchecked<FlatVector<bool>>()->rawValues<uint64_t>();
       if (!values) {
+        // 如果是空指针，表明所有值都是NULL
         return BooleanMix::kAllNull;
       }
       auto nulls = vector->rawNulls();

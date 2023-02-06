@@ -14,22 +14,23 @@
  * limitations under the License.
  */
 #include "velox/exec/Operator.h"
+#include "velox/common/base/SuccinctPrinter.h"
+#include "velox/common/process/ProcessBase.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/exec/Task.h"
-
-#include "velox/common/base/SuccinctPrinter.h"
-#include "velox/common/process/ProcessBase.h"
 #include "velox/expression/Expr.h"
 
 namespace facebook::velox::exec {
 namespace {
+    // connector表达式执行器？
 // Basic implementation of the connector::ExpressionEvaluator interface.
 class SimpleExpressionEvaluator : public connector::ExpressionEvaluator {
  public:
   explicit SimpleExpressionEvaluator(core::ExecCtx* execCtx)
       : execCtx_(execCtx) {}
 
+    // 创建一个表达式集合
   std::unique_ptr<exec::ExprSet> compile(
       const core::TypedExprPtr& expression) const override {
     auto expressions = {expression};
@@ -41,11 +42,12 @@ class SimpleExpressionEvaluator : public connector::ExpressionEvaluator {
       const SelectivityVector& rows,
       RowVectorPtr& input,
       VectorPtr* result) const override {
+        // 创建一个EvalCtx，每个RowVector的批次一个？
     exec::EvalCtx context(execCtx_, exprSet, input.get());
 
     std::vector<VectorPtr> results = {*result};
     exprSet->eval(0, 1, true, rows, context, results);
-
+    // 这个感觉没有必要
     *result = results[0];
   }
 
@@ -54,9 +56,18 @@ class SimpleExpressionEvaluator : public connector::ExpressionEvaluator {
 };
 } // namespace
 
-OperatorCtx::OperatorCtx(DriverCtx* driverCtx, const std::string& operatorType)
-    : driverCtx_(driverCtx), pool_(driverCtx_->addOperatorPool(operatorType)) {}
+OperatorCtx::OperatorCtx(
+    DriverCtx* driverCtx,
+    const core::PlanNodeId& planNodeId,
+    int32_t operatorId,
+    const std::string& operatorType)
+    : driverCtx_(driverCtx),
+      planNodeId_(planNodeId),
+      operatorId_(operatorId),
+      operatorType_(operatorType),
+      pool_(driverCtx_->addOperatorPool(planNodeId, operatorType)) {}
 
+// 返回execCtx
 core::ExecCtx* OperatorCtx::execCtx() const {
   if (!execCtx_) {
     execCtx_ = std::make_unique<core::ExecCtx>(
@@ -77,8 +88,60 @@ OperatorCtx::createConnectorQueryCtx(
       pool_,
       driverCtx_->task->queryCtx()->getConnectorConfig(connectorId),
       expressionEvaluator_.get(),
-      driverCtx_->task->queryCtx()->mappedMemory(),
-      fmt::format("{}.{}", driverCtx_->task->taskId(), planNodeId));
+      driverCtx_->task->queryCtx()->allocator(),
+      taskId(),
+      planNodeId,
+      driverCtx_->driverId);
+}
+
+std::optional<Spiller::Config> OperatorCtx::makeSpillConfig(
+    Spiller::Type type) const {
+  const auto& queryConfig = driverCtx_->task->queryCtx()->config();
+  if (!queryConfig.spillEnabled()) {
+    return std::nullopt;
+  }
+  if (!queryConfig.spillPath().has_value()) {
+    return std::nullopt;
+  }
+  switch (type) {
+    case Spiller::Type::kOrderBy:
+      if (!queryConfig.orderBySpillEnabled()) {
+        return std::nullopt;
+      }
+      break;
+    case Spiller::Type::kAggregate:
+      if (!queryConfig.aggregationSpillEnabled()) {
+        return std::nullopt;
+      }
+      break;
+    case Spiller::Type::kHashJoinBuild:
+      FOLLY_FALLTHROUGH;
+    case Spiller::Type::kHashJoinProbe:
+      if (!queryConfig.joinSpillEnabled()) {
+        return std::nullopt;
+      }
+      break;
+    default:
+      LOG(ERROR) << "Unknown spiller type: " << Spiller::typeName(type);
+      return std::nullopt;
+  }
+
+  return Spiller::Config(
+      makeOperatorSpillPath(
+          queryConfig.spillPath().value(),
+          taskId(),
+          driverCtx()->driverId,
+          operatorId_),
+      queryConfig.maxSpillFileSize(),
+      queryConfig.minSpillRunSize(),
+      driverCtx_->task->queryCtx()->spillExecutor(),
+      queryConfig.spillableReservationGrowthPct(),
+      HashBitRange(
+          queryConfig.spillStartPartitionBit(),
+          queryConfig.spillStartPartitionBit() +
+              queryConfig.spillPartitionBits()),
+      queryConfig.maxSpillLevel(),
+      queryConfig.testingSpillPct());
 }
 
 Operator::Operator(
@@ -87,12 +150,16 @@ Operator::Operator(
     int32_t operatorId,
     std::string planNodeId,
     std::string operatorType)
-    : operatorCtx_(std::make_unique<OperatorCtx>(driverCtx, operatorType)),
-      stats_(
+    : operatorCtx_(std::make_unique<OperatorCtx>(
+          driverCtx,
+          planNodeId,
+          operatorId,
+          operatorType)),
+      stats_(OperatorStats{
           operatorId,
           driverCtx->pipelineId,
           std::move(planNodeId),
-          std::move(operatorType)),
+          std::move(operatorType)}),
       outputType_(std::move(outputType)) {
   auto memoryUsageTracker = pool()->getMemoryUsageTracker();
   if (memoryUsageTracker) {
@@ -100,24 +167,13 @@ Operator::Operator(
         [&](memory::MemoryUsageTracker& tracker) {
           VELOX_DCHECK(pool()->getMemoryUsageTracker().get() == &tracker);
           std::stringstream out;
-          out << "\nFailed Operator: " << stats_.operatorType << "."
-              << stats_.operatorId << ": "
+          out << "\nFailed Operator: " << this->operatorType() << "."
+              << this->operatorId() << ": "
               << succinctBytes(tracker.getCurrentTotalBytes());
           return out.str();
         });
   }
 }
-
-Operator::Operator(
-    int32_t operatorId,
-    int32_t pipelineId,
-    std::string planNodeId,
-    std::string operatorType)
-    : stats_(
-          operatorId,
-          pipelineId,
-          std::move(planNodeId),
-          std::move(operatorType)) {}
 
 std::vector<std::unique_ptr<Operator::PlanNodeTranslator>>&
 Operator::translators() {
@@ -180,12 +236,12 @@ std::optional<uint32_t> Operator::maxDrivers(
   return std::nullopt;
 }
 
-memory::MappedMemory* OperatorCtx::mappedMemory() const {
-  if (!mappedMemory_) {
-    mappedMemory_ =
+memory::MemoryAllocator* OperatorCtx::allocator() const {
+  if (allocator_ == nullptr) {
+    allocator_ =
         driverCtx_->task->addOperatorMemory(pool_->getMemoryUsageTracker());
   }
-  return mappedMemory_;
+  return allocator_;
 }
 
 const std::string& OperatorCtx::taskId() const {
@@ -241,21 +297,32 @@ RowVectorPtr Operator::fillOutput(vector_size_t size, BufferPtr mapping) {
       std::move(columns));
 }
 
+OperatorStats Operator::stats(bool clear) {
+  if (!clear) {
+    return *stats_.rlock();
+  }
+
+  auto lockedStats = stats_.wlock();
+  OperatorStats ret{*lockedStats};
+  lockedStats->clear();
+  return ret;
+}
+
 void Operator::recordBlockingTime(uint64_t start) {
   uint64_t now =
       std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::high_resolution_clock::now().time_since_epoch())
           .count();
-  stats_.blockedWallNanos += (now - start) * 1000;
+  stats_.wlock()->blockedWallNanos += (now - start) * 1000;
 }
 
 std::string Operator::toString() const {
   std::stringstream out;
   if (auto task = operatorCtx_->task()) {
     auto driverCtx = operatorCtx_->driverCtx();
-    out << stats_.operatorType << "(" << stats_.operatorId << ")<"
-        << task->taskId() << ":" << driverCtx->pipelineId << "."
-        << driverCtx->driverId << " " << this;
+    out << operatorType() << "(" << operatorId() << ")<" << task->taskId()
+        << ":" << driverCtx->pipelineId << "." << driverCtx->driverId << " "
+        << this;
   } else {
     out << "<Terminated, no task>";
   }
@@ -314,6 +381,12 @@ std::vector<column_index_t> calculateOutputChannels(
   return outputChannels;
 }
 
+void OperatorStats::addRuntimeStat(
+    const std::string& name,
+    const RuntimeCounter& value) {
+  addOperatorRuntimeStats(name, value, runtimeStats);
+}
+
 void OperatorStats::add(const OperatorStats& other) {
   numSplits += other.numSplits;
   rawInputBytes += other.rawInputBytes;
@@ -349,6 +422,7 @@ void OperatorStats::add(const OperatorStats& other) {
   spilledBytes += other.spilledBytes;
   spilledRows += other.spilledRows;
   spilledPartitions += other.spilledPartitions;
+  spilledFiles += other.spilledFiles;
 }
 
 void OperatorStats::clear() {

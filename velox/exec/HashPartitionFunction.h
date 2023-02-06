@@ -40,6 +40,7 @@ class HashPartitionFunction : public core::PartitionFunction {
   void partition(const RowVector& input, std::vector<uint32_t>& partitions)
       override;
 
+    // 分区数量
   int numPartitions() const {
     return numPartitions_;
   }

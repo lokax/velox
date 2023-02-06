@@ -15,9 +15,12 @@
  */
 
 #include "velox/exec/HashBuild.h"
+#include "velox/common/testutil/TestValue.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/exec/Task.h"
 #include "velox/expression/FieldReference.h"
+
+using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
 namespace {
@@ -47,15 +50,14 @@ HashBuild::HashBuild(
     : Operator(driverCtx, nullptr, operatorId, joinNode->id(), "HashBuild"),
       joinNode_(std::move(joinNode)),
       joinType_{joinNode_->joinType()},
-      mappedMemory_(operatorCtx_->mappedMemory()),
+      allocator_(operatorCtx_->allocator()),
       joinBridge_(operatorCtx_->task()->getHashJoinBridgeLocked(
           operatorCtx_->driverCtx()->splitGroupId,
           planNodeId())),
-      spillConfig_(makeOperatorSpillConfig(
-          *operatorCtx_->task()->queryCtx(),
-          *operatorCtx_,
-          core::QueryConfig::kJoinSpillEnabled,
-          operatorId)),
+      spillConfig_(
+          isSpillAllowed()
+              ? operatorCtx_->makeSpillConfig(Spiller::Type::kHashJoinBuild)
+              : std::nullopt),
       spillGroup_(
           spillEnabled() ? operatorCtx_->task()->getSpillOperatorGroupLocked(
                                operatorCtx_->driverCtx()->splitGroupId,
@@ -74,7 +76,9 @@ HashBuild::HashBuild(
   std::vector<TypePtr> types;
   types.reserve(outputType->size());
 
+    // 遍历右表的每一个key
   for (int i = 0; i < joinNode_->rightKeys().size(); ++i) {
+    // 拿出key，获取对应的channel
     auto& key = joinNode_->rightKeys()[i];
     auto channel = exprToChannel(key.get(), outputType);
     keyChannelMap[channel] = i;
@@ -89,28 +93,30 @@ HashBuild::HashBuild(
   decoders_.reserve(numDependents);
   for (auto i = 0; i < outputType->size(); ++i) {
     if (keyChannelMap.find(i) == keyChannelMap.end()) {
+        // 创建对应的解码向量
       dependentChannels_.emplace_back(i);
       decoders_.emplace_back(std::make_unique<DecodedVector>());
       names.emplace_back(outputType->nameOf(i));
       types.emplace_back(outputType->childAt(i));
     }
   }
-
+    // 创建行类型
   tableType_ = ROW(std::move(names), std::move(types));
   setupTable();
   setupSpiller();
 
-  if (isNullAwareAntiJoin(joinType_) && joinNode_->filter()) {
-    setupFilterForNullAwareAntiJoin(keyChannelMap);
+  if (isAntiJoins(joinType_) && joinNode_->filter()) {
+    setupFilterForAntiJoins(keyChannelMap);
   }
 }
 
 void HashBuild::setupTable() {
   VELOX_CHECK_NULL(table_);
-
+    // key的数量
   const auto numKeys = keyChannels_.size();
   std::vector<std::unique_ptr<VectorHasher>> keyHashers;
   keyHashers.reserve(numKeys);
+  // 创建hasher用来计算哈希？
   for (vector_size_t i = 0; i < numKeys; ++i) {
     keyHashers.emplace_back(std::make_unique<VectorHasher>(
         tableType_->childAt(i), keyChannels_[i]));
@@ -122,22 +128,24 @@ void HashBuild::setupTable() {
   for (int i = numKeys; i < tableType_->size(); ++i) {
     dependentTypes.emplace_back(tableType_->childAt(i));
   }
-  if (joinNode_->isRightJoin() || joinNode_->isFullJoin()) {
+  if (joinNode_->isRightJoin() || joinNode_->isFullJoin() ||
+      joinNode_->isRightSemiProjectJoin()) {
     // Do not ignore null keys.
     table_ = HashTable<false>::createForJoin(
         std::move(keyHashers),
         dependentTypes,
         true, // allowDuplicates
         true, // hasProbedFlag
-        mappedMemory_);
+        allocator_);
   } else {
     // (Left) semi and anti join with no extra filter only needs to know whether
     // there is a match. Hence, no need to store entries with duplicate keys.
     const bool dropDuplicates = !joinNode_->filter() &&
-        (joinNode_->isLeftSemiJoin() || joinNode_->isNullAwareAntiJoin());
+        (joinNode_->isLeftSemiFilterJoin() ||
+         joinNode_->isLeftSemiProjectJoin() || isAntiJoins(joinType_));
     // Right semi join needs to tag build rows that were probed.
-    const bool needProbedFlag = joinNode_->isRightSemiJoin();
-    if (joinNode_->isNullAwareAntiJoin() && joinNode_->filter()) {
+    const bool needProbedFlag = joinNode_->isRightSemiFilterJoin();
+    if (isNullAwareAntiJoinWithFilter(joinNode_)) {
       // We need to check null key rows in build side in case of null-aware anti
       // join with filter set.
       table_ = HashTable<false>::createForJoin(
@@ -145,7 +153,7 @@ void HashBuild::setupTable() {
           dependentTypes,
           !dropDuplicates, // allowDuplicates
           needProbedFlag, // hasProbedFlag
-          mappedMemory_);
+          allocator_);
     } else {
       // Ignore null keys
       table_ = HashTable<true>::createForJoin(
@@ -153,7 +161,7 @@ void HashBuild::setupTable() {
           dependentTypes,
           !dropDuplicates, // allowDuplicates
           needProbedFlag, // hasProbedFlag
-          mappedMemory_);
+          allocator_);
     }
   }
   analyzeKeys_ = table_->hashMode() != BaseHashTable::HashMode::kHash;
@@ -162,19 +170,36 @@ void HashBuild::setupTable() {
 void HashBuild::setupSpiller(SpillPartition* spillPartition) {
   VELOX_CHECK_NULL(spiller_);
   VELOX_CHECK_NULL(spillInputReader_);
-
+    // 如果没有启动spiller，则直接返回
   if (!spillEnabled()) {
     return;
   }
-
+  // 获取spill配置
   const auto& spillConfig = spillConfig_.value();
   HashBitRange hashBits = spillConfig.hashBitRange;
-  if (spillPartition != nullptr) {
+
+  if (spillPartition == nullptr) {
+    // 添加算子
+    spillGroup_->addOperator(
+        *this,
+        [&](const std::vector<Operator*>& operators) { runSpill(operators); });
+  } else {
+    // 创建reader
+    spillInputReader_ = spillPartition->createReader();
+    // 这里先增加是为了在下一轮继续Spill？
     const auto startBit = spillPartition->id().partitionBitOffset() +
         spillConfig.hashBitRange.numBits();
+    // Disable spilling if exceeding the max spill level and the query might run
+    // out of memory if the restored partition still can't fit in memory.
+    if (spillConfig.exceedSpillLevelLimit(startBit)) {
+        // 不再进行Spill
+      return;
+    }
     hashBits =
         HashBitRange(startBit, startBit + spillConfig.hashBitRange.numBits());
   }
+
+    // 创建新的Spiller
   spiller_ = std::make_unique<Spiller>(
       Spiller::Type::kHashJoinBuild,
       table_->rows(),
@@ -184,22 +209,12 @@ void HashBuild::setupSpiller(SpillPartition* spillPartition) {
       keyChannels_.size(),
       std::vector<CompareFlags>(),
       spillConfig.filePath,
-      operatorCtx_->task()
-              ->queryCtx()
-              ->pool()
-              ->getMemoryUsageTracker()
-              ->maxTotalBytes() *
-          spillConfig.fileSizeFactor,
+      spillConfig.maxFileSize,
+      spillConfig.minSpillRunSize,
       Spiller::spillPool(),
       spillConfig.executor);
 
-  if (spillPartition == nullptr) {
-    spillGroup_->addOperator(
-        *this,
-        [&](const std::vector<Operator*>& operators) { runSpill(operators); });
-  } else {
-    spillInputReader_ = spillPartition->createReader();
-  }
+    // 分区数量
   const int32_t numPartitions = spiller_->hashBits().numPartitions();
   spillInputIndicesBuffers_.resize(numPartitions);
   rawSpillInputIndicesBuffers_.resize(numPartitions);
@@ -211,12 +226,13 @@ bool HashBuild::isInputFromSpill() const {
   return spillInputReader_ != nullptr;
 }
 
+// 看注释
 RowTypePtr HashBuild::inputType() const {
   return isInputFromSpill() ? tableType_
                             : joinNode_->sources()[1]->outputType();
 }
 
-void HashBuild::setupFilterForNullAwareAntiJoin(
+void HashBuild::setupFilterForAntiJoins(
     const folly::F14FastMap<column_index_t, column_index_t>& keyChannelMap) {
   VELOX_DCHECK(
       std::is_sorted(dependentChannels_.begin(), dependentChannels_.end()));
@@ -248,7 +264,7 @@ void HashBuild::setupFilterForNullAwareAntiJoin(
   }
 }
 
-void HashBuild::removeInputRowsForNullAwareAntiJoinFilter() {
+void HashBuild::removeInputRowsForAntiJoinFilter() {
   bool changed = false;
   auto* rawActiveRows = activeRows_.asMutableRange().bits();
   auto removeNulls = [&](DecodedVector& decoded) {
@@ -276,6 +292,7 @@ void HashBuild::addInput(RowVectorPtr input) {
   if (!ensureInputFits(input)) {
     VELOX_CHECK_NOT_NULL(input_);
     VELOX_CHECK(future_.valid());
+    // 直接返回
     return;
   }
 
@@ -284,30 +301,35 @@ void HashBuild::addInput(RowVectorPtr input) {
 
   auto& hashers = table_->hashers();
 
+    // 计算哈希
   for (auto i = 0; i < hashers.size(); ++i) {
     auto key = input->childAt(hashers[i]->channel())->loadedVector();
     hashers[i]->decode(*key, activeRows_);
   }
 
   if (!isRightJoin(joinType_) && !isFullJoin(joinType_) &&
-      !(isNullAwareAntiJoin(joinType_) && joinNode_->filter())) {
+      !isRightSemiProjectJoin(joinType_) &&
+      !isNullAwareAntiJoinWithFilter(joinNode_)) {
+        // de选择掉NULL值
     deselectRowsWithNulls(hashers, activeRows_);
   }
-
+    // 解码数据
   for (auto i = 0; i < dependentChannels_.size(); ++i) {
     decoders_[i]->decode(
         *input->childAt(dependentChannels_[i])->loadedVector(), activeRows_);
   }
 
-  if (joinType_ == core::JoinType::kNullAwareAnti) {
-    if (joinNode_->filter()) {
-      if (filterPropagatesNulls_) {
-        removeInputRowsForNullAwareAntiJoinFilter();
-      }
-    } else if (activeRows_.countSelected() < input->size()) {
+  if (isAntiJoins(joinType_) && joinNode_->filter()) {
+    if (filterPropagatesNulls_) {
+      removeInputRowsForAntiJoinFilter();
+    }
+  } else if (
+      (isNullAwareAntiJoin(joinType_) || isLeftSemiProjectJoin(joinType_)) &&
+      activeRows_.countSelected() < input->size()) {
+    joinHasNullKeys_ = true;
+    if (isNullAwareAntiJoin(joinType_)) {
       // Null-aware anti join with no extra filter returns no rows if build side
       // has nulls in join keys. Hence, we can stop processing on first null.
-      antiJoinHasNullKeys_ = true;
       noMoreInput();
       return;
     }
@@ -315,6 +337,7 @@ void HashBuild::addInput(RowVectorPtr input) {
 
   spillInput(input);
   if (!activeRows_.hasSelections()) {
+    // 直接返回
     return;
   }
 
@@ -338,8 +361,10 @@ void HashBuild::addInput(RowVectorPtr input) {
   auto rows = table_->rows();
   auto nextOffset = rows->nextOffset();
   activeRows_.applyToSelected([&](auto rowIndex) {
+    // 创建新行
     char* newRow = rows->newRow();
     if (nextOffset) {
+        // 设置成NULL
       *reinterpret_cast<char**>(newRow + nextOffset) = nullptr;
     }
     // Store the columns for each row in sequence. At probe time
@@ -357,7 +382,8 @@ void HashBuild::addInput(RowVectorPtr input) {
 bool HashBuild::ensureInputFits(RowVectorPtr& input) {
   // NOTE: we don't need memory reservation if all the partitions are spilling
   // as we spill all the input rows to disk directly.
-  if (!spillEnabled() || spiller_->isAllSpilled()) {
+  if (!spillEnabled() || spiller_ == nullptr || spiller_->isAllSpilled()) {
+    // 直接返回就行
     return true;
   }
 
@@ -378,6 +404,7 @@ bool HashBuild::ensureInputFits(RowVectorPtr& input) {
   return true;
 }
 
+// 预留内存
 bool HashBuild::reserveMemory(const RowVectorPtr& input) {
   VELOX_CHECK(spillEnabled());
 
@@ -386,6 +413,7 @@ bool HashBuild::reserveMemory(const RowVectorPtr& input) {
 
   auto rows = table_->rows();
   auto numRows = rows->numRows();
+  // 直接返回即可
   if (numRows == 0) {
     // Skip the memory reservation for the first input as we are lack of memory
     // usage stats for estimation. It is safe to skip as the query should have
@@ -419,7 +447,7 @@ bool HashBuild::reserveMemory(const RowVectorPtr& input) {
   const auto increment =
       rows->sizeIncrement(input->size(), outOfLineBytes ? flatBytes : 0);
 
-  auto tracker = CHECK_NOTNULL(mappedMemory_->tracker());
+  auto tracker = CHECK_NOTNULL(allocator_->tracker());
   // There must be at least 2x the increments in reservation.
   if (tracker->getAvailableReservation() > 2 * increment) {
     return true;
@@ -444,11 +472,11 @@ bool HashBuild::reserveMemory(const RowVectorPtr& input) {
 void HashBuild::spillInput(const RowVectorPtr& input) {
   VELOX_CHECK_EQ(input->size(), activeRows_.size());
 
-  if (!spillEnabled() || !spiller_->isAnySpilled() ||
+  if (!spillEnabled() || spiller_ == nullptr || !spiller_->isAnySpilled() ||
       !activeRows_.hasSelections()) {
     return;
   }
-
+    // 数据行数
   const auto numInput = input->size();
   prepareInputIndicesBuffers(numInput, spiller_->spilledPartitionSet());
   computeSpillPartitions(input);
@@ -459,13 +487,16 @@ void HashBuild::spillInput(const RowVectorPtr& input) {
     if (FOLLY_UNLIKELY(!activeRows_.isValid(row))) {
       continue;
     }
+    // 如果这个分区没有spill，则无所谓了
     if (!spiller_->isSpilled(partition)) {
       continue;
     }
+    // 设置该行无效
     activeRows_.setValid(row, false);
     ++numSpillInputs;
     rawSpillInputIndicesBuffers_[partition][numSpillInputs_[partition]++] = row;
   }
+  // 没有直接返回
   if (numSpillInputs == 0) {
     return;
   }
@@ -501,9 +532,12 @@ void HashBuild::maybeSetupSpillChildVectors(const RowVectorPtr& input) {
 void HashBuild::prepareInputIndicesBuffers(
     vector_size_t numInput,
     const SpillPartitionNumSet& spillPartitions) {
+  const auto maxIndicesBufferBytes = numInput * sizeof(vector_size_t);
+  // 遍历每个分区
   for (const auto& partition : spillPartitions) {
     if (spillInputIndicesBuffers_[partition] == nullptr ||
-        (spillInputIndicesBuffers_[partition]->size() < numInput)) {
+        (spillInputIndicesBuffers_[partition]->size() <
+         maxIndicesBufferBytes)) {
       spillInputIndicesBuffers_[partition] = allocateIndices(numInput, pool());
       rawSpillInputIndicesBuffers_[partition] =
           spillInputIndicesBuffers_[partition]->asMutable<vector_size_t>();
@@ -525,7 +559,7 @@ void HashBuild::computeSpillPartitions(const RowVectorPtr& input) {
       hashers[i]->hashPrecomputed(activeRows_, i > 0, hashes_);
     }
   }
-
+    // 保存数据分区到哪个分区上
   spillPartitions_.resize(input->size());
   for (auto i = 0; i < spillPartitions_.size(); ++i) {
     spillPartitions_[i] = spiller_->hashBits().partition(hashes_[i]);
@@ -555,6 +589,7 @@ bool HashBuild::requestSpill(RowVectorPtr& input) {
   input_ = std::move(input);
   if (spillGroup_->requestSpill(*this, future_)) {
     VELOX_CHECK(future_.valid());
+    // 设置状态
     setState(State::kWaitForSpill);
     return false;
   }
@@ -563,10 +598,11 @@ bool HashBuild::requestSpill(RowVectorPtr& input) {
 }
 
 bool HashBuild::waitSpill(RowVectorPtr& input) {
+    // 不需要Spill，直接返回false
   if (!spillGroup_->needSpill()) {
     return false;
   }
-
+    // 等待Spill
   if (spillGroup_->waitSpill(*this, future_)) {
     VELOX_CHECK(future_.valid());
     input_ = std::move(input);
@@ -584,9 +620,12 @@ void HashBuild::runSpill(const std::vector<Operator*>& spillOperators) {
   uint64_t targetBytes = 0;
   std::vector<Spiller*> spillers;
   spillers.reserve(spillOperators.size());
+  // 遍历每个算子
   for (auto& spillOp : spillOperators) {
+    // 转换成HashBuild算子？
     HashBuild* build = dynamic_cast<HashBuild*>(spillOp);
     VELOX_CHECK_NOT_NULL(build);
+    // 保存spiller_的裸指针，每个算子都有一个Spiller
     spillers.push_back(build->spiller_.get());
     build->addAndClearSpillTarget(targetRows, targetBytes);
   }
@@ -603,6 +642,7 @@ void HashBuild::runSpill(const std::vector<Operator*>& spillOperators) {
   SpillPartitionNumSet partitionsToSpill;
   std::vector<int32_t> partitionIndices(spillableStats.size());
   std::iota(partitionIndices.begin(), partitionIndices.end(), 0);
+  // 从大到小进行排序
   std::sort(
       partitionIndices.begin(),
       partitionIndices.end(),
@@ -613,12 +653,14 @@ void HashBuild::runSpill(const std::vector<Operator*>& spillOperators) {
   int64_t numBytes = 0;
   for (auto partitionNum : partitionIndices) {
     if (spillableStats[partitionNum].numBytes == 0) {
+        // 如果已经是0了，直接跳出就行了
       break;
     }
     partitionsToSpill.insert(partitionNum);
     numRows += spillableStats[partitionNum].numRows;
     numBytes += spillableStats[partitionNum].numBytes;
     if (numRows >= targetRows && numBytes >= targetBytes) {
+        // 跳出
       break;
     }
   }
@@ -651,6 +693,7 @@ void HashBuild::noMoreInput() {
 
 void HashBuild::noMoreInputInternal() {
   if (spillEnabled()) {
+    // 停止
     spillGroup_->operatorStopped(*this);
   }
 
@@ -673,6 +716,7 @@ bool HashBuild::finishHashBuild() {
   // build pipeline.
   if (!operatorCtx_->task()->allPeersFinished(
           planNodeId(), operatorCtx_->driver(), &future_, promises, peers)) {
+    // 设置当前状态为等待
     setState(State::kWaitForBuild);
     return false;
   }
@@ -681,56 +725,74 @@ bool HashBuild::finishHashBuild() {
   otherTables.reserve(peers.size());
   SpillPartitionSet spillPartitions;
   Spiller::Stats spillStats;
-  if (!antiJoinHasNullKeys_) {
+  if (joinHasNullKeys_ && isNullAwareAntiJoin(joinType_)) {
+    joinBridge_->setAntiJoinHasNullKeys();
+  } else {
+    // 遍历每一个driver
     for (auto& peer : peers) {
+        // 拿出算子
       auto op = peer->findOperator(planNodeId());
       HashBuild* build = dynamic_cast<HashBuild*>(op);
       VELOX_CHECK(build);
-      if (build->antiJoinHasNullKeys_) {
-        antiJoinHasNullKeys_ = true;
-        break;
+      if (build->joinHasNullKeys_) {
+        joinHasNullKeys_ = true;
+        if (isNullAwareAntiJoin(joinType_)) {
+          break;
+        }
       }
+      // 把哈希表移动进来
       otherTables.push_back(std::move(build->table_));
       if (build->spiller_ != nullptr) {
+        // 更新Spiller统计数据？
         spillStats += build->spiller_->stats();
         build->spiller_->finishSpill(spillPartitions);
       }
     }
 
-    if (spiller_ != nullptr) {
-      spillStats += spiller_->stats();
+    if (joinHasNullKeys_ && isNullAwareAntiJoin(joinType_)) {
+      joinBridge_->setAntiJoinHasNullKeys();
+    } else {
+        // 如果spiller不是nullptr
+      if (spiller_ != nullptr) {
+        spillStats += spiller_->stats();
 
-      stats_.spilledBytes = spillStats.spilledBytes;
-      stats_.spilledRows = spillStats.spilledRows;
-      stats_.spilledPartitions = spillStats.spilledPartitions;
+        {
+          auto lockedStats = stats_.wlock();
+          lockedStats->spilledBytes += spillStats.spilledBytes;
+          lockedStats->spilledRows += spillStats.spilledRows;
+          lockedStats->spilledPartitions += spillStats.spilledPartitions;
+          lockedStats->spilledFiles += spillStats.spilledFiles;
+        }
+        
+        spiller_->finishSpill(spillPartitions);
 
-      spiller_->finishSpill(spillPartitions);
-
-      // Remove empty partitions.
-      auto iter = spillPartitions.begin();
-      while (iter != spillPartitions.end()) {
-        if (iter->second->numFiles() == 0) {
-          iter = spillPartitions.erase(iter);
-        } else {
-          ++iter;
+        // Verify all the spilled partitions are not empty as we won't spill on
+        // an empty one.
+        for (const auto& spillPartitionEntry : spillPartitions) {
+          VELOX_CHECK_GT(spillPartitionEntry.second->numFiles(), 0);
         }
       }
-    }
-    table_->prepareJoinTable(std::move(otherTables));
 
-    addRuntimeStats();
-    if (joinBridge_->setHashTable(
-            std::move(table_), std::move(spillPartitions))) {
-      spillGroup_->restart();
+      const bool hasOthers = !otherTables.empty();
+      table_->prepareJoinTable(
+          std::move(otherTables),
+          hasOthers ? operatorCtx_->task()->queryCtx()->executor() : nullptr);
+
+      addRuntimeStats();
+      if (joinBridge_->setHashTable(
+              std::move(table_),
+              std::move(spillPartitions),
+              joinHasNullKeys_)) {
+        spillGroup_->restart();
+      }
     }
-  } else {
-    joinBridge_->setAntiJoinHasNullKeys();
   }
 
   // Realize the promises so that the other Drivers (which were not
   // the last to finish) can continue from the barrier and finish.
   peers.clear();
   for (auto& promise : promises) {
+    // 通知所有的future
     promise.setValue();
   }
   return true;
@@ -741,8 +803,9 @@ void HashBuild::postHashBuildProcess() {
 
   // Release the unused memory reservation since we have finished the table
   // build.
-  operatorCtx_->mappedMemory()->tracker()->release();
+  operatorCtx_->allocator()->tracker()->release();
 
+    // 如果没有启动Spill，则设置状态为Finished，返回
   if (!spillEnabled()) {
     setState(State::kFinish);
     return;
@@ -751,6 +814,7 @@ void HashBuild::postHashBuildProcess() {
   auto spillInput = joinBridge_->spillInputOrFuture(&future_);
   if (!spillInput.has_value()) {
     VELOX_CHECK(future_.valid());
+    // 等待探测？
     setState(State::kWaitForProbe);
     return;
   }
@@ -761,6 +825,7 @@ void HashBuild::setupSpillInput(HashJoinBridge::SpillInput spillInput) {
   checkRunning();
 
   if (spillInput.spillPartition == nullptr) {
+    // 设置状态为完成
     setState(State::kFinish);
     return;
   }
@@ -784,6 +849,7 @@ void HashBuild::setupSpillInput(HashJoinBridge::SpillInput spillInput) {
   processSpillInput();
 }
 
+// 处理输入
 void HashBuild::processSpillInput() {
   checkRunning();
 
@@ -801,16 +867,24 @@ void HashBuild::addRuntimeStats() {
   const auto& hashers = table_->hashers();
   uint64_t asRange;
   uint64_t asDistinct;
+  auto lockedStats = stats_.wlock();
   for (auto i = 0; i < hashers.size(); i++) {
     hashers[i]->cardinality(0, asRange, asDistinct);
     if (asRange != VectorHasher::kRangeTooLarge) {
-      stats_.addRuntimeStat(
+      lockedStats->addRuntimeStat(
           fmt::format("rangeKey{}", i), RuntimeCounter(asRange));
     }
     if (asDistinct != VectorHasher::kRangeTooLarge) {
-      stats_.addRuntimeStat(
+      lockedStats->addRuntimeStat(
           fmt::format("distinctKey{}", i), RuntimeCounter(asDistinct));
     }
+  }
+  // Add max spilling level stats if spilling has been triggered.
+  if (spiller_ != nullptr && spiller_->isAnySpilled()) {
+    lockedStats->addRuntimeStat(
+        "maxSpillLevel",
+        RuntimeCounter(
+            spillConfig()->spillLevel(spiller_->hashBits().begin())));
   }
 }
 
@@ -852,7 +926,7 @@ BlockingReason HashBuild::isBlocked(ContinueFuture* future) {
 bool HashBuild::isFinished() {
   return state_ == State::kFinish;
 }
-
+// 算子是否处于运行态
 bool HashBuild::isRunning() const {
   return state_ == State::kRunning;
 }
@@ -866,11 +940,11 @@ void HashBuild::setRunning() {
 }
 
 void HashBuild::setState(State state) {
-  stateTransitionCheck(state);
+  checkStateTransition(state);
   state_ = state;
 }
 
-void HashBuild::stateTransitionCheck(State state) {
+void HashBuild::checkStateTransition(State state) {
   VELOX_CHECK_NE(state_, state);
   switch (state) {
     case State::kRunning:

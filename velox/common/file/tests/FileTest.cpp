@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <fcntl.h>
+
 #include "velox/common/file/File.h"
 #include "velox/common/file/FileSystems.h"
 #include "velox/exec/tests/utils/TempDirectoryPath.h"
@@ -33,15 +35,19 @@ void writeData(WriteFile* writeFile) {
   ASSERT_EQ(writeFile->size(), 15 + kOneMB);
 }
 
-void readData(ReadFile* readFile) {
-  ASSERT_EQ(readFile->size(), 15 + kOneMB);
+void readData(ReadFile* readFile, bool checkFileSize = true) {
+  if (checkFileSize) {
+    ASSERT_EQ(readFile->size(), 15 + kOneMB);
+  }
   char buffer1[5];
   ASSERT_EQ(readFile->pread(10 + kOneMB, 5, &buffer1), "ddddd");
   char buffer2[10];
   ASSERT_EQ(readFile->pread(0, 10, &buffer2), "aaaaabbbbb");
   char buffer3[kOneMB];
   ASSERT_EQ(readFile->pread(10, kOneMB, &buffer3), std::string(kOneMB, 'c'));
-  ASSERT_EQ(readFile->size(), 15 + kOneMB);
+  if (checkFileSize) {
+    ASSERT_EQ(readFile->size(), 15 + kOneMB);
+  }
   char buffer4[10];
   const std::string_view arf = readFile->pread(5, 10, &buffer4);
   const std::string zarf = readFile->pread(kOneMB, 15);
@@ -109,6 +115,34 @@ TEST(LocalFile, viaRegistry) {
   lfs->remove(filename);
 }
 
+TEST(LocalFile, rename) {
+  filesystems::registerLocalFileSystem();
+  auto tempFolder = ::exec::test::TempDirectoryPath::create();
+  auto a = fmt::format("{}/a", tempFolder->path);
+  auto b = fmt::format("{}/b", tempFolder->path);
+  auto newA = fmt::format("{}/newA", tempFolder->path);
+  const std::string data("aaaaa");
+  auto localFs = filesystems::getFileSystem(a, nullptr);
+  {
+    auto writeFile = localFs->openFileForWrite(a);
+    writeFile = localFs->openFileForWrite(b);
+    writeFile->append(data);
+    writeFile->close();
+  }
+  ASSERT_TRUE(localFs->exists(a));
+  ASSERT_TRUE(localFs->exists(b));
+  ASSERT_FALSE(localFs->exists(newA));
+  EXPECT_THROW(localFs->rename(a, b), VeloxUserError);
+  localFs->rename(a, newA);
+  ASSERT_FALSE(localFs->exists(a));
+  ASSERT_TRUE(localFs->exists(b));
+  ASSERT_TRUE(localFs->exists(newA));
+  localFs->rename(b, newA, true);
+  auto readFile = localFs->openFileForRead(newA);
+  char buffer[5];
+  ASSERT_EQ(readFile->pread(0, 5, &buffer), data);
+}
+
 TEST(LocalFile, exists) {
   filesystems::registerLocalFileSystem();
   auto tempFolder = ::exec::test::TempDirectoryPath::create();
@@ -139,13 +173,45 @@ TEST(LocalFile, list) {
     auto writeFile = localFs->openFileForWrite(a);
     writeFile = localFs->openFileForWrite(b);
   }
-  ASSERT_EQ(
-      localFs->list(std::string_view(tempFolder->path)),
-      std::vector<std::string>({a, b}));
+  auto files = localFs->list(std::string_view(tempFolder->path));
+  std::sort(files.begin(), files.end());
+  ASSERT_EQ(files, std::vector<std::string>({a, b}));
   localFs->remove(a);
   ASSERT_EQ(
       localFs->list(std::string_view(tempFolder->path)),
       std::vector<std::string>({b}));
   localFs->remove(b);
   ASSERT_TRUE(localFs->list(std::string_view(tempFolder->path)).empty());
+}
+
+TEST(LocalFile, readFileDestructor) {
+  auto tempFile = ::exec::test::TempFilePath::create();
+  const auto& filename = tempFile->path.c_str();
+  remove(filename);
+  {
+    LocalWriteFile writeFile(filename);
+    writeData(&writeFile);
+  }
+
+  {
+    LocalReadFile readFile(filename);
+    readData(&readFile);
+  }
+
+  int32_t readFd;
+  {
+    std::unique_ptr<char[]> buf(new char[tempFile->path.size() + 1]);
+    buf[tempFile->path.size()] = 0;
+    memcpy(buf.get(), tempFile->path.data(), tempFile->path.size());
+    readFd = open(buf.get(), O_RDONLY);
+  }
+  {
+    LocalReadFile readFile(readFd);
+    readData(&readFile, false);
+  }
+  {
+    // Can't read again from a closed file descriptor.
+    LocalReadFile readFile(readFd);
+    ASSERT_ANY_THROW(readData(&readFile, false));
+  }
 }

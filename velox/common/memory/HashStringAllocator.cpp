@@ -64,6 +64,7 @@ getNextContinued(HashStringAllocator::Header* FOLLY_NONNULL header) {
 // static
 void HashStringAllocator::prepareRead(const Header* begin, ByteStream& stream) {
   std::vector<ByteRange> ranges;
+  // 从参数传进来的头开始
   auto header = const_cast<Header*>(begin);
   for (;;) {
     ranges.push_back(ByteRange{
@@ -152,7 +153,8 @@ void HashStringAllocator::newSlab(int32_t size) {
     // 为什么多出两个header的空间？其中一个正常header，另一个是marker吗？
     // 最少分配4个Page，16KB
   int32_t needed = std::max<int32_t>(
-      bits::roundUp(size + 2 * sizeof(Header), memory::MappedMemory::kPageSize),
+      bits::roundUp(
+          size + 2 * sizeof(Header), memory::MemoryAllocator::kPageSize),
       kUnitSize);
   pool_.newRun(needed);
   auto run = pool_.firstFreeInRun();

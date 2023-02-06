@@ -123,16 +123,17 @@ class GroupingSet {
   // otherwise.
   void extractGroups(folly::Range<char**> groups, const RowVectorPtr& result);
 
-  /// Produces output in if spilling has occurred. First produces data
-  /// from non-spilled partitions, then merges spill runs and
-  /// unspilled data form spilled partitions. Returns nullptr when at
-  /// end.
-  bool getOutputWithSpill(const RowVectorPtr& result);
+  // Produces output in if spilling has occurred. First produces data
+  // from non-spilled partitions, then merges spill runs and unspilled data
+  // form spilled partitions. Returns nullptr when at end. 'batchSize' specifies
+  // the max number of output rows in 'result'.
+  bool getOutputWithSpill(int32_t batchSize, const RowVectorPtr& result);
 
-  /// Reads rows from the current spilled partition until producing a batch of
-  /// final results in 'result'. Returns false and leaves 'result' empty when
-  /// the partition is fully read.
-  bool mergeNext(const RowVectorPtr& result);
+  // Reads rows from the current spilled partition until producing a batch of
+  // final results in 'result'. Returns false and leaves 'result' empty when
+  // the partition is fully read. 'batchSize' specifies the max number of output
+  // rows in 'result'.
+  bool mergeNext(int32_t batchSize, const RowVectorPtr& result);
 
   // Initializes a new row in 'mergeRows' with the keys from the
   // current element from 'keys'. Accumulators are left in the initial
@@ -178,7 +179,7 @@ class GroupingSet {
 
   const bool ignoreNullKeys_;
 
-  memory::MappedMemory* FOLLY_NONNULL const mappedMemory_;
+  memory::MemoryAllocator* FOLLY_NONNULL const allocator_;
 
   // The maximum memory usage that a final aggregation can hold before spilling.
   // If it is zero, then there is no such limit.
@@ -214,11 +215,9 @@ class GroupingSet {
   /// First row in remainingInput_ that needs to be processed.
   vector_size_t firstRemainingRow_;
 
-  /// The value of mayPushdown flag specified in addInput() for the
-  /// 'remainingInput_'.
+  // The value of mayPushdown flag specified in addInput() for the
+  // 'remainingInput_'.
   bool remainingMayPushdown_;
-
-  uint64_t maxBatchBytes_;
 
   std::unique_ptr<Spiller> spiller_;
   std::unique_ptr<TreeOfLosers<SpillMergeStream>> merge_;

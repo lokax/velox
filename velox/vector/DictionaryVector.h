@@ -65,10 +65,14 @@ class DictionaryVector : public SimpleVector<T> {
   virtual ~DictionaryVector() override = default;
 
   bool mayHaveNulls() const override {
+    // 必须是已经初始化的
     VELOX_DCHECK(initialized_);
+    // 检查字典编码向量自己是否引入NULL值
+    // 或者是字典本身是否存在NULL值
     return BaseVector::nulls() || dictionaryValues_->mayHaveNulls();
   }
 
+    // 递归检查是否有NULL值？
   bool mayHaveNullsRecursive() const override {
     VELOX_DCHECK(initialized_);
     return BaseVector::mayHaveNullsRecursive() ||
@@ -84,7 +88,9 @@ class DictionaryVector : public SimpleVector<T> {
    * gets the dictionary value by its indexed value.
    */
   const T valueAt(vector_size_t idx) const override {
+    // 必须初始化
     VELOX_DCHECK(initialized_);
+    // 必须不是NULL值
     VELOX_DCHECK(!isNullAt(idx), "found null value at: {}", idx);
     auto innerIndex = getDictionaryIndex(idx);
     return scalarDictionaryValues_->valueAt(innerIndex);
@@ -102,6 +108,7 @@ class DictionaryVector : public SimpleVector<T> {
    */
   xsimd::batch<T> loadSIMDValueBufferAt(size_t index) const;
 
+    // 返回索引
   inline const BufferPtr& indices() const {
     return indices_;
   }
@@ -110,6 +117,7 @@ class DictionaryVector : public SimpleVector<T> {
     return dictionaryValues_;
   }
 
+    // 返回所有
   BufferPtr wrapInfo() const override {
     return indices_;
   }
@@ -120,6 +128,7 @@ class DictionaryVector : public SimpleVector<T> {
       return indices_;
     }
 
+    // 否则创建新的索引
     indices_ = AlignedBuffer::allocate<vector_size_t>(size, BaseVector::pool_);
     rawIndices_ = indices_->as<vector_size_t>();
     return indices_;
@@ -130,6 +139,8 @@ class DictionaryVector : public SimpleVector<T> {
         indices_->capacity();
   }
 
+    // 字典编码的向量会检查一下每一行是否都是相同的
+    // 这是通过索引来检查的
   bool isConstant(const SelectivityVector& rows) const override {
     VELOX_CHECK(rows.hasSelections(), "No selected rows in isConstant()");
     auto firstIdx = getDictionaryIndex(rows.begin());
@@ -141,24 +152,30 @@ class DictionaryVector : public SimpleVector<T> {
     });
   }
 
+    // 返回内部字典是否为标量类型向量？
   bool isScalar() const override {
     return dictionaryValues_->isScalar();
   }
 
+    // 加载向量
   BaseVector* loadedVector() override {
+    // 如果已经初始化了，则直接返回自己
     if (initialized_) {
       return this;
     }
-
+    // 创建一个选择向量
     SelectivityVector rows(dictionaryValues_->size(), false);
     for (vector_size_t i = 0; i < this->size(); i++) {
       if (!BaseVector::isNullAt(i)) {
+        // 不是NULL值就设置该行是有效的
         auto ind = getDictionaryIndex(i);
         rows.setValid(ind, true);
       }
     }
+    // 更新边界
     rows.updateBounds();
 
+    // 确保字典对rows中的所有数据都加载成功
     LazyVector::ensureLoadedRows(dictionaryValues_, rows);
     setInternalState();
     return this;
@@ -218,11 +235,15 @@ class DictionaryVector : public SimpleVector<T> {
   const vector_size_t* rawIndices_ = nullptr;
 
   VectorPtr dictionaryValues_;
+  // 标量类型缓存这个指针？
   // Caches 'dictionaryValues_.get()' if scalar type.
   SimpleVector<T>* scalarDictionaryValues_ = nullptr;
   // Caches 'scalarDictionaryValues_->getRawValues()' if 'dictionaryValues_'
   // is a FlatVector<T>.
   const T* rawDictionaryValues_ = nullptr;
+
+  // Indicates whether internal state has been set. Can also be false if there
+  // is an unloaded lazy vector under the encoding layers.
   bool initialized_{false};
 };
 

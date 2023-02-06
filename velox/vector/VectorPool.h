@@ -24,6 +24,7 @@ namespace facebook::velox {
 /// recyclable if it is flat and recursively singly-referenced.
 class VectorPool {
  public:
+    // 传进来内存池
   explicit VectorPool(memory::MemoryPool* pool) : pool_{pool} {}
 
   /// Gets a possibly recycled vector of 'type and 'size'. Allocates from

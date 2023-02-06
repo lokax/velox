@@ -16,6 +16,8 @@
 
 #include "velox/connectors/hive/HiveConnector.h"
 
+#include "velox/common/base/Fs.h"
+#include "velox/connectors/hive/HiveWriteProtocol.h"
 #include "velox/dwio/common/InputStream.h"
 #include "velox/dwio/common/ReaderFactory.h"
 #include "velox/expression/FieldReference.h"
@@ -23,10 +25,12 @@
 #include "velox/type/Type.h"
 #include "velox/type/Variant.h"
 
+#include <boost/lexical_cast.hpp>
+
 #include <memory>
 
+using namespace facebook::velox::exec;
 using namespace facebook::velox::dwrf;
-using WriterConfig = facebook::velox::dwrf::Config;
 
 DEFINE_int32(
     file_handle_cache_mb,
@@ -77,32 +81,6 @@ std::string HiveTableHandle::toString() const {
     out << ", remaining filter: (" << remainingFilter_->toString() << ")";
   }
   return out.str();
-}
-
-HiveDataSink::HiveDataSink(
-    std::shared_ptr<const RowType> inputType,
-    const std::string& filePath,
-    velox::memory::MemoryPool* memoryPool)
-    : inputType_(inputType) {
-  auto config = std::make_shared<WriterConfig>();
-  // TODO: Wire up serde properties to writer configs.
-
-  facebook::velox::dwrf::WriterOptions options;
-  options.config = config;
-  options.schema = inputType;
-  // Without explicitly setting flush policy, the default memory based flush
-  // policy is used.
-
-  auto sink = facebook::velox::dwio::common::DataSink::create(filePath);
-  writer_ = std::make_unique<Writer>(options, std::move(sink), *memoryPool);
-}
-
-void HiveDataSink::appendData(VectorPtr input) {
-  writer_->write(input);
-}
-
-void HiveDataSink::close() {
-  writer_->close();
 }
 
 namespace {
@@ -163,7 +141,7 @@ static void makeFieldSpecs(
 
 std::shared_ptr<common::ScanSpec> makeScanSpec(
     const SubfieldFilters& filters,
-    const std::shared_ptr<const RowType>& rowType) {
+    const RowTypePtr& rowType) {
   auto spec = std::make_shared<common::ScanSpec>("root");
   makeFieldSpecs("", 0, rowType, spec.get());
 
@@ -186,7 +164,7 @@ std::shared_ptr<common::ScanSpec> makeScanSpec(
 } // namespace
 
 HiveDataSource::HiveDataSource(
-    const std::shared_ptr<const RowType>& outputType,
+    const RowTypePtr& outputType,
     const std::shared_ptr<connector::ConnectorTableHandle>& tableHandle,
     const std::unordered_map<
         std::string,
@@ -194,7 +172,7 @@ HiveDataSource::HiveDataSource(
     FileHandleFactory* fileHandleFactory,
     velox::memory::MemoryPool* pool,
     ExpressionEvaluator* expressionEvaluator,
-    memory::MappedMemory* mappedMemory,
+    memory::MemoryAllocator* allocator,
     const std::string& scanId,
     folly::Executor* executor)
     : outputType_(outputType),
@@ -202,7 +180,7 @@ HiveDataSource::HiveDataSource(
       pool_(pool),
       readerOpts_(pool),
       expressionEvaluator_(expressionEvaluator),
-      mappedMemory_(mappedMemory),
+      allocator_(allocator),
       scanId_(scanId),
       executor_(executor) {
   // Column handled keyed on the column alias, the name used in the query.
@@ -322,7 +300,7 @@ class InputStreamHolder : public dwio::common::AbstractInputStreamHolder {
       std::shared_ptr<dwio::common::IoStatistics> stats)
       : fileHandle_(std::move(fileHandle)), stats_(std::move(stats)) {
     input_ = std::make_unique<dwio::common::ReadFileInputStream>(
-        fileHandle_->file.get(), dwio::common::MetricsLog::voidLog(), nullptr);
+        fileHandle_->file, dwio::common::MetricsLog::voidLog(), nullptr);
   }
 
   dwio::common::InputStream& get() override {
@@ -384,7 +362,7 @@ void HiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
 
   fileHandle_ = fileHandleFactory_->generate(split_->filePath);
   // For DataCache and no cache, the stream keeps track of IO.
-  auto asyncCache = dynamic_cast<cache::AsyncDataCache*>(mappedMemory_);
+  auto asyncCache = dynamic_cast<cache::AsyncDataCache*>(allocator_);
   // Decide between AsyncDataCache, legacy DataCache and no cache. All
   // three are supported to enable comparison.
   if (asyncCache) {
@@ -418,7 +396,7 @@ void HiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
   reader_ = dwio::common::getReaderFactory(readerOpts_.getFileFormat())
                 ->createReader(
                     std::make_unique<dwio::common::ReadFileInputStream>(
-                        fileHandle_->file.get(),
+                        fileHandle_->file,
                         dwio::common::MetricsLog::voidLog(),
                         asyncCache ? nullptr : ioStats_.get()),
                     readerOpts_);
@@ -490,7 +468,7 @@ void HiveDataSource::addSplit(std::shared_ptr<ConnectorSplit> split) {
 
   std::shared_ptr<dwio::common::ColumnSelector> cs;
   if (columnNames.empty()) {
-    static const std::shared_ptr<const RowType> kEmpty{ROW({}, {})};
+    static const RowTypePtr kEmpty{ROW({}, {})};
     cs = std::make_shared<dwio::common::ColumnSelector>(kEmpty);
   } else {
     cs = std::make_shared<dwio::common::ColumnSelector>(fileType, columnNames);

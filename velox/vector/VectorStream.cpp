@@ -40,6 +40,7 @@ void VectorStreamGroup::createStreamTree(
     int32_t numRows,
     const VectorSerde::Options* options) {
   VELOX_CHECK(getVectorSerde().get(), "Vector serde is not registered");
+  // 创建序列器
   serializer_ =
       getVectorSerde()->createSerializer(type, numRows, this, options);
 }

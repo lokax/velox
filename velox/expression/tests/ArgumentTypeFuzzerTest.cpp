@@ -127,7 +127,7 @@ TEST_F(ArgumentTypeFuzzerTest, signatureTemplate) {
 
   {
     auto signature = exec::FunctionSignatureBuilder()
-                         .typeVariable("K")
+                         .knownTypeVariable("K")
                          .typeVariable("V")
                          .returnType("K")
                          .argumentType("array(K)")
@@ -153,7 +153,7 @@ TEST_F(ArgumentTypeFuzzerTest, signatureTemplate) {
 
   {
     auto signature = exec::FunctionSignatureBuilder()
-                         .typeVariable("K")
+                         .knownTypeVariable("K")
                          .typeVariable("V")
                          .returnType("bigint")
                          .argumentType("array(K)")
@@ -191,7 +191,7 @@ TEST_F(ArgumentTypeFuzzerTest, variableArity) {
 
   {
     auto signature = exec::FunctionSignatureBuilder()
-                         .typeVariable("K")
+                         .knownTypeVariable("K")
                          .returnType("bigint")
                          .argumentType("K")
                          .variableArity()
@@ -280,7 +280,7 @@ TEST_F(ArgumentTypeFuzzerTest, lambda) {
 
   // map(K, V1), function(K, V1, V2) -> map(K, V2)
   signature = exec::FunctionSignatureBuilder()
-                  .typeVariable("K")
+                  .knownTypeVariable("K")
                   .typeVariable("V1")
                   .typeVariable("V2")
                   .returnType("map(K,V2)")
@@ -301,6 +301,29 @@ TEST_F(ArgumentTypeFuzzerTest, lambda) {
     auto randomType = argumentTypes[0]->asMap().valueType();
     ASSERT_EQ(*argumentTypes[1], *FUNCTION({BIGINT(), randomType}, VARCHAR()));
   }
+}
+
+TEST_F(ArgumentTypeFuzzerTest, unconstrainedSignatureTemplate) {
+  auto signature = exec::FunctionSignatureBuilder()
+                       .knownTypeVariable("K")
+                       .typeVariable("V")
+                       .returnType("V")
+                       .argumentType("map(K,V)")
+                       .argumentType("K")
+                       .build();
+
+  std::mt19937 seed{0};
+  ArgumentTypeFuzzer fuzzer{*signature, MAP(BIGINT(), VARCHAR()), seed};
+  ASSERT_TRUE(fuzzer.fuzzArgumentTypes(kMaxVariadicArgs));
+
+  const auto& argumentTypes = fuzzer.argumentTypes();
+  ASSERT_EQ(2, argumentTypes.size());
+  ASSERT_TRUE(argumentTypes[0] != nullptr);
+  ASSERT_TRUE(argumentTypes[1] != nullptr);
+
+  ASSERT_EQ(argumentTypes[0]->kind(), TypeKind::MAP);
+
+  ASSERT_EQ(argumentTypes[0]->childAt(0), argumentTypes[1]);
 }
 
 } // namespace facebook::velox::test

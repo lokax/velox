@@ -82,7 +82,7 @@ class MapKeysFunction : public MapKeyValueFunction {
         context.pool(),
         ARRAY(mapKeys->type()),
         mapVector->nulls(),
-        rows.size(),
+        rows.end(),
         mapVector->offsets(),
         mapVector->sizes(),
         mapKeys,
@@ -92,7 +92,7 @@ class MapKeysFunction : public MapKeyValueFunction {
   static std::vector<std::shared_ptr<exec::FunctionSignature>> signatures() {
     // map(K,V) -> array(K)
     return {exec::FunctionSignatureBuilder()
-                .typeVariable("K")
+                .knownTypeVariable("K")
                 .typeVariable("V")
                 .returnType("array(K)")
                 .argumentType("map(K,V)")
@@ -119,7 +119,7 @@ class MapValuesFunction : public MapKeyValueFunction {
         context.pool(),
         ARRAY(mapValues->type()),
         mapVector->nulls(),
-        rows.size(),
+        rows.end(),
         mapVector->offsets(),
         mapVector->sizes(),
         mapValues,
@@ -129,7 +129,7 @@ class MapValuesFunction : public MapKeyValueFunction {
   static std::vector<std::shared_ptr<exec::FunctionSignature>> signatures() {
     // map(K,V) -> array(V)
     return {exec::FunctionSignatureBuilder()
-                .typeVariable("K")
+                .knownTypeVariable("K")
                 .typeVariable("V")
                 .returnType("array(V)")
                 .argumentType("map(K,V)")

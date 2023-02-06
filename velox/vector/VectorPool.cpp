@@ -16,7 +16,7 @@
 #include "velox/vector/VectorPool.h"
 
 namespace facebook::velox {
-
+// 数组索引
 inline int32_t toCacheIndex(TypeKind kind) {
   return static_cast<int32_t>(kind);
 }
@@ -26,6 +26,7 @@ VectorPtr VectorPool::get(const TypePtr& type, vector_size_t size) {
   if (cacheIndex < kNumCachedVectorTypes && size <= kMaxRecycleSize) {
     return vectors_[cacheIndex].pop(type, size, *pool_);
   }
+  // 否则直接创建一个
   return BaseVector::create(type, size, pool_);
 }
 
@@ -33,6 +34,7 @@ bool VectorPool::release(VectorPtr& vector) {
   if (FOLLY_UNLIKELY(vector == nullptr)) {
     return false;
   }
+  // 这个向量不是唯一的，或者大小超过可循环使用大小时
   if (!vector.unique() || vector->size() > kMaxRecycleSize) {
     return false;
   }
@@ -61,10 +63,11 @@ bool VectorPool::TypePool::maybePushBack(VectorPtr& vector) {
   if (!vector->isWritable() || !vector->isFlatEncoding() || !vector->values()) {
     return false;
   }
+  // 超过阈值时
   if (size >= kNumPerType) {
     return false;
   }
-
+    // 为以后的复用预先准备
   vector->prepareForReuse();
   vectors[size++] = std::move(vector);
   return true;
@@ -87,11 +90,13 @@ VectorPtr VectorPool::TypePool::pop(
     if (UNLIKELY(
             result->typeKind() == TypeKind::VARCHAR ||
             result->typeKind() == TypeKind::VARBINARY)) {
+                // 这里为什么要清0？
       simd::memset(
           const_cast<void*>(result->valuesAsVoid()),
           0,
           std::min<int32_t>(vectorSize, result->size()) * sizeof(StringView));
     }
+    // 这里需要resize一下大小
     if (result->size() != vectorSize) {
       result->resize(vectorSize);
     }

@@ -93,10 +93,35 @@ class LocalFileSystem : public FileSystem {
 
   void remove(std::string_view path) override {
     auto file = extractPath(path);
-    int32_t rc = ::remove(std::string(file).c_str());
-    if (rc < 0) {
+    int32_t rc = std::remove(std::string(file).c_str());
+    if (rc < 0 && std::filesystem::exists(file)) {
       VELOX_USER_FAIL(
           "Failed to delete file {} with errno {}", file, strerror(errno));
+    }
+  }
+
+  void rename(
+      std::string_view oldPath,
+      std::string_view newPath,
+      bool overwrite) override {
+    auto oldFile = extractPath(oldPath);
+    auto newFile = extractPath(newPath);
+    if (!overwrite && exists(newPath)) {
+      VELOX_USER_FAIL(
+          "Failed to rename file {} to {} with as {} exists.",
+          oldFile,
+          newFile,
+          newFile);
+      return;
+    }
+    int32_t rc =
+        ::rename(std::string(oldFile).c_str(), std::string(newFile).c_str());
+    if (rc != 0) {
+      VELOX_USER_FAIL(
+          "Failed to rename file {} to {} with errno {}",
+          oldFile,
+          newFile,
+          folly::errnoStr(errno));
     }
   }
 

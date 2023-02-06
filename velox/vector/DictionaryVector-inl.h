@@ -22,8 +22,10 @@
 namespace facebook {
 namespace velox {
 
+// 设置内部状态
 template <typename T>
 void DictionaryVector<T>::setInternalState() {
+    // 设置裸指针
   rawIndices_ = indices_->as<vector_size_t>();
 
   // Sanity check indices for non-null positions. Enabled in debug mode only to
@@ -52,11 +54,18 @@ void DictionaryVector<T>::setInternalState() {
 #endif
 
   if (isLazyNotLoaded(*dictionaryValues_)) {
+    VELOX_CHECK(
+        dictionaryValues_->markAsContainingLazyAndWrapped(),
+        "An unloaded lazy vector cannot be wrapped by two different"
+        " top level vectors.");
     // Do not load Lazy vector
     return;
   }
 
+    // 注意逻辑走到这里，该向量已经加载成功了
+    // 如果字典向量是标量类型
   if (dictionaryValues_->isScalar()) {
+    // 设置裸指针之类的操作
     scalarDictionaryValues_ =
         reinterpret_cast<SimpleVector<T>*>(dictionaryValues_->loadedVector());
     if (scalarDictionaryValues_->isFlatEncoding() && !std::is_same_v<T, bool>) {
@@ -65,6 +74,7 @@ void DictionaryVector<T>::setInternalState() {
               ->rawValues();
     }
   }
+  // 设置为已经初始化
   initialized_ = true;
 
   BaseVector::inMemoryBytes_ =
@@ -112,16 +122,21 @@ DictionaryVector<T>::DictionaryVector(
 
 template <typename T>
 bool DictionaryVector<T>::isNullAt(vector_size_t idx) const {
+    // 必须已经初始化了
   VELOX_DCHECK(initialized_);
+  // 检查自己是否存在NULL值
   if (BaseVector::isNullAt(idx)) {
     return true;
   }
+  // 获取内部index
   auto innerIndex = getDictionaryIndex(idx);
+  // 检查字典是否在这个位置上存在NULL值
   return dictionaryValues_->isNullAt(innerIndex);
 }
 
 template <typename T>
 const T DictionaryVector<T>::valueAtFast(vector_size_t idx) const {
+    // 必须已经初始化
   VELOX_DCHECK(initialized_);
   if (rawDictionaryValues_) {
     return rawDictionaryValues_[getDictionaryIndex(idx)];
@@ -129,6 +144,8 @@ const T DictionaryVector<T>::valueAtFast(vector_size_t idx) const {
   return scalarDictionaryValues_->valueAt(getDictionaryIndex(idx));
 }
 
+// 布尔类型比较特俗，没有缓存RawDicValues_
+// 因为内部存储是bit吧,而不是一个字节吧
 template <>
 inline const bool DictionaryVector<bool>::valueAtFast(vector_size_t idx) const {
   VELOX_DCHECK(initialized_);

@@ -15,29 +15,19 @@
  */
 
 #include "velox/vector/LazyVector.h"
-#include <folly/ThreadLocal.h>
 #include "velox/common/base/RawVector.h"
+#include "velox/common/base/RuntimeMetrics.h"
 #include "velox/common/time/Timer.h"
 #include "velox/vector/DecodedVector.h"
 
 namespace facebook::velox {
 
-// Thread local stat writer, if set (not null) are used here to record how much
-// time was spent on IO in lazy vectors.
-static folly::ThreadLocalPtr<BaseRuntimeStatWriter> sRunTimeStatWriters;
-
-void setRunTimeStatWriter(std::unique_ptr<BaseRuntimeStatWriter>&& ptr) {
-  sRunTimeStatWriters.reset(std::move(ptr));
-}
-
 static void writeIOWallTimeStat(size_t ioTimeStartMicros) {
-  if (BaseRuntimeStatWriter* pWriter = sRunTimeStatWriters.get()) {
-    pWriter->addRuntimeStat(
-        "dataSourceLazyWallNanos",
-        RuntimeCounter(
-            (getCurrentTimeMicro() - ioTimeStartMicros) * 1'000,
-            RuntimeCounter::Unit::kNanos));
-  }
+  addThreadLocalRuntimeStat(
+      "dataSourceLazyWallNanos",
+      RuntimeCounter(
+          (getCurrentTimeMicro() - ioTimeStartMicros) * 1'000,
+          RuntimeCounter::Unit::kNanos));
 }
 
 void VectorLoader::load(RowSet rows, ValueHook* hook, VectorPtr* result) {
@@ -49,9 +39,7 @@ void VectorLoader::load(RowSet rows, ValueHook* hook, VectorPtr* result) {
     // Record number of rows loaded directly into ValueHook bypassing
     // materialization into vector. This counter can be used to understand
     // whether aggregation pushdown is happening or not.
-    if (auto* pWriter = sRunTimeStatWriters.get()) {
-      pWriter->addRuntimeStat("loadedToValueHook", RuntimeCounter(rows.size()));
-    }
+    addThreadLocalRuntimeStat("loadedToValueHook", RuntimeCounter(rows.size()));
   }
 }
 
@@ -112,18 +100,25 @@ void LazyVector::ensureLoadedRows(
     const SelectivityVector& rows,
     DecodedVector& decoded,
     SelectivityVector& baseRows) {
+        // 对vector进行解码
   decoded.decode(*vector, rows, false);
+  // 如果解码后的基向量不是Lazy的，则直接返回就行了
   if (decoded.base()->encoding() != VectorEncoding::Simple::LAZY) {
     return;
   }
+  // 类型转换为lazyVector
   auto lazyVector = decoded.base()->asUnchecked<LazyVector>();
   if (lazyVector->isLoaded()) {
+    // 如果已经加载了，调用一下vector的loadedVector函数
     vector->loadedVector();
     return;
   }
+  // raw_vector和std::vector差不多，不过做了些优化吧
   raw_vector<vector_size_t> rowNumbers;
   RowSet rowSet;
+  // 如果是常量编码？
   if (decoded.isConstantMapping()) {
+    // 获取第一个就可以了？
     rowNumbers.push_back(decoded.index(rows.begin()));
     rowSet = RowSet(rowNumbers);
   } else if (decoded.isIdentityMapping()) {
@@ -138,6 +133,7 @@ void LazyVector::ensureLoadedRows(
     }
   } else {
     baseRows.resize(0);
+    // 全部设置为false
     baseRows.resize(lazyVector->size(), false);
     rows.applyToSelected([&](auto row) {
       if (!decoded.isNullAt(row)) {
@@ -151,7 +147,7 @@ void LazyVector::ensureLoadedRows(
         baseRows.asRange().bits(), 0, baseRows.end(), rowNumbers.data()));
 
     rowSet = RowSet(rowNumbers);
-
+    // 调用加载函数
     lazyVector->load(rowSet, nullptr);
 
     // The loaded base vector may have fewer rows than the original. Make sure

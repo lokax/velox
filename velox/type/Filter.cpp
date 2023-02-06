@@ -27,7 +27,7 @@
 namespace facebook::velox::common {
 
 std::string Filter::toString() const {
-  const char* strKind = "<unknown>";
+  std::string strKind;
   switch (kind_) {
     case FilterKind::kAlwaysFalse:
       strKind = "AlwaysFalse";
@@ -167,6 +167,7 @@ BigintValuesUsingHashTable::BigintValuesUsingHashTable(
   std::fill(hashTable_.begin(), hashTable_.end(), kEmptyMarker);
   for (auto value : values) {
     if (value == kEmptyMarker) {
+        // 设置成true
       containsEmptyMarker_ = true;
     } else {
       auto position = ((value * M) & sizeMask_);

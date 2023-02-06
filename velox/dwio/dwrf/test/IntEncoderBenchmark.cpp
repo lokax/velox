@@ -18,10 +18,10 @@
 #include <folly/Varint.h>
 #include <folly/init/Init.h>
 #include "velox/common/memory/Memory.h"
+#include "velox/dwio/common/Range.h"
 #include "velox/dwio/dwrf/common/DataBufferHolder.h"
 #include "velox/dwio/dwrf/common/EncoderUtil.h"
 #include "velox/dwio/dwrf/common/IntEncoder.h"
-#include "velox/dwio/dwrf/common/Range.h"
 
 using namespace facebook::velox::dwio::common;
 using namespace facebook::velox;
@@ -30,8 +30,8 @@ using namespace facebook::velox::memory;
 
 static size_t generateAutoId(int64_t startId, int64_t count) {
   size_t capacity = count * folly::kMaxVarintLength64;
-  auto scopedPool = memory::getDefaultScopedMemoryPool();
-  DataBufferHolder holder{*scopedPool, capacity};
+  auto pool = memory::getDefaultMemoryPool();
+  DataBufferHolder holder{*pool, capacity};
   auto output = std::make_unique<BufferedOutputStream>(holder);
   auto encoder =
       createDirectEncoder<true>(std::move(output), true, sizeof(int64_t));
@@ -44,8 +44,8 @@ static size_t generateAutoId(int64_t startId, int64_t count) {
 
 static size_t generateAutoId2(int64_t startId, int64_t count) {
   size_t capacity = count * folly::kMaxVarintLength64;
-  auto scopedPool = memory::getDefaultScopedMemoryPool();
-  DataBufferHolder holder{*scopedPool, capacity};
+  auto pool = memory::getDefaultMemoryPool();
+  DataBufferHolder holder{*pool, capacity};
   auto output = std::make_unique<BufferedOutputStream>(holder);
   auto encoder =
       createDirectEncoder<true>(std::move(output), true, sizeof(int64_t));
@@ -58,7 +58,7 @@ static size_t generateAutoId2(int64_t startId, int64_t count) {
     for (int64_t i = 0; i < bufCount; ++i) {
       buffer[i] = currentId++;
     }
-    encoder->add(buffer, Ranges::of(0, bufCount), nullptr);
+    encoder->add(buffer, common::Ranges::of(0, bufCount), nullptr);
     countRemaining -= bufCount;
   }
   return encoder->flush();

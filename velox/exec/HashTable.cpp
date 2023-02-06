@@ -19,10 +19,16 @@
 #include "velox/common/base/Portability.h"
 #include "velox/common/base/SimdUtil.h"
 #include "velox/common/process/ProcessBase.h"
+#include "velox/common/testutil/TestValue.h"
 #include "velox/exec/ContainerRowSerde.h"
 #include "velox/vector/VectorTypeUtils.h"
 
+using facebook::velox::common::testutil::TestValue;
+
 namespace facebook::velox::exec {
+namespace {
+constexpr int32_t kMinTableSizeForParallelJoinBuild = 1000;
+}
 
 template <bool ignoreNullKeys>
 HashTable<ignoreNullKeys>::HashTable(
@@ -32,7 +38,7 @@ HashTable<ignoreNullKeys>::HashTable(
     bool allowDuplicates,
     bool isJoinBuild,
     bool hasProbedFlag,
-    memory::MappedMemory* mappedMemory)
+    memory::MemoryAllocator* allocator)
     : BaseHashTable(std::move(hashers)), isJoinBuild_(isJoinBuild) {
   std::vector<TypePtr> keys;
   for (auto& hasher : hashers_) {
@@ -50,7 +56,7 @@ HashTable<ignoreNullKeys>::HashTable(
       isJoinBuild,
       hasProbedFlag,
       hashMode_ != HashMode::kHash,
-      mappedMemory,
+      allocator,
       ContainerRowSerde::instance());
   nextOffset_ = rows_->nextOffset();
 }
@@ -470,7 +476,7 @@ void HashTable<ignoreNullKeys>::arrayGroupProbe(HashLookup& lookup) {
   for (; i < numProbes; ++i) {
     auto row = rows[i];
     uint64_t index = hashes[row];
-    VELOX_DCHECK(index < size_);
+    VELOX_DCHECK_LT(index, size_);
     char* group = table_[index];
     if (UNLIKELY(!group)) {
       group = insertEntry(lookup, index, row);
@@ -575,14 +581,15 @@ template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::allocateTables(uint64_t size) {
   VELOX_CHECK(bits::isPowerOfTwo(size), "Size is not a power of two: {}", size);
   if (size > 0) {
+    // 设置size
     size_ = size;
     sizeMask_ = size_ - 1;
     sizeBits_ = __builtin_popcountll(sizeMask_);
-    constexpr auto kPageSize = memory::MappedMemory::kPageSize;
+    constexpr auto kPageSize = memory::MemoryAllocator::kPageSize;
     // The total size is 9 bytes per slot, 8 in the pointers table and 1 in the
     // tags table.
     auto numPages = bits::roundUp(size * 9, kPageSize) / kPageSize;
-    if (!rows_->mappedMemory()->allocateContiguous(
+    if (!rows_->allocator()->allocateContiguous(
             numPages, nullptr, tableAllocation_)) {
       VELOX_FAIL("Could not allocate join/group by hash table");
     }
@@ -615,8 +622,13 @@ void HashTable<ignoreNullKeys>::checkSize(int32_t numNew) {
     // hashing.
     auto newSize = std::max(
         (uint64_t)2048, bits::nextPowerOfTwo(numNew * 2 + numDistinct_));
+    if (numNew + numDistinct_ > rehashSize(newSize)) {
+      newSize *= 2;
+    }
+    // 分配空间
     allocateTables(newSize);
     if (numDistinct_) {
+        // 进行rehash
       rehash();
     }
   } else if (numNew + numDistinct_ > rehashSize()) {
@@ -693,12 +705,30 @@ void syncWorkItems(
 } // namespace
 
 template <bool ignoreNullKeys>
+bool HashTable<ignoreNullKeys>::canApplyParallelJoinBuild() const {
+  if (!isJoinBuild_ || buildExecutor_ == nullptr) {
+    return false;
+  }
+  if (hashMode_ == HashMode::kArray) {
+    return false;
+  }
+  if (otherTables_.empty()) {
+    return false;
+  }
+  return (size_ / (1 + otherTables_.size())) >
+      kMinTableSizeForParallelJoinBuild;
+}
+
+template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::parallelJoinBuild() {
+  TestValue::adjust(
+      "facebook::velox::exec::HashTable::parallelJoinBuild", nullptr);
   int32_t numPartitions = 1 + otherTables_.size();
   VELOX_CHECK_GT(
       size_ / numPartitions,
-      160,
-      "Less than 160 entries per partition for parallel build");
+      kMinTableSizeForParallelJoinBuild,
+      "Less than {} entries per partition for parallel build",
+      kMinTableSizeForParallelJoinBuild);
   buildPartitionBounds_.resize(numPartitions + 1);
   // Pad the tail of buildPartitionBounds_ to max int.
   std::fill(
@@ -841,6 +871,7 @@ bool HashTable<ignoreNullKeys>::insertBatch(
     char** groups,
     int32_t numGroups,
     raw_vector<uint64_t>& hashes) {
+        // 计算哈希值？
   if (!hashRows(folly::Range(groups, numGroups), true, hashes)) {
     return false;
   }
@@ -1009,23 +1040,26 @@ void HashTable<ignoreNullKeys>::insertForJoin(
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::rehash() {
+    // 一批1024
   constexpr int32_t kHashBatchSize = 1024;
-  // @lint-ignore CLANGTIDY
-  if (buildExecutor_ && hashMode_ != HashMode::kArray &&
-      !otherTables_.empty() && size_ / (1 + otherTables_.size()) > 1000) {
+  if (canApplyParallelJoinBuild()) {
+    // 并行构建
     parallelJoinBuild();
     return;
   }
   raw_vector<uint64_t> hashes;
+  // 扩容1024
   hashes.resize(kHashBatchSize);
   char* groups[kHashBatchSize];
   // A join build can have multiple payload tables. Loop over 'this'
   // and the possible other tables and put all the data in the table
   // of 'this'.
+  // 遍历每一个哈希表
   for (int32_t i = 0; i <= otherTables_.size(); ++i) {
     RowContainerIterator iterator;
     int32_t numGroups;
     do {
+        // i == 0的时候是自己这张哈希表，否则是其他哈希表
       numGroups = (i == 0 ? this : otherTables_[i - 1].get())
                       ->rows()
                       ->listRows(&iterator, kHashBatchSize, groups);
@@ -1043,9 +1077,9 @@ void HashTable<ignoreNullKeys>::setHashMode(HashMode mode, int32_t numNew) {
   VELOX_CHECK_NE(hashMode_, HashMode::kHash);
   if (mode == HashMode::kArray) {
     auto bytes = size_ * sizeof(char*);
-    constexpr auto kPageSize = memory::MappedMemory::kPageSize;
+    constexpr auto kPageSize = memory::MemoryAllocator::kPageSize;
     auto numPages = bits::roundUp(bytes, kPageSize) / kPageSize;
-    if (!rows_->mappedMemory()->allocateContiguous(
+    if (!rows_->allocator()->allocateContiguous(
             numPages, nullptr, tableAllocation_)) {
       VELOX_FAIL(
           "Could not allocate array with {} bytes/{} pages for array mode hash table",
@@ -1057,6 +1091,7 @@ void HashTable<ignoreNullKeys>::setHashMode(HashMode mode, int32_t numNew) {
     hashMode_ = HashMode::kArray;
     rehash();
   } else if (mode == HashMode::kHash) {
+    // 设置hashMode
     hashMode_ = HashMode::kHash;
     for (auto& hasher : hashers_) {
       hasher->resetStats();
@@ -1312,9 +1347,11 @@ template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::prepareJoinTable(
     std::vector<std::unique_ptr<BaseHashTable>> tables,
     folly::Executor* FOLLY_NULLABLE executor) {
+        // 设置executor
   buildExecutor_ = executor;
   otherTables_.reserve(tables.size());
   for (auto& table : tables) {
+    // 创建
     otherTables_.emplace_back(std::unique_ptr<HashTable<ignoreNullKeys>>(
         dynamic_cast<HashTable<ignoreNullKeys>*>(table.release())));
   }
@@ -1341,6 +1378,8 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
       }
     }
   }
+
+    // 计算有几条不同的数据，这个应该是不准的
   numDistinct_ = rows()->numRows();
   for (auto& other : otherTables_) {
     numDistinct_ += other->rows()->numRows();
@@ -1514,6 +1553,15 @@ int32_t HashTable<ignoreNullKeys>::listProbedRows(
     char** rows) {
   return listRows<RowContainer::ProbeType::kProbed>(
       iter, maxRows, maxBytes, rows);
+}
+
+template <bool ignoreNullKeys>
+int32_t HashTable<ignoreNullKeys>::listAllRows(
+    RowsIterator* iter,
+    int32_t maxRows,
+    uint64_t maxBytes,
+    char** rows) {
+  return listRows<RowContainer::ProbeType::kAll>(iter, maxRows, maxBytes, rows);
 }
 
 template <bool ignoreNullKeys>

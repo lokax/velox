@@ -14,21 +14,38 @@
  * limitations under the License.
  */
 #include "velox/functions/prestosql/window/WindowFunctionsRegistration.h"
+#include "velox/exec/Aggregate.h"
 
 namespace facebook::velox::window {
+
+extern void registerAggregateWindowFunction(const std::string& name);
+
+namespace prestosql {
 
 extern void registerRowNumber(const std::string& name);
 extern void registerRank(const std::string& name);
 extern void registerDenseRank(const std::string& name);
 extern void registerPercentRank(const std::string& name);
 extern void registerCumeDist(const std::string& name);
+extern void registerNtile(const std::string& name);
+extern void registerNthValue(const std::string& name);
 
-void registerWindowFunctions() {
-  window::registerRowNumber("row_number");
-  window::registerRank("rank");
-  window::registerDenseRank("dense_rank");
-  window::registerPercentRank("percent_rank");
-  window::registerCumeDist("cume_dist");
+void registerAllWindowFunctions() {
+  registerRowNumber("row_number");
+  registerRank("rank");
+  registerDenseRank("dense_rank");
+  registerPercentRank("percent_rank");
+  registerCumeDist("cume_dist");
+  registerNtile("ntile");
+  registerNthValue("nth_value");
+
+  // Register all aggregate functions as window functions.
+  const auto& aggregateFunctions = exec::aggregateFunctions();
+  for (const auto& aggregateEntry : aggregateFunctions) {
+    window::registerAggregateWindowFunction(aggregateEntry.first);
+  }
 }
+
+} // namespace prestosql
 
 } // namespace facebook::velox::window

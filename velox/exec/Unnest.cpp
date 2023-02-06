@@ -31,18 +31,24 @@ Unnest::Unnest(
           unnestNode->id(),
           "Unnest"),
       withOrdinality_(unnestNode->withOrdinality()) {
+        // 输入类型
   const auto& inputType = unnestNode->sources()[0]->outputType();
   const auto& unnestVariables = unnestNode->unnestVariables();
+  // 遍历每一个要unnest的变量
   for (const auto& variable : unnestVariables) {
+    // 如果不是数组或者MAP，则抛出异常
     if (!variable->type()->isArray() && !variable->type()->isMap()) {
       VELOX_UNSUPPORTED("Unnest operator supports only ARRAY and MAP types")
     }
+    // 获取输入位置？
     unnestChannels_.push_back(inputType->getChildIdx(variable->name()));
   }
 
+    // 解码向量
   unnestDecoded_.resize(unnestVariables.size());
 
   if (withOrdinality_) {
+    // 存在序数列，则应该是BIGINT类型
     VELOX_CHECK_EQ(
         outputType_->children().back(),
         BIGINT(),
@@ -50,24 +56,30 @@ Unnest::Unnest(
   }
 
   column_index_t outputChannel = 0;
+  // 进行重复的变量
   for (const auto& variable : unnestNode->replicateVariables()) {
     identityProjections_.emplace_back(
         inputType->getChildIdx(variable->name()), outputChannel++);
   }
 }
 
+// 添加输入向量
 void Unnest::addInput(RowVectorPtr input) {
   input_ = std::move(input);
 }
 
 RowVectorPtr Unnest::getOutput() {
   if (!input_) {
+    // 输入向量为空指针，则直接返回空指针
     return nullptr;
   }
 
+    // 输入的行数
   auto size = input_->size();
+  // 对选择向量进行扩容
   inputRows_.resize(size);
 
+    // 分配内存
   // The max number of elements at each row across all unnested columns.
   auto maxSizes = AlignedBuffer::allocate<int64_t>(size, pool(), 0);
   auto rawMaxSizes = maxSizes->asMutable<int64_t>();
@@ -80,11 +92,15 @@ RowVectorPtr Unnest::getOutput() {
   rawOffsets.resize(unnestChannels_.size());
   rawIndices.resize(unnestChannels_.size());
 
+    // 遍历每一个要unnest的channel
   for (auto channel = 0; channel < unnestChannels_.size(); ++channel) {
+    // 拿出对应的输入列的向量
     const auto& unnestVector = input_->childAt(unnestChannels_[channel]);
+    // 进行解码
     unnestDecoded_[channel].decode(*unnestVector, inputRows_);
 
     auto& currentDecoded = unnestDecoded_[channel];
+    // 保存索引裸指针
     rawIndices[channel] = currentDecoded.indices();
 
     const ArrayVector* unnestBaseArray;
@@ -103,10 +119,13 @@ RowVectorPtr Unnest::getOutput() {
     // Count max number of elements per row.
     auto currentSizes = rawSizes[channel];
     auto currentIndices = rawIndices[channel];
+    // 遍历每一行
     for (auto row = 0; row < size; ++row) {
+        // 如果不是NULL值
       if (!currentDecoded.isNullAt(row)) {
         auto unnestSize = currentSizes[currentIndices[row]];
         if (rawMaxSizes[row] < unnestSize) {
+            // 更新该行的的最大的size?
           rawMaxSizes[row] = unnestSize;
         }
       }
@@ -139,6 +158,7 @@ RowVectorPtr Unnest::getOutput() {
   // Wrap "replicated" columns in a dictionary using 'repeatedIndices'.
   std::vector<VectorPtr> outputs(outputType_->size());
   for (const auto& projection : identityProjections_) {
+    // TODO(lokax): 包装成字典向量
     outputs[projection.outputChannel] = wrapChild(
         numElements, repeatedIndices, input_->childAt(projection.inputChannel));
   }
@@ -161,9 +181,11 @@ RowVectorPtr Unnest::getOutput() {
     // Make dictionary index for elements column since they may be out of order.
     index = 0;
     bool identityMapping = true;
+    // 遍历单独一列内的每一行
     for (auto row = 0; row < size; ++row) {
+        // 最大大小
       auto maxSize = rawMaxSizes[row];
-
+        // 如果当前行不是NULL值
       if (!currentDecoded.isNullAt(row)) {
         auto offset = currentOffsets[currentIndices[row]];
         auto unnestSize = currentSizes[currentIndices[row]];
@@ -176,12 +198,13 @@ RowVectorPtr Unnest::getOutput() {
           rawElementIndices[index++] = offset + i;
         }
 
+        // 不够的部分填充NULL值
         for (auto i = unnestSize; i < maxSize; ++i) {
           bits::setNull(rawNulls, index++, true);
         }
       } else if (maxSize > 0) {
         identityMapping = false;
-
+        // 设置成NULL
         for (auto i = 0; i < maxSize; ++i) {
           bits::setNull(rawNulls, index++, true);
         }

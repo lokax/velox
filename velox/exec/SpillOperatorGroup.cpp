@@ -20,6 +20,7 @@
 namespace facebook::velox::exec {
 
 SpillOperatorGroup::State SpillOperatorGroup::state() {
+    // 加锁后返回状态
   std::lock_guard<std::mutex> l(mutex_);
   return state_;
 }
@@ -41,6 +42,7 @@ void SpillOperatorGroup::addOperator(
     Operator& op,
     SpillOperatorGroup::SpillRunner runner) {
   VELOX_CHECK_NOT_NULL(runner);
+  // 加锁
   std::lock_guard<std::mutex> l(mutex_);
   VELOX_CHECK_EQ(
       state_,
@@ -83,6 +85,7 @@ void SpillOperatorGroup::operatorStopped(const Operator& op) {
   runSpill(promises);
 }
 
+// 设置为运行态？
 void SpillOperatorGroup::start() {
   std::lock_guard<std::mutex> l(mutex_);
   VELOX_CHECK_EQ(
@@ -105,10 +108,13 @@ void SpillOperatorGroup::restart() {
   state_ = State::kRunning;
 }
 
+// 请求Spill
 bool SpillOperatorGroup::requestSpill(Operator& op, ContinueFuture& future) {
   std::vector<ContinuePromise> promises;
   {
+    // 加锁
     std::lock_guard<std::mutex> l(mutex_);
+    // 检查当前是否在运行态
     VELOX_CHECK_EQ(
         state_,
         State::kRunning,
@@ -116,12 +122,14 @@ bool SpillOperatorGroup::requestSpill(Operator& op, ContinueFuture& future) {
         toStringLocked());
     VELOX_CHECK_LT(numWaitingOperators_, numActiveOperatorsLocked());
     VELOX_CHECK_LT(stoppedOperators_.size(), operators_.size());
+    // 设置成需要Spill
     needSpill_ = true;
     if (waitSpillLocked(op, promises, future)) {
       VELOX_CHECK(future.valid());
       return true;
     }
   }
+  // 运行Spill
   runSpill(promises);
   return false;
 }
@@ -136,6 +144,7 @@ bool SpillOperatorGroup::waitSpill(Operator& op, ContinueFuture& future) {
         "Can only wait spill when group is running: {}",
         toStringLocked());
     VELOX_CHECK_LT(stoppedOperators_.size(), operators_.size());
+    // 如果不需要Spill，则直接返回
     if (!needSpill_) {
       VELOX_CHECK_EQ(numWaitingOperators_, 0);
       return false;
@@ -153,22 +162,27 @@ bool SpillOperatorGroup::waitSpillLocked(
     std::vector<ContinuePromise>& promises,
     ContinueFuture& future) {
   VELOX_CHECK_LT(numWaitingOperators_, numActiveOperatorsLocked());
+  // 增加等待的算子数量
   if (++numWaitingOperators_ == numActiveOperatorsLocked()) {
+    // 把promises_移动出去，并且返回
     promises = std::move(promises_);
     return false;
   }
+  // 创建一个promises
   promises_.emplace_back(ContinuePromise(fmt::format(
       "SpillOperatorGroup::waitSpillLocked {}/{}/{}/{}",
       taskId_,
       planNodeId_,
       splitGroupId_,
-      op.stats().operatorId)));
+      op.operatorId())));
+      // 设置future
   future = promises_.back().getSemiFuture();
   return true;
 }
 
 void SpillOperatorGroup::runSpill(std::vector<ContinuePromise>& promises) {
   VELOX_CHECK(needSpill_);
+  // 调用回调函数
   spillRunner_(operators_);
   {
     std::lock_guard<std::mutex> l(mutex_);
@@ -177,9 +191,11 @@ void SpillOperatorGroup::runSpill(std::vector<ContinuePromise>& promises) {
         State::kRunning,
         "Can only run spill when group is running: {}",
         toStringLocked());
+        // 加锁，并设置这些状态
     needSpill_ = false;
     numWaitingOperators_ = 0;
   }
+  // 通知
   for (auto& promise : promises) {
     promise.setValue();
   }

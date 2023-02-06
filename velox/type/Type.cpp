@@ -183,7 +183,8 @@ std::shared_ptr<const Type> Type::create(const folly::dynamic& obj) {
 
       auto child =
           velox::ISerializable::deserialize<std::vector<Type>>(obj["cTypes"]);
-      return std::make_shared<const RowType>(move(names), move(child));
+      return std::make_shared<const RowType>(
+          std::move(names), std::move(child));
     }
 
     case TypeKind::OPAQUE: {
@@ -206,7 +207,7 @@ std::shared_ptr<const Type> Type::create(const folly::dynamic& obj) {
         childTypes =
             velox::ISerializable::deserialize<std::vector<Type>>(obj["cTypes"]);
       }
-      return createType(type, move(childTypes));
+      return createType(type, std::move(childTypes));
     }
   }
 }
@@ -831,6 +832,46 @@ TypePtr fromKindToScalerType(TypeKind kind) {
       VELOX_UNSUPPORTED(
           "Kind is not a scalar type: {}", mapTypeKindToName(kind));
       return nullptr;
+  }
+}
+
+void toTypeSql(const TypePtr& type, std::ostream& out) {
+  if (type->isPrimitiveType()) {
+    out << type->toString();
+    return;
+  }
+
+  switch (type->kind()) {
+    case TypeKind::ARRAY:
+      // Append <type>[], e.g. bigint[].
+      toTypeSql(type->childAt(0), out);
+      out << "[]";
+      break;
+    case TypeKind::MAP:
+      // Append map(<key>, <value>), e.g. map(varchar, bigint).
+      out << "map(";
+      toTypeSql(type->childAt(0), out);
+      out << ", ";
+      toTypeSql(type->childAt(1), out);
+      out << ")";
+      break;
+    case TypeKind::ROW: {
+      // Append struct(name1 type1, name2 type2,..), e.g.
+      // struct(a bigint, b real);
+      const auto& rowType = type->asRow();
+      out << "struct(";
+      for (auto i = 0; i < type->size(); ++i) {
+        if (i > 0) {
+          out << ", ";
+        }
+        out << rowType.nameOf(i) << " ";
+        toTypeSql(type->childAt(i), out);
+      }
+      out << ")";
+      break;
+    }
+    default:
+      VELOX_UNSUPPORTED("Type is not supported: {}", type->toString());
   }
 }
 

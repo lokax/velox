@@ -18,6 +18,8 @@
 
 #include "velox/core/ITypedExpr.h"
 #include "velox/core/QueryCtx.h"
+#include "velox/expression/tests/ExpressionVerifier.h"
+#include "velox/expression/tests/FuzzerToolkit.h"
 #include "velox/functions/FunctionRegistry.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 #include "velox/vector/tests/utils/VectorMaker.h"
@@ -29,20 +31,6 @@ namespace facebook::velox::test {
 // Generates random expressions based on `signatures`, random input data (via
 // VectorFuzzer), and executes them.
 void expressionFuzzer(FunctionSignatureMap signatureMap, size_t seed);
-
-// Represents one available function signature.
-struct CallableSignature {
-  // Function name.
-  std::string name;
-
-  // Input arguments and return type.
-  std::vector<TypePtr> args;
-  bool variableArity{false};
-  TypePtr returnType;
-
-  // Convenience print function.
-  std::string toString() const;
-};
 
 class ExpressionFuzzer {
  public:
@@ -60,13 +48,13 @@ class ExpressionFuzzer {
   core::TypedExprPtr generateExpression(const TypePtr& returnType);
 
  private:
+  const std::string kTypeParameterName = "T";
+
   enum ArgumentKind { kArgConstant = 0, kArgColumn = 1, kArgExpression = 2 };
 
   void seed(size_t seed);
 
   void reSeed();
-
-  void printRowVector(const RowVectorPtr& rowVector);
 
   void appendConjunctSignatures();
 
@@ -80,75 +68,104 @@ class ExpressionFuzzer {
 
   std::vector<core::TypedExprPtr> generateArgs(const CallableSignature& input);
 
-  // Specialization for the "like" function: second and third (optional)
-  // parameters always need to be constant.
+  /// Specialization for the "like" function: second and third (optional)
+  /// parameters always need to be constant.
   std::vector<core::TypedExprPtr> generateLikeArgs(
       const CallableSignature& input);
 
-  // Specialization for the "empty_approx_set" function: first optional
-  // parameter needs to be constant.
+  /// Specialization for the "empty_approx_set" function: first optional
+  /// parameter needs to be constant.
   std::vector<core::TypedExprPtr> generateEmptyApproxSetArgs(
       const CallableSignature& input);
 
-  // Specialization for the "regexp_replace" function: second and third
-  // (optional) parameters always need to be constant.
+  /// Specialization for the "regexp_replace" function: second and third
+  /// (optional) parameters always need to be constant.
   std::vector<core::TypedExprPtr> generateRegexpReplaceArgs(
       const CallableSignature& input);
 
-  void persistReproInfo(
-      const VectorPtr& inputVector,
-      const VectorPtr& resultVector,
-      const std::string& sql);
+  core::TypedExprPtr getCallExprFromCallable(const CallableSignature& callable);
 
-  // Executes an expression. Returns:
-  //
-  //  - true if both succeeded and returned the exact same results.
-  //  - false if both failed with compatible exceptions.
-  //  - throws otherwise (incompatible exceptions or different results).
-  bool executeExpression(
-      const core::TypedExprPtr& plan,
-      const RowVectorPtr& rowVector,
-      VectorPtr&& resultVector,
-      bool canThrow);
+  /// Generate an expression with a random concrete function signature that
+  /// returns returnType.
+  core::TypedExprPtr generateExpressionFromConcreteSignatures(
+      const TypePtr& returnType);
 
-  // If --duration_sec > 0, check if we expired the time budget. Otherwise,
-  // check if we expired the number of iterations (--steps).
+  /// Return a random signature template mapped to typeName in
+  /// signatureTemplateMap_ whose return type can match returnType. Return
+  /// nullptr if no such signature template exists.
+  const SignatureTemplate* chooseRandomSignatureTemplate(
+      const TypePtr& returnType,
+      const std::string& typeName);
+
+  /// Generate an expression with a random function signature template that
+  /// returns returnType.
+  core::TypedExprPtr generateExpressionFromSignatureTemplate(
+      const TypePtr& returnType);
+
+  /// If --duration_sec > 0, check if we expired the time budget. Otherwise,
+  /// check if we expired the number of iterations (--steps).
   template <typename T>
   bool isDone(size_t i, T startTime) const;
+
+  /// Reset any stateful members. Should be called before every fuzzer
+  /// iteration.
+  void reset();
 
   FuzzerGenerator rng_;
   size_t currentSeed_{0};
 
   std::vector<CallableSignature> signatures_;
 
-  // Maps a given type to the functions that return that type.
+  /// Maps a given type to the functions that return that type.
   std::unordered_map<TypeKind, std::vector<const CallableSignature*>>
       signaturesMap_;
 
-  // The remaining levels of expression nesting. It's initialized by
-  // FLAGS_max_level_of_nesting and updated in generateExpression(). When its
-  // value decreases to 0, we don't generate subexpressions anymore.
+  std::vector<SignatureTemplate> signatureTemplates_;
+
+  /// Maps the base name of the return type signature to the functions that
+  /// return this type. Base name could be "T" if the return type is a type
+  /// variable.
+  std::unordered_map<std::string, std::vector<const SignatureTemplate*>>
+      signatureTemplateMap_;
+
+  /// The remaining levels of expression nesting. It's initialized by
+  /// FLAGS_max_level_of_nesting and updated in generateExpression(). When its
+  /// value decreases to 0, we don't generate subexpressions anymore.
   int32_t remainingLevelOfNesting_;
 
-  // We allow the arg generation routine to be specialized for particular
-  // functions. This map stores the mapping between function name and the
-  // overridden method.
+  /// We allow the arg generation routine to be specialized for particular
+  /// functions. This map stores the mapping between function name and the
+  /// overridden method.
   using ArgsOverrideFunc = std::function<std::vector<core::TypedExprPtr>(
       const CallableSignature& input)>;
   std::unordered_map<std::string, ArgsOverrideFunc> funcArgOverrides_;
 
-  std::shared_ptr<core::QueryCtx> queryCtx_{core::QueryCtx::createForTest()};
-  std::unique_ptr<memory::MemoryPool> pool_{
-      memory::getDefaultScopedMemoryPool()};
+  std::shared_ptr<core::QueryCtx> queryCtx_{std::make_shared<core::QueryCtx>()};
+  std::shared_ptr<memory::MemoryPool> pool_{memory::getDefaultMemoryPool()};
   core::ExecCtx execCtx_{pool_.get(), queryCtx_.get()};
+  test::ExpressionVerifier verifier_;
 
   test::VectorMaker vectorMaker_{execCtx_.pool()};
   VectorFuzzer vectorFuzzer_;
 
-  // Contains the input column references that need to be generated for one
-  // particular iteration.
+  /// Contains the input column references that need to be generated for one
+  /// particular iteration.
   std::vector<TypePtr> inputRowTypes_;
   std::vector<std::string> inputRowNames_;
+
+  /// Maps a 'Type' serialized as a string to the column names that have already
+  /// been generated. Used to easily look up columns that can be re-used when a
+  /// specific type is required as input to a callable.
+  std::unordered_map<std::string, std::vector<std::string>> typeToColumnNames_;
+
+  /// Maps a 'Type' serialized as a string to the expressions that have already
+  /// been generated and have the same return type. Used to easily look up
+  /// expressions that can be re-used when a specific return type is required.
+  /// Only expressions with no nested expressions are tracked here and can be
+  /// re-used.
+  /// TODO: add support for sharing multi-level expressions.
+  std::unordered_map<std::string, std::vector<core::TypedExprPtr>>
+      typeToExpressions_;
 };
 
 } // namespace facebook::velox::test

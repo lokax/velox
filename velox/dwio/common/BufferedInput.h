@@ -60,7 +60,7 @@ class BufferedInput {
     std::unique_ptr<SeekableInputStream> ret = readBuffer(offset, length);
     if (!ret) {
       VLOG(1) << "Unplanned read. Offset: " << offset << ", Length: " << length;
-      // We cannot do enqueue/load here because load() clears previously laoded
+      // We cannot do enqueue/load here because load() clears previously loaded
       // data. TODO: figure out how we can use the data cache for
       // this access.
       ret = std::make_unique<SeekableFileInputStream>(
@@ -71,8 +71,9 @@ class BufferedInput {
 
   // True if there is free memory for prefetching the stripe. This is
   // called to check if a stripe that is not next for read should be
-  // prefetched.
-  virtual bool shouldPreload() {
+  // prefetched. 'numPages' is added to the already enqueued pages, so
+  // that this can be called also before enqueueing regions.
+  virtual bool shouldPreload(int32_t /*numPages*/ = 0) {
     return false;
   }
 

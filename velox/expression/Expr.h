@@ -164,6 +164,7 @@ class Expr {
     }
   }
 
+    // 清空这些指针
   void clearMemo() {
     baseDictionary_ = nullptr;
     dictionaryCache_ = nullptr;
@@ -236,7 +237,12 @@ class Expr {
   virtual std::string toString(bool recursive = true) const;
 
   /// Return the expression as SQL string.
-  virtual std::string toSql() const;
+  /// @param complexConstants An optional std::vector of VectorPtr to record
+  /// complex constants (Array, Maps, Structs, ...) that aren't accurately
+  /// expressable as sql. If not given, they will be converted to
+  /// SQL-expressable simple constants.
+  virtual std::string toSql(
+      std::vector<VectorPtr>* FOLLY_NULLABLE complexConstants = nullptr) const;
 
   const ExprStats& stats() const {
     return stats_;
@@ -246,6 +252,13 @@ class Expr {
   // 'rows'. Ensures that '*result' is writable, of sufficient size
   // and that it can take nulls. Makes a new '*result' when
   // appropriate.
+  static void addNulls(
+      const SelectivityVector& rows,
+      const uint64_t* FOLLY_NULLABLE rawNulls,
+      EvalCtx& context,
+      const TypePtr& type,
+      VectorPtr& result);
+
   void addNulls(
       const SelectivityVector& rows,
       const uint64_t* FOLLY_NULLABLE rawNulls,
@@ -355,7 +368,9 @@ class Expr {
  protected:
   void appendInputs(std::stringstream& stream) const;
 
-  void appendInputsSql(std::stringstream& stream) const;
+  void appendInputsSql(
+      std::stringstream& stream,
+      std::vector<VectorPtr>* FOLLY_NULLABLE complexConstants) const;
 
   /// Release 'inputValues_' back to vector pool in 'evalCtx' so they can be
   /// reused.

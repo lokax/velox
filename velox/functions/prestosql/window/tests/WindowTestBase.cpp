@@ -15,6 +15,7 @@
  */
 #include "velox/functions/prestosql/window/tests/WindowTestBase.h"
 
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
@@ -23,7 +24,58 @@ using namespace facebook::velox::exec::test;
 
 namespace facebook::velox::window::test {
 
-std::vector<RowVectorPtr> WindowTestBase::makeVectors(
+namespace {
+struct QueryInfo {
+  const core::PlanNodePtr planNode;
+  const std::string functionSql;
+  const std::string querySql;
+};
+
+QueryInfo buildWindowQuery(
+    const std::vector<RowVectorPtr>& input,
+    const std::string& function,
+    const std::string& overClause,
+    const std::optional<std::string> frameClause) {
+  auto functionSql = frameClause
+      ? fmt::format(
+            "{} over ({} {})", function, overClause, frameClause.value())
+      : fmt::format("{} over ({})", function, overClause);
+
+  auto op = PlanBuilder().values(input).window({functionSql}).planNode();
+
+  auto rowType = asRowType(input[0]->type());
+  std::string columnsString = folly::join(", ", rowType->names());
+  std::string querySql =
+      fmt::format("SELECT {}, {} FROM tmp", columnsString, functionSql);
+
+  return {op, functionSql, querySql};
+}
+}; // namespace
+
+RowVectorPtr WindowTestBase::makeSimpleVector(vector_size_t size) {
+  return makeRowVector({
+      makeFlatVector<int32_t>(size, [](auto row) { return row % 5; }),
+      makeFlatVector<int32_t>(
+          size, [](auto row) { return row % 7; }, nullEvery(15)),
+  });
+}
+
+RowVectorPtr WindowTestBase::makeSinglePartitionVector(vector_size_t size) {
+  return makeRowVector({
+      makeFlatVector<int32_t>(size, [](auto /* row */) { return 1; }),
+      makeFlatVector<int32_t>(
+          size, [](auto row) { return row; }, nullEvery(7)),
+  });
+}
+
+RowVectorPtr WindowTestBase::makeSingleRowPartitionsVector(vector_size_t size) {
+  return makeRowVector({
+      makeFlatVector<int32_t>(size, [](auto row) { return row; }),
+      makeFlatVector<int32_t>(size, [](auto row) { return row; }),
+  });
+}
+
+std::vector<RowVectorPtr> WindowTestBase::makeFuzzVectors(
     const RowTypePtr& rowType,
     vector_size_t size,
     int numVectors,
@@ -32,6 +84,7 @@ std::vector<RowVectorPtr> WindowTestBase::makeVectors(
   VectorFuzzer::Options options;
   options.vectorSize = size;
   options.nullRatio = nullRatio;
+  options.useMicrosecondPrecisionTimestamp = true;
   VectorFuzzer fuzzer(options, pool_.get(), 0);
   for (int32_t i = 0; i < numVectors; ++i) {
     auto vector = std::dynamic_pointer_cast<RowVector>(fuzzer.fuzzRow(rowType));
@@ -43,66 +96,36 @@ std::vector<RowVectorPtr> WindowTestBase::makeVectors(
 void WindowTestBase::testWindowFunction(
     const std::vector<RowVectorPtr>& input,
     const std::string& function,
-    const std::string& overClause) {
-  auto functionSql = fmt::format("{} over ({})", function, overClause);
-
-  SCOPED_TRACE(functionSql);
-  auto op = PlanBuilder().values(input).window({functionSql}).planNode();
-
-  auto rowType = asRowType(input[0]->type());
-  std::string columnsString = folly::join(", ", rowType->names());
-
-  assertQuery(
-      op, fmt::format("SELECT {}, {} FROM tmp", columnsString, functionSql));
+    const std::string& overClause,
+    const std::string& frameClause) {
+  auto queryInfo = buildWindowQuery(input, function, overClause, frameClause);
+  SCOPED_TRACE(queryInfo.functionSql);
+  assertQuery(queryInfo.planNode, queryInfo.querySql);
 }
 
 void WindowTestBase::testWindowFunction(
     const std::vector<RowVectorPtr>& input,
     const std::string& function,
-    const std::vector<std::string>& overClauses) {
+    const std::vector<std::string>& overClauses,
+    const std::vector<std::string>& frameClauses) {
+  createDuckDbTable(input);
   for (const auto& overClause : overClauses) {
-    testWindowFunction(input, function, overClause);
+    for (const auto& frameClause : frameClauses) {
+      testWindowFunction(input, function, overClause, frameClause);
+    }
   }
 }
 
-void WindowTestBase::testTwoColumnInput(
+void WindowTestBase::assertWindowFunctionError(
     const std::vector<RowVectorPtr>& input,
-    const std::string& windowFunction) {
-  VELOX_CHECK_EQ(input[0]->childrenSize(), 2);
+    const std::string& function,
+    const std::string& overClause,
+    const std::string& errorMessage) {
+  auto queryInfo = buildWindowQuery(input, function, overClause, std::nullopt);
+  SCOPED_TRACE(queryInfo.functionSql);
 
-  std::vector<std::string> overClauses = {
-      "partition by c0 order by c1",
-      "partition by c1 order by c0",
-      "partition by c0 order by c1 desc",
-      "partition by c1 order by c0 desc",
-      "partition by c0 order by c1 nulls first",
-      "partition by c1 order by c0 nulls first",
-      "partition by c0 order by c1 desc nulls first",
-      "partition by c1 order by c0 desc nulls first",
-      // No partition by clause.
-      "order by c0, c1",
-      "order by c1, c0",
-      "order by c0 asc, c1 desc",
-      "order by c1 asc, c0 desc",
-      "order by c0 asc nulls first, c1 desc nulls first",
-      "order by c1 asc nulls first, c0 desc nulls first",
-      "order by c0 desc nulls first, c1 asc nulls first",
-      "order by c1 desc nulls first, c0 asc nulls first",
-      // No order by clause.
-      "partition by c0, c1",
-  };
-
-  createDuckDbTable(input);
-  testWindowFunction(input, windowFunction, overClauses);
-
-  // Invoking with same vector set twice so that the underlying WindowFunction
-  // receives the same data set multiple times and does a full processing
-  // (partition, sort) + apply of it.
-  std::vector<RowVectorPtr> doubleInput;
-  doubleInput.insert(doubleInput.end(), input.begin(), input.end());
-  doubleInput.insert(doubleInput.end(), input.begin(), input.end());
-  createDuckDbTable(doubleInput);
-  testWindowFunction(doubleInput, windowFunction, overClauses);
+  VELOX_ASSERT_THROW(
+      assertQuery(queryInfo.planNode, queryInfo.querySql), errorMessage);
 }
 
 }; // namespace facebook::velox::window::test

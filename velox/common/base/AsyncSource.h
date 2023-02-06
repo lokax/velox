@@ -42,20 +42,26 @@ class AsyncSource {
   // Makes an item if it is not already made. To be called on a background
   // executor.
   void prepare() {
+    // 一个仿函数对象
     std::function<std::unique_ptr<Item>()> make = nullptr;
     {
+        // 加锁
       std::lock_guard<std::mutex> l(mutex_);
       if (!make_) {
+        // 空指针，直接返回
         return;
       }
+      // 设置为正在制作？
       making_ = true;
       std::swap(make, make_);
     }
     std::unique_ptr<Item> item;
     try {
+        // 调用函数制作item
       item = make();
     } catch (std::exception& e) {
       std::lock_guard<std::mutex> l(mutex_);
+      // 保存异常指针
       exception_ = std::current_exception();
     }
     std::unique_ptr<ContinuePromise> promise;
@@ -68,6 +74,7 @@ class AsyncSource {
       making_ = false;
       promise.swap(promise_);
     }
+    // 通知一下
     if (promise != nullptr) {
       promise->setValue();
     }
